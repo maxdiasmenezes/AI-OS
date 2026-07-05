@@ -1,0 +1,13 @@
+[project]
+name = "ai-os"
+version = "0.1.0"
+description = "Personal AI Operating System"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic",
+    "python-dotenv",
+    "pyyaml",
+]
+
+[tool.uv]
+package = false

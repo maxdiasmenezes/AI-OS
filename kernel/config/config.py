@@ -23,10 +23,12 @@ _ENV_PATH = _PROJECT_ROOT / ".env"
 class Config:
     """Everything the kernel needs to run a single prompt."""
 
-    def __init__(self, provider: str, provider_settings: dict, log_path: Path):
+    def __init__(self, provider: str, provider_settings: dict, log_path: Path,
+                 memory_settings: dict):
         self.provider = provider
         self.provider_settings = provider_settings
         self.log_path = log_path
+        self.memory_settings = memory_settings
 
 
 def load_config() -> Config:
@@ -42,9 +44,11 @@ def load_config() -> Config:
     provider = settings["provider"]
     provider_settings = settings["providers"][provider]
     log_path = _PROJECT_ROOT / settings["log_dir"] / settings["log_file"]
+    memory_settings = settings["memory"]
 
     return Config(
         provider=provider,
         provider_settings=provider_settings,
         log_path=log_path,
+        memory_settings=memory_settings,
     )

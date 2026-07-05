@@ -24,3 +24,6 @@ providers:
 
 log_dir: "storage/logs"
 log_file: "interactions.jsonl"
+
+memory:
+  storage_dir: "storage/memory"

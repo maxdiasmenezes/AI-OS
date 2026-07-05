@@ -19,7 +19,7 @@ class JSONLBackend:
     """Reads and writes memory entries as JSONL files under a directory."""
 
     def __init__(self, settings: dict):
-        self.dir = _PROJECT_ROOT / settings["dir"]
+        self.dir = _PROJECT_ROOT / settings["storage_dir"]
 
     def write(self, entry: MemoryEntry) -> None:
         """Append a single memory entry to its namespace's JSONL file."""

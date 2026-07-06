@@ -1,0 +1,26 @@
+# Non-secret kernel settings.
+# Secrets (e.g. API keys) belong in .env, never here.
+
+provider: ollama
+
+providers:
+  ollama:
+    model: "llama3.1:8b"
+    base_url: "http://localhost:11434"
+    max_tokens: 1024
+    temperature: 1.0
+  anthropic:
+    model: "claude-sonnet-5"
+    max_tokens: 1024
+    temperature: 1.0
+  openai:
+    model: "gpt-5"
+    max_tokens: 1024
+    temperature: 1.0
+  gemini:
+    model: "gemini-3-pro"
+    max_tokens: 1024
+    temperature: 1.0
+
+log_dir: "storage/logs"
+log_file: "interactions.jsonl"

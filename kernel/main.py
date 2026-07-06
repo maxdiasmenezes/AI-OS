@@ -12,6 +12,7 @@ just those four steps.
 import argparse
 
 from kernel.config.config import load_config
+from kernel.memory import MemoryManager
 from kernel.models import get_provider
 from kernel.logger import log_interaction
 
@@ -23,6 +24,7 @@ def main() -> None:
 
     config = load_config()
     provider = get_provider(config)
+    memory = MemoryManager(config.memory_settings)
     response = provider.send_prompt(args.prompt)
     log_interaction(args.prompt, response, config.log_path)
 

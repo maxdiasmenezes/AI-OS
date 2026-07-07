@@ -51,5 +51,4 @@ desktop.ini
 !.env.example
 
 # Runtime storage
-storage/memory/*.jsonl
-storage/logs/*.jsonl
+storage/**/*.jsonl

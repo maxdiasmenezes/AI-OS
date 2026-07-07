@@ -4,9 +4,9 @@ Kernel v0.0.1 entry point.
 Usage:
     python -m kernel.main "your prompt here"
 
-Steps: load config -> call the configured model provider -> log the
-interaction -> print the response. No routing, no memory, no orchestration -
-just those four steps.
+Steps: load config -> call the configured model provider -> store the
+prompt and response in memory -> log the interaction -> print the response.
+No routing, no orchestration, no retrieval - just those steps.
 """
 
 import argparse
@@ -26,6 +26,8 @@ def main() -> None:
     provider = get_provider(config)
     memory = MemoryManager(config.memory_settings)
     response = provider.send_prompt(args.prompt)
+    memory.remember("conversation", args.prompt, metadata={"role": "user"})
+    memory.remember("conversation", response.text, metadata={"role": "assistant"})
     log_interaction(args.prompt, response, config.log_path)
 
     print(response.text)

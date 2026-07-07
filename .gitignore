@@ -49,3 +49,7 @@ desktop.ini
 .env
 .env.*
 !.env.example
+
+# Runtime storage
+storage/memory/*.jsonl
+storage/logs/*.jsonl

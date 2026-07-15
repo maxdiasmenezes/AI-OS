@@ -1,32 +1,53 @@
 """
 Orchestrator: owns the request lifecycle.
 
-Given a config, wires up a model provider and a memory manager once; given a
-user prompt, builds the augmented prompt, calls the provider, persists the
-exchange to memory, logs the interaction, and returns the model's response.
-No routing, no tools, no retries, no streaming - just the existing flow.
+Given a config and a capability loader, wires up a model provider, a memory
+manager, and a capability router once; given a user prompt, routes it to a
+capability when the router matches one, otherwise falls back to the model
+provider. Either way, persists the exchange to memory, logs the interaction,
+and returns the response. No tools, no retries, no streaming - just routing
+plus the existing flow.
 """
 
+from typing import Callable
+
+from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.logger import log_interaction
 from kernel.memory import MemoryManager
 from kernel.models import ModelResponse, get_provider
+from kernel.orchestrator.router import CapabilityRouter
 from kernel.prompts import build_prompt
 
 
 class Orchestrator:
     """Runs a single request end-to-end for a given config."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, capability_loader: Callable[[str], Capability]) -> None:
         self._config = config
         self._provider = get_provider(config)
         self._memory = MemoryManager(config.memory_settings)
+        self._router = CapabilityRouter()
+        self._capability_loader = capability_loader
 
     def handle(self, user_prompt: str) -> ModelResponse:
-        """Run one request end-to-end and return the model's response."""
+        """Run one request end-to-end and return the response."""
 
-        augmented_prompt = build_prompt(user_prompt, self._memory)
-        response = self._provider.send_prompt(augmented_prompt)
+        capability_id = self._router.route(user_prompt)
+        if capability_id is not None:
+            capability = self._capability_loader(capability_id)
+            text = capability.handle(user_prompt)
+            response = ModelResponse(
+                text=text,
+                model=f"capability:{capability_id}",
+                input_tokens=0,
+                output_tokens=0,
+                latency_seconds=0.0,
+            )
+        else:
+            augmented_prompt = build_prompt(user_prompt, self._memory)
+            response = self._provider.send_prompt(augmented_prompt)
+
         self._memory.remember("conversation", user_prompt, metadata={"role": "user"})
         self._memory.remember("conversation", response.text, metadata={"role": "assistant"})
         log_interaction(user_prompt, response, self._config.log_path)

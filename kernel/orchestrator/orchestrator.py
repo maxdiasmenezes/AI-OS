@@ -16,6 +16,7 @@ from kernel.config.config import Config
 from kernel.logger import log_interaction
 from kernel.memory import MemoryManager
 from kernel.models import ModelResponse, get_provider
+from kernel.models.base import ModelProvider
 from kernel.orchestrator.router import CapabilityRouter
 from kernel.prompts import build_prompt
 
@@ -23,7 +24,11 @@ from kernel.prompts import build_prompt
 class Orchestrator:
     """Runs a single request end-to-end for a given config."""
 
-    def __init__(self, config: Config, capability_loader: Callable[[str], Capability]) -> None:
+    def __init__(
+        self,
+        config: Config,
+        capability_loader: Callable[[str, ModelProvider], Capability],
+    ) -> None:
         self._config = config
         self._provider = get_provider(config)
         self._memory = MemoryManager(config.memory_settings)
@@ -35,7 +40,7 @@ class Orchestrator:
 
         capability_id = self._router.route(user_prompt)
         if capability_id is not None:
-            capability = self._capability_loader(capability_id)
+            capability = self._capability_loader(capability_id, self._provider)
             text = capability.handle(user_prompt)
             response = ModelResponse(
                 text=text,

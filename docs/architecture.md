@@ -67,7 +67,11 @@ business logic of their own.
   handle it, and returns the result either way. Implemented: it wires up a
   model provider, a memory manager, and a capability router once per run, then
   owns the per-request routing/fallback decision described in
-  [Request flow](#request-flow).
+  [Request flow](#request-flow). On the routed branch it passes its own
+  provider instance to the capability loader (`capability_loader(capability_id,
+  self._provider)`), so a capability can reuse the same provider the
+  orchestrator already built, rather than constructing or configuring one
+  itself.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
@@ -107,7 +111,10 @@ know what wine, travel, or strategy mean.
   inside them.
 - **Loader** (`capabilities/loader.py`) — the one place allowed to know about
   concrete capability classes; maps a known id to its class and instantiates
-  it (currently `{"wine": WineCapability}`).
+  it (currently `{"wine": WineCapability}`). `CapabilityLoader.load(capability_id,
+  model_provider)` takes the model provider explicitly and passes it to the
+  capability's constructor — the loader does not construct or configure a
+  provider itself.
 - **Router** (`kernel/orchestrator/router.py`) — deterministic prompt-to-id
   matching; currently a single rule (`\bwine\b`, case-insensitive) routes to
   `"wine"`, otherwise returns `None`.
@@ -115,7 +122,11 @@ know what wine, travel, or strategy mean.
   deterministic, keyword-based food-to-wine pairing across eight food
   categories with a defined priority order for overlapping matches (e.g.
   "spicy shrimp" resolves to spicy, not shellfish). No model calls, no
-  external lookups. Covered by an automated pytest suite
+  external lookups. Its constructor accepts a `ModelProvider` (the kernel
+  abstraction, `kernel/models/base.py`) and retains it, but `handle()` does
+  not call it yet — the provider is wired through in anticipation of a
+  model-backed fallback for out-of-scope requests, planned for a later
+  milestone. Covered by an automated pytest suite
   (`tests/capabilities/wine/test_capability.py`).
 
 Each capability is meant to be a self-contained domain expert that uses

@@ -3,11 +3,34 @@
 import pytest
 
 from capabilities.wine.capability import WineCapability
+from kernel.models.base import ModelProvider, ModelResponse
+
+
+class FakeModelProvider(ModelProvider):
+    """Records whether it was called; no external calls."""
+
+    def __init__(self):
+        self.received_prompts: list[str] = []
+
+    def send_prompt(self, prompt: str) -> ModelResponse:
+        self.received_prompts.append(prompt)
+        return ModelResponse(
+            text="unused",
+            model="fake-model",
+            input_tokens=0,
+            output_tokens=0,
+            latency_seconds=0.0,
+        )
 
 
 @pytest.fixture
-def wine():
-    return WineCapability()
+def fake_provider():
+    return FakeModelProvider()
+
+
+@pytest.fixture
+def wine(fake_provider):
+    return WineCapability(fake_provider)
 
 
 def _assert_out_of_scope(response: str) -> None:
@@ -84,3 +107,16 @@ def test_priority_prefers_preparation_over_protein(
 def test_unsupported_prompt_returns_out_of_scope_response(wine):
     response = wine.handle("What's a good Bordeaux vintage from 2015?")
     _assert_out_of_scope(response)
+
+
+# --- Milestone 21: provider is injected but not yet used -----------------
+
+
+def test_matched_category_prompt_does_not_call_provider(wine, fake_provider):
+    wine.handle("What wine goes with steak?")
+    assert fake_provider.received_prompts == []
+
+
+def test_out_of_scope_prompt_does_not_call_provider(wine, fake_provider):
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    assert fake_provider.received_prompts == []

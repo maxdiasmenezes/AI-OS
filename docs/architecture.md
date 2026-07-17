@@ -4,105 +4,175 @@
 
 AI-OS is organized as a **kernel** that provides shared infrastructure, a set of
 **capabilities** that act as independent AI employees, and a set of
-**interfaces** through which those employees are reached. Everything is tied
-together through shared **prompts** and **storage**.
+**interfaces** through which those employees will eventually be reached.
+Everything is tied together through shared **prompts** and **storage**.
+
+Today, the system is reachable through a single CLI entry point
+(`kernel/main.py`); the `interfaces/` layer is scaffolded but not yet wired
+to the kernel.
 
 ```
                     +------------------+
-                    |    interfaces    |
-                    | claude / whatsapp|
-                    | web / voice      |
+                    |    interfaces    |   planned: README stubs only
+                    | claude / whatsapp|   (claude, whatsapp, web, voice),
+                    |   web / voice    |   not wired to the kernel yet
                     +--------+---------+
                              |
                     +--------v---------+
-                    |      kernel      |
-                    |  orchestrator    |
+                    |   kernel.main    |   implemented: current entry point
+                    |      (CLI)       |
+                    +--------+---------+
+                             |
+                    +--------v---------+
+                    |   orchestrator   |   implemented
                     +--------+---------+
                              |
         +--------------------+--------------------+
         |                    |                     |
-  +-----v-----+       +------v------+       +------v------+
-  |  memory   |       |  knowledge  |       |    tools    |
-  +-----------+       +-------------+       +-------------+
-                             |
-                    +--------v---------+
-                    |   capabilities   |
-                    | strategy/research|
-                    | travel/wine/...  |
-                    +------------------+
+  +-----v-----+       +------v------+       +------v-------+
+  |  memory   |       |   models    |       | capabilities  |
+  | (JSONL)   |       | (provider   |       | registry +    |
+  |           |       |  adapters)  |       | loader +      |
+  +-----------+       +-------------+       | router        |
+                                             +------+--------+
+                                                    |
+                                             +------v--------+
+                                             | WineCapability |
+                                             |    (wine)      |
+                                             +----------------+
+
+  kernel/knowledge, kernel/tools: directories exist; planned, no code yet.
 ```
 
 ## Layers
 
 ### Interfaces
 
-`interfaces/` holds the entry points through which a human interacts with
-AI-OS: Claude, WhatsApp, a web app, and voice. Interfaces are responsible for
-translating a channel-specific message into a request the kernel can route,
-and translating the kernel's response back into that channel's format.
-Interfaces contain no business logic of their own.
+`interfaces/` holds the intended entry points through which a human will
+interact with AI-OS: Claude, WhatsApp, a web app, and voice. Each currently
+exists only as a directory with a short README describing its intent — none
+contain code, and none are wired to the orchestrator yet. The system's actual
+entry point today is a CLI: `python -m kernel.main "<prompt>"`
+(`kernel/main.py`), which is a composition root rather than part of
+`interfaces/`. Once a real interface is built, it will translate a
+channel-specific message into a call into the orchestrator, and translate the
+result back into that channel's format — interfaces are meant to contain no
+business logic of their own.
 
 ### Kernel
 
 `kernel/` is the shared core that every capability depends on:
 
-- **orchestrator** — receives a request from an interface, decides which
-  capability (or capabilities) should handle it, and returns the result.
-  It owns routing, not domain logic.
-- **memory** — short- and long-term context: conversation history, user
-  facts, and state that needs to persist across sessions.
+- **orchestrator** — receives a prompt, decides whether a capability should
+  handle it, and returns the result either way. Implemented: it wires up a
+  model provider, a memory manager, and a capability router once per run, then
+  owns the per-request routing/fallback decision described in
+  [Request flow](#request-flow).
+- **memory** — conversation history persisted across requests. Implemented:
+  `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
+  namespace (`kernel/memory/jsonl.py`), stored under the directory configured
+  in `kernel/config/config.yaml` (`storage/memory/` by default).
 - **knowledge** — the shared knowledge base infrastructure (storage and
-  retrieval) that capabilities use to look up domain knowledge.
+  retrieval) capabilities would use to look up domain knowledge. Not yet
+  implemented — `kernel/knowledge/` contains only a README describing intent.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
+  The `ModelProvider` contract and a `get_provider()` factory are implemented
+  (`kernel/models/base.py`, `kernel/models/factory.py`), and adapter modules
+  exist for Ollama, Anthropic, OpenAI, and Gemini. Of these, only Ollama is
+  selected as the active provider in `kernel/config/config.yaml` and exercised
+  end-to-end today; the other adapters are present in the codebase but not
+  verified as the active path.
 - **tools** — reusable tools (actions, integrations, lookups) that
-  capabilities can invoke.
+  capabilities could invoke. Not yet implemented — `kernel/tools/` contains
+  only a README describing intent.
 - **config** — settings that govern how the kernel and its components
-  behave.
+  behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
+  (active provider, provider settings, memory and log locations), secrets load
+  from `.env` (`kernel/config/config.py`).
 
 The kernel is domain-agnostic. It knows how to run a capability; it does not
 know what wine, travel, or strategy mean.
 
 ### Capabilities
 
-`capabilities/` holds the AI employees themselves: strategy, research, wine,
-travel, knowledge, and life administration. Each capability is a self
--contained domain expert that uses kernel services (memory, knowledge, tools,
-models) to do its job. Capabilities do not talk to interfaces directly, and
-they do not talk to each other directly — all cross-capability coordination
-goes through the orchestrator.
+`capabilities/` holds the AI employees. One is implemented today —
+**wine** — reached through a small, explicit pipeline:
+
+- **Capability contract** (`kernel/capabilities/base.py`) — an ABC every
+  capability implements: an `id` property and a `handle(prompt) -> str`
+  method.
+- **Registry** (`kernel/capabilities/registry.py`) — discovers capability
+  directories under `capabilities/` by name, without importing anything
+  inside them.
+- **Loader** (`capabilities/loader.py`) — the one place allowed to know about
+  concrete capability classes; maps a known id to its class and instantiates
+  it (currently `{"wine": WineCapability}`).
+- **Router** (`kernel/orchestrator/router.py`) — deterministic prompt-to-id
+  matching; currently a single rule (`\bwine\b`, case-insensitive) routes to
+  `"wine"`, otherwise returns `None`.
+- **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1:
+  deterministic, keyword-based food-to-wine pairing across eight food
+  categories with a defined priority order for overlapping matches (e.g.
+  "spicy shrimp" resolves to spicy, not shellfish). No model calls, no
+  external lookups. Covered by an automated pytest suite
+  (`tests/capabilities/wine/test_capability.py`).
+
+Each capability is meant to be a self-contained domain expert that uses
+kernel services (memory, knowledge, tools, models) to do its job. Capabilities
+do not talk to interfaces directly, and they do not talk to each other
+directly — all cross-capability coordination goes through the orchestrator.
+Only `wine` exists so far; strategy, research, travel, and life administration
+remain unimplemented.
 
 ### Prompts
 
 `prompts/` holds prompt templates and instructions shared across the kernel
 and capabilities, kept separate from code so they can be reviewed and
-iterated on independently.
+iterated on independently. `prompts/system.md` is implemented and loaded by
+`kernel/prompts/builder.py` for the model-fallback path (see below).
 
 ### Storage
 
-`storage/` is where persisted state actually lives: logs, memory snapshots,
-knowledge base contents, and backups. The kernel's `memory` and `knowledge`
-modules define *how* data is structured and accessed; `storage/` is *where*
-it is kept at rest.
+`storage/` is where persisted state actually lives: logs and memory. The
+kernel's `memory` module defines *how* conversation data is structured and
+stored (JSONL); `storage/` is *where* it is kept at rest
+(`storage/memory/`, `storage/logs/`). A knowledge base and backups are not
+yet implemented.
 
 ### Scripts and tests
 
 `scripts/` holds operational and maintenance scripts (setup, migrations,
 utilities). `tests/` holds test suites that verify kernel and capability
-behavior.
+behavior; today this covers `WineCapability`
+(`tests/capabilities/wine/test_capability.py`).
 
 ## Request flow
 
-1. A human sends a message through an interface (e.g. WhatsApp).
-2. The interface normalizes the message and hands it to the kernel
-   orchestrator.
-3. The orchestrator determines which capability should handle the request,
-   using memory/knowledge as needed for context.
-4. The capability processes the request, using kernel services (models,
-   tools, knowledge) as needed.
-5. The result flows back through the orchestrator to the originating
-   interface, which formats it for the channel.
-6. Relevant state (memory, logs) is persisted to `storage/`.
+The flow below reflects what `Orchestrator.handle()` (`kernel/orchestrator/orchestrator.py`)
+does today, run via the CLI entry point:
+
+1. A prompt is passed to `python -m kernel.main "<prompt>"`.
+2. The orchestrator asks the `CapabilityRouter` whether the prompt matches a
+   capability.
+3. **If it matches** (routed branch): the `CapabilityLoader` instantiates the
+   matched capability, and its `handle()` method returns the response text
+   directly — no model call is made. Today this only ever resolves to `wine`.
+4. **If it does not match** (fallback branch): `build_prompt()`
+   (`kernel/prompts/builder.py`) assembles a prompt from the system prompt
+   (`prompts/system.md`), the last 10 entries recalled from the
+   `"conversation"` memory namespace, and the user's prompt; this combined
+   prompt is sent to the configured model provider, and its response text is
+   used.
+5. Either way, the user's prompt and the response text are each appended as
+   a separate entry to the `"conversation"` memory namespace
+   (`storage/memory/conversation.jsonl`), and the full interaction (prompt,
+   response text, model identifier, token counts, latency) is appended to the
+   interaction log (`storage/logs/interactions.jsonl`).
+6. The response text is printed to stdout.
+
+There is currently no multi-turn session, streaming, retries, or tool use in
+this flow — a single call to `handle()` is one full request/response cycle.
 
 ## Design boundaries
 
@@ -115,7 +185,31 @@ behavior.
 - **Prompts and storage are data, not code.** They are kept separate from
   implementation so they can evolve independently.
 
-## Status
+## Implementation status
 
-This document describes the intended shape of the system. No implementation
-exists yet; this is the reference for how future work should be organized.
+**Implemented:**
+
+- CLI entry point (`kernel/main.py`).
+- Orchestrator: routing/fallback decision, wiring of provider, memory, router.
+- Model provider abstraction (`ModelProvider`, `get_provider()`), with an
+  Ollama adapter configured as the active provider and exercised end-to-end.
+  Adapter modules for Anthropic, OpenAI, and Gemini also exist in the
+  codebase but are not the configured/verified active path.
+- Memory: JSONL-backed conversation history, written and recalled on every
+  request.
+- Interaction logging to `storage/logs/interactions.jsonl`.
+- System prompt (`prompts/system.md`), assembled with recalled memory for the
+  model-fallback path.
+- Capability contract, registry, explicit loader, and deterministic router.
+- One capability: `WineCapability` (Wine Pairing v1), with an automated
+  pytest suite.
+
+**Planned / not yet implemented:**
+
+- Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
+  currently placeholder directories only.
+- Knowledge base storage and retrieval (`kernel/knowledge/`).
+- Tools (`kernel/tools/`).
+- Additional capabilities (strategy, research, travel, life administration).
+- Multi-turn sessions, streaming, retries, and any autonomous or
+  multi-capability workflows.

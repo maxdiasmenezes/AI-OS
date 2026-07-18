@@ -89,7 +89,7 @@ def test_wine_prompt_routes_to_capability_and_skips_model(monkeypatch, tmp_path)
     orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
     response = orchestrator.handle("What wine goes with steak?")
 
-    loader.assert_called_once_with("wine")
+    loader.assert_called_once_with("wine", fake_provider)
     assert fake_capability.received_prompts == ["What wine goes with steak?"]
     assert response.text == "a bold Malbec would work well"
     assert response.model == "capability:wine"

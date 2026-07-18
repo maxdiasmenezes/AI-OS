@@ -9,6 +9,7 @@ calls, no external lookups - just keyword rules.
 import re
 
 from kernel.capabilities.base import Capability
+from kernel.models.base import ModelProvider
 
 # Each entry: (category id, human label, keywords, wine style, explanation).
 # Keywords are matched case-insensitively as whole words/phrases.
@@ -96,6 +97,9 @@ _OUT_OF_SCOPE_RESPONSE = (
 
 class WineCapability(Capability):
     """AI employee for wine: deterministic food-to-wine pairing (v1)."""
+
+    def __init__(self, model_provider: ModelProvider) -> None:
+        self._model_provider = model_provider
 
     @property
     def id(self) -> str:

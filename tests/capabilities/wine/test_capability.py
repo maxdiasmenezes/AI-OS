@@ -398,3 +398,417 @@ def test_unmatched_prompt_with_invalid_profile_field_raises_value_error(
         wine.handle("What's a good Bordeaux vintage from 2015?")
 
     assert fake_provider.received_prompts == []
+
+
+# --- Milestone 27: personal wine cellar inventory -------------------------
+
+
+def _write_cellar(knowledge_dir: Path, records: dict) -> None:
+    """Write a synthetic wine_cellar.json document directly under tmp_path."""
+
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "wine_cellar.json").write_text(json.dumps(records), encoding="utf-8")
+
+
+_SAMPLE_RECORD = {
+    "producer": "Sample Estate",
+    "wine_name": "Reserve Red",
+    "color": "red",
+    "quantity": 3,
+    "vintage": 2021,
+    "country": "Example Country",
+    "region": "Example Region",
+    "style": "medium-bodied red",
+    "grapes": ["Sample Grape"],
+    "estimated_price": 30,
+    "price_currency": "USD",
+    "vivino_rating": 3.8,
+    "drinking_window": "2025-2029",
+    "notes": "Synthetic test record",
+    "special_occasion": False,
+}
+
+
+def test_deterministic_match_does_not_touch_seeded_cellar(
+    wine, fake_provider, memory_manager, knowledge_store, knowledge_dir
+):
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+
+    wine.handle("What wine goes with a steak?")
+
+    assert knowledge_store.get_calls == []
+    assert knowledge_store.list_records_calls == []
+    assert fake_provider.received_prompts == []
+
+
+def test_unmatched_prompt_with_no_cellar_namespace_has_no_cellar_section(wine, fake_provider):
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine cellar:" not in sent_prompt
+
+
+def test_unmatched_prompt_with_empty_cellar_document_has_no_cellar_section(
+    wine, fake_provider, knowledge_dir
+):
+    _write_cellar(knowledge_dir, {})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine cellar:" not in sent_prompt
+
+
+def test_unmatched_prompt_with_only_zero_quantity_records_has_no_cellar_section(
+    wine, fake_provider, knowledge_dir
+):
+    zero_record = dict(_SAMPLE_RECORD, quantity=0)
+    _write_cellar(knowledge_dir, {"sample-red-2021": zero_record})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine cellar:" not in sent_prompt
+
+
+def test_unmatched_prompt_with_cellar_renders_required_and_optional_fields(
+    wine, fake_provider, knowledge_dir
+):
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine cellar:" in sent_prompt
+    assert "Cellar ID: sample-red-2021" in sent_prompt
+    assert "Producer: Sample Estate" in sent_prompt
+    assert "Wine: Reserve Red" in sent_prompt
+    assert "Vintage: 2021" in sent_prompt
+    assert "Color: red" in sent_prompt
+    assert "Style: medium-bodied red" in sent_prompt
+    assert "Country: Example Country" in sent_prompt
+    assert "Region: Example Region" in sent_prompt
+    assert "Grapes: Sample Grape" in sent_prompt
+    assert "Quantity: 3" in sent_prompt
+    assert "Estimated price: 30 USD" in sent_prompt
+    assert "Vivino rating: 3.8" in sent_prompt
+    assert "Drinking window: 2025-2029" in sent_prompt
+    assert "Notes: Synthetic test record" in sent_prompt
+    # special_occasion is False, so it must not be rendered at all.
+    assert "Special occasion" not in sent_prompt
+
+
+def test_cellar_record_with_only_required_fields_renders_minimally(
+    wine, fake_provider, knowledge_dir
+):
+    minimal_record = {
+        "producer": "Minimal Producer",
+        "wine_name": "Basic White",
+        "color": "white",
+        "quantity": 1,
+    }
+    _write_cellar(knowledge_dir, {"minimal-white": minimal_record})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Cellar ID: minimal-white" in sent_prompt
+    assert "Producer: Minimal Producer" in sent_prompt
+    assert "Wine: Basic White" in sent_prompt
+    assert "Color: white" in sent_prompt
+    assert "Quantity: 1" in sent_prompt
+    assert "Vintage" not in sent_prompt
+    assert "Style" not in sent_prompt
+
+
+def test_cellar_special_occasion_true_is_rendered(wine, fake_provider, knowledge_dir):
+    record = dict(_SAMPLE_RECORD, special_occasion=True)
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Special occasion: yes" in sent_prompt
+
+
+def test_cellar_zero_quantity_record_excluded_alongside_active_record(
+    wine, fake_provider, knowledge_dir
+):
+    active = dict(_SAMPLE_RECORD)
+    depleted = dict(_SAMPLE_RECORD, wine_name="Depleted Red", quantity=0)
+    _write_cellar(
+        knowledge_dir,
+        {"sample-red-2021": active, "depleted-red-2019": depleted},
+    )
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "sample-red-2021" in sent_prompt
+    assert "depleted-red-2019" not in sent_prompt
+    assert "Depleted Red" not in sent_prompt
+
+
+def test_cellar_active_records_sorted_by_record_key(wine, fake_provider, knowledge_dir):
+    record_b = dict(_SAMPLE_RECORD, wine_name="B Wine")
+    record_a = dict(_SAMPLE_RECORD, wine_name="A Wine")
+    _write_cellar(knowledge_dir, {"zzz-wine": record_b, "aaa-wine": record_a})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+
+    aaa_index = sent_prompt.index("aaa-wine")
+    zzz_index = sent_prompt.index("zzz-wine")
+    assert aaa_index < zzz_index
+
+
+def test_cellar_grape_order_is_preserved(wine, fake_provider, knowledge_dir):
+    record = dict(_SAMPLE_RECORD, grapes=["Merlot", "Cabernet Franc", "Petit Verdot"])
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Grapes: Merlot, Cabernet Franc, Petit Verdot" in sent_prompt
+
+
+def test_cellar_unknown_fields_are_ignored(wine, fake_provider, knowledge_dir):
+    record = dict(_SAMPLE_RECORD, favorite_glassware="Riedel")
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Riedel" not in sent_prompt
+    assert "favorite_glassware" not in sent_prompt
+
+
+def test_cellar_two_records_with_same_wine_name_remain_separate_via_record_key(
+    wine, fake_provider, knowledge_dir
+):
+    record_1 = dict(_SAMPLE_RECORD)
+    record_2 = dict(_SAMPLE_RECORD, quantity=1)
+    _write_cellar(
+        knowledge_dir,
+        {"sample-red-2021-case-a": record_1, "sample-red-2021-case-b": record_2},
+    )
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Cellar ID: sample-red-2021-case-a" in sent_prompt
+    assert "Cellar ID: sample-red-2021-case-b" in sent_prompt
+
+
+def test_profile_and_cellar_remain_separate_sections(wine, fake_provider, knowledge_dir):
+    _write_profile(knowledge_dir, {"notes": "Prefers Old World wines."})
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+
+    profile_index = sent_prompt.index("Personal wine profile:")
+    cellar_index = sent_prompt.index("Personal wine cellar:")
+    assert profile_index < cellar_index
+
+
+def test_fallback_prompt_order_is_instructions_profile_cellar_conversation_request(
+    wine, fake_provider, memory_manager, knowledge_dir
+):
+    _write_profile(knowledge_dir, {"notes": "Prefers Old World wines."})
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+    memory_manager.remember("conversation", "What's a good everyday red?", metadata={"role": "user"})
+    memory_manager.remember("conversation", "Try a Cotes du Rhone.", metadata={"role": "assistant"})
+
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+
+    sent_prompt = fake_provider.received_prompts[0]
+    instructions_index = sent_prompt.index(_FALLBACK_INSTRUCTIONS)
+    profile_index = sent_prompt.index("Personal wine profile:")
+    cellar_index = sent_prompt.index("Personal wine cellar:")
+    context_index = sent_prompt.index("Conversation context:")
+    request_index = sent_prompt.index("Current user request:")
+    prompt_index = sent_prompt.index(prompt)
+
+    assert (
+        instructions_index
+        < profile_index
+        < cellar_index
+        < context_index
+        < request_index
+        < prompt_index
+    )
+
+
+def test_fallback_prompt_current_request_appears_verbatim(wine, fake_provider):
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+    sent_prompt = fake_provider.received_prompts[0]
+    assert f"Current user request:\n{prompt}" in sent_prompt
+
+
+def test_fallback_instructions_include_everyday_versus_special_policy():
+    assert "special_occasion: true" in _FALLBACK_INSTRUCTIONS
+    assert "Never assume an occasion is special" in _FALLBACK_INSTRUCTIONS
+
+
+def test_no_cellar_produces_no_invented_cellar_section(wine, fake_provider):
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Cellar ID" not in sent_prompt
+
+
+def test_cellar_over_limit_produces_honest_size_limit_section_without_individual_records(
+    wine, fake_provider, knowledge_dir
+):
+    records = {
+        f"wine-{i:03d}": dict(_SAMPLE_RECORD, wine_name=f"Wine {i}") for i in range(101)
+    }
+    _write_cellar(knowledge_dir, records)
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine cellar:" in sent_prompt
+    assert "101" in sent_prompt
+    assert "100" in sent_prompt
+    assert "Cellar ID" not in sent_prompt
+    assert len(fake_provider.received_prompts) == 1
+
+
+def test_cellar_at_limit_includes_every_active_record(wine, fake_provider, knowledge_dir):
+    records = {
+        f"wine-{i:03d}": dict(_SAMPLE_RECORD, wine_name=f"Wine {i}") for i in range(100)
+    }
+    _write_cellar(knowledge_dir, records)
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    sent_prompt = fake_provider.received_prompts[0]
+    assert sent_prompt.count("Cellar ID") == 100
+
+
+# --- Milestone 27: cellar validation ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"wine_name": "Reserve Red", "color": "red", "quantity": 1},
+        {"producer": "Sample Estate", "color": "red", "quantity": 1},
+        {"producer": "Sample Estate", "wine_name": "Reserve Red", "quantity": 1},
+        {"producer": "Sample Estate", "wine_name": "Reserve Red", "color": "red"},
+        {"producer": "", "wine_name": "Reserve Red", "color": "red", "quantity": 1},
+        {"producer": "Sample Estate", "wine_name": "", "color": "red", "quantity": 1},
+        {"producer": "Sample Estate", "wine_name": "Reserve Red", "color": "", "quantity": 1},
+        {
+            "producer": "Sample Estate",
+            "wine_name": "Reserve Red",
+            "color": "red",
+            "quantity": True,
+        },
+        {
+            "producer": "Sample Estate",
+            "wine_name": "Reserve Red",
+            "color": "red",
+            "quantity": -1,
+        },
+        {
+            "producer": "Sample Estate",
+            "wine_name": "Reserve Red",
+            "color": "red",
+            "quantity": 1.5,
+        },
+    ],
+)
+def test_cellar_missing_or_invalid_required_fields_raise_value_error(
+    wine, fake_provider, knowledge_dir, record
+):
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert fake_provider.received_prompts == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"country": ""},
+        {"country": 5},
+        {"region": ""},
+        {"style": 5},
+        {"drinking_window": ""},
+        {"notes": 5},
+        {"grapes": "Merlot"},
+        {"grapes": [""]},
+        {"grapes": [5]},
+        {"vintage": 1799},
+        {"vintage": 2101},
+        {"vintage": True},
+        {"vintage": "1999"},
+        {"vintage": "nv"},
+        {"estimated_price": -1},
+        {"estimated_price": True},
+        {"estimated_price": "30"},
+        {"vivino_rating": -0.1},
+        {"vivino_rating": 5.1},
+        {"vivino_rating": True},
+        {"special_occasion": "true"},
+        {"special_occasion": 1},
+    ],
+)
+def test_cellar_invalid_optional_fields_raise_value_error(
+    wine, fake_provider, knowledge_dir, overrides
+):
+    record = dict(_SAMPLE_RECORD)
+    record.update(overrides)
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert fake_provider.received_prompts == []
+
+
+def test_cellar_estimated_price_without_currency_raises_value_error(
+    wine, fake_provider, knowledge_dir
+):
+    record = dict(_SAMPLE_RECORD)
+    del record["price_currency"]
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert fake_provider.received_prompts == []
+
+
+def test_cellar_currency_without_estimated_price_raises_value_error(
+    wine, fake_provider, knowledge_dir
+):
+    record = dict(_SAMPLE_RECORD)
+    del record["estimated_price"]
+    _write_cellar(knowledge_dir, {"sample-red-2021": record})
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert fake_provider.received_prompts == []
+
+
+def test_cellar_zero_quantity_record_is_still_validated(wine, fake_provider, knowledge_dir):
+    invalid_zero_record = {
+        "producer": "Sample Estate",
+        "wine_name": "Reserve Red",
+        "color": "red",
+        "quantity": 0,
+        "vintage": 9999,
+    }
+    _write_cellar(knowledge_dir, {"sample-red-2021": invalid_zero_record})
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert fake_provider.received_prompts == []
+
+
+def test_cellar_malformed_json_propagates_as_value_error(wine, fake_provider, knowledge_dir):
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "wine_cellar.json").write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert fake_provider.received_prompts == []
+
+
+def test_valid_cellar_fallback_calls_provider_exactly_once_and_returns_exact_response(
+    wine, fake_provider, knowledge_dir
+):
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+    response = wine.handle("What's a good Bordeaux vintage from 2015?")
+    assert len(fake_provider.received_prompts) == 1
+    assert response is fake_provider.response

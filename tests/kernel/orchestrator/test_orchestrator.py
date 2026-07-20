@@ -356,6 +356,62 @@ def test_end_to_end_routed_wine_fallback_sees_synthetic_profile_under_tmp_path(
     assert "Preferred styles: dry Riesling, Barolo" in sent_prompt
 
 
+def test_end_to_end_routed_wine_fallback_sees_synthetic_cellar_under_tmp_path(
+    monkeypatch, tmp_path
+):
+    # Milestone 27: prove the cellar inventory reaches WineCapability's
+    # fallback prompt through the real CapabilityLoader and the
+    # orchestrator's own KnowledgeStore instance, all under tmp_path.
+    config = _make_config(tmp_path)
+    fallback_response = ModelResponse(
+        text="A Loire Valley Sauvignon Blanc is a versatile, food-friendly choice.",
+        model="fake-model",
+        input_tokens=17,
+        output_tokens=29,
+        latency_seconds=0.42,
+    )
+    fake_provider = FakeModelProvider(fallback_response)
+
+    config.knowledge_storage_dir.mkdir(parents=True)
+    (config.knowledge_storage_dir / "wine_cellar.json").write_text(
+        json.dumps(
+            {
+                "sample-red-2021": {
+                    "producer": "Sample Estate",
+                    "wine_name": "Reserve Red",
+                    "color": "red",
+                    "quantity": 3,
+                    "vintage": 2021,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_loader = CapabilityLoader()
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    # Contains the whole word "wine" but avoids all eight deterministic food
+    # categories, so it hits WineCapability's model-backed fallback.
+    response = orchestrator.handle("What's a good wine region to explore?")
+
+    assert response is fallback_response
+    assert len(fake_provider.received_prompts) == 1
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine cellar:" in sent_prompt
+    assert "Cellar ID: sample-red-2021" in sent_prompt
+    assert "Producer: Sample Estate" in sent_prompt
+    assert "Quantity: 3" in sent_prompt
+
+    record = _read_last_log_record(config.log_path)
+    assert record["model"] == "fake-model"
+    assert record["input_tokens"] == 17
+    assert record["output_tokens"] == 29
+    assert record["latency_seconds"] == 0.42
+
+    # Nothing should have been written under the repository's real storage/.
+    assert not (_PROJECT_ROOT / "storage" / "knowledge" / "wine_cellar.json").exists()
+
+
 # --- Fallback branch -----------------------------------------------------
 
 

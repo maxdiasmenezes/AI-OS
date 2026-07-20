@@ -2,10 +2,11 @@
 
 import json
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
+from capabilities.loader import CapabilityLoader
 from capabilities.wine.capability import WineCapability
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
@@ -123,11 +124,36 @@ def test_wine_prompt_routes_to_capability_and_skips_model(monkeypatch, tmp_path)
     orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
     response = orchestrator.handle("What wine goes with steak?")
 
-    loader.assert_called_once_with("wine", fake_provider)
+    loader.assert_called_once_with("wine", fake_provider, ANY)
     assert fake_capability.received_prompts == ["What wine goes with steak?"]
     assert response.text == "a bold Malbec would work well"
     assert response.model == "capability:wine"
     assert fake_provider.received_prompts == []
+
+
+def test_orchestrator_passes_its_own_provider_and_memory_manager_to_loader(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeCapability("wine", "a bold Malbec would work well")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("What wine goes with steak?")
+
+    loader.assert_called_once()
+    call_id, call_provider, call_memory = loader.call_args.args
+    assert call_id == "wine"
+    assert call_provider is fake_provider
+    assert isinstance(call_memory, MemoryManager)
+
+    # Prove it's the same MemoryManager instance the orchestrator itself
+    # persists to (not just any instance), by recalling through the
+    # reference the loader received.
+    entries = call_memory.recall("conversation")
+    assert [e.content for e in entries] == [
+        "What wine goes with steak?",
+        "a bold Malbec would work well",
+    ]
 
 
 # --- Routed branch: model-backed capability results ----------------------
@@ -188,7 +214,8 @@ def test_orchestrator_with_real_wine_capability_preserves_fallback_metadata(monk
         latency_seconds=0.42,
     )
     fake_provider = FakeModelProvider(fallback_response)
-    loader = Mock(return_value=WineCapability(fake_provider))
+    wine_memory = MemoryManager(config.memory_settings)
+    loader = Mock(return_value=WineCapability(fake_provider, wine_memory))
 
     orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
     # Contains the whole word "wine" (routes to WineCapability) but avoids
@@ -204,6 +231,44 @@ def test_orchestrator_with_real_wine_capability_preserves_fallback_metadata(monk
 
     record = _read_last_log_record(config.log_path)
     assert record["response"] == fallback_response.text
+    assert record["model"] == "fake-model"
+    assert record["input_tokens"] == 17
+    assert record["output_tokens"] == 29
+    assert record["latency_seconds"] == 0.42
+
+
+def test_end_to_end_routed_wine_fallback_sees_conversation_history_under_tmp_path(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fallback_response = ModelResponse(
+        text="A Loire Valley Sauvignon Blanc is a versatile, food-friendly choice.",
+        model="fake-model",
+        input_tokens=17,
+        output_tokens=29,
+        latency_seconds=0.42,
+    )
+    fake_provider = FakeModelProvider(fallback_response)
+
+    # Seed conversation memory under tmp_path before running the request,
+    # using the same storage settings the orchestrator's MemoryManager reads.
+    seed_memory = MemoryManager(config.memory_settings)
+    seed_memory.remember("conversation", "What's a good everyday red?", metadata={"role": "user"})
+    seed_memory.remember("conversation", "Try a Cotes du Rhone.", metadata={"role": "assistant"})
+
+    real_loader = CapabilityLoader()
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    # Contains the whole word "wine" but avoids all eight deterministic food
+    # categories, so it hits WineCapability's model-backed fallback.
+    response = orchestrator.handle("What's a good wine region to explore?")
+
+    assert response is fallback_response
+    assert len(fake_provider.received_prompts) == 1
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Try a Cotes du Rhone." in sent_prompt
+    assert "What's a good wine region to explore?" in sent_prompt
+
+    record = _read_last_log_record(config.log_path)
     assert record["model"] == "fake-model"
     assert record["input_tokens"] == 17
     assert record["output_tokens"] == 29

@@ -10,6 +10,7 @@ instantiates it.
 
 from kernel.capabilities import CapabilityRegistry
 from kernel.capabilities.base import Capability
+from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider
 
 from capabilities.wine.capability import WineCapability
@@ -25,7 +26,12 @@ class CapabilityLoader:
     def __init__(self, registry: CapabilityRegistry | None = None) -> None:
         self._registry = registry or CapabilityRegistry()
 
-    def load(self, capability_id: str, model_provider: ModelProvider) -> Capability:
+    def load(
+        self,
+        capability_id: str,
+        model_provider: ModelProvider,
+        memory_manager: MemoryManager,
+    ) -> Capability:
         """Return a new instance of the capability with the given id."""
 
         if self._registry.get_capability(capability_id) is None:
@@ -35,4 +41,4 @@ class CapabilityLoader:
         if capability_class is None:
             raise ValueError(f"no implementation registered for capability: {capability_id}")
 
-        return capability_class(model_provider)
+        return capability_class(model_provider, memory_manager)

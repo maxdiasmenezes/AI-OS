@@ -27,7 +27,7 @@ class Orchestrator:
     def __init__(
         self,
         config: Config,
-        capability_loader: Callable[[str, ModelProvider], Capability],
+        capability_loader: Callable[[str, ModelProvider, MemoryManager], Capability],
     ) -> None:
         self._config = config
         self._provider = get_provider(config)
@@ -40,7 +40,11 @@ class Orchestrator:
 
         capability_id = self._router.route(user_prompt)
         if capability_id is not None:
-            capability = self._capability_loader(capability_id, self._provider)
+            capability = self._capability_loader(
+                capability_id,
+                self._provider,
+                self._memory,
+            )
             capability_result = capability.handle(user_prompt)
             if isinstance(capability_result, ModelResponse):
                 response = capability_result

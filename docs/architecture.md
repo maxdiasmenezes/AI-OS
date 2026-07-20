@@ -42,8 +42,8 @@ to the kernel.
                                              +----------------+
 
   kernel/knowledge: read-only KnowledgeStore contract + JSON implementation,
-  not yet wired into any capability. kernel/tools: directory exists;
-  planned, no code yet.
+  wired into WineCapability's model-backed fallback for an optional personal
+  wine profile. kernel/tools: directory exists; planned, no code yet.
 ```
 
 ## Layers
@@ -67,29 +67,34 @@ business logic of their own.
 
 - **orchestrator** — receives a prompt, decides whether a capability should
   handle it, and returns the result either way. Implemented: it wires up a
-  model provider, a memory manager, and a capability router once per run, then
-  owns the per-request routing/fallback decision described in
-  [Request flow](#request-flow). On the routed branch it passes its own
-  provider and memory manager instances to the capability loader
-  (`capability_loader(capability_id, self._provider, self._memory)`), so a
-  capability can reuse the same provider and memory manager the orchestrator
-  already built, rather than constructing or configuring its own.
+  model provider, a memory manager, a read-only knowledge store (a
+  `JSONKnowledgeStore` constructed from `config.knowledge_storage_dir`), and
+  a capability router once per run, then owns the per-request routing/fallback
+  decision described in [Request flow](#request-flow). On the routed branch it
+  passes its own provider, memory manager, and knowledge store instances to
+  the capability loader (`capability_loader(capability_id, self._provider,
+  self._memory, self._knowledge)`), so a capability can reuse the same
+  instances the orchestrator already built, rather than constructing or
+  configuring its own.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
   in `kernel/config/config.yaml` (`storage/memory/` by default).
 - **knowledge** — the shared knowledge base infrastructure (storage and
-  retrieval) capabilities would use to look up domain knowledge. A minimal,
+  retrieval) capabilities use to look up domain knowledge. A minimal,
   read-only contract exists: `KnowledgeStore` (`kernel/knowledge/base.py`)
   defines `get(namespace, key)` and `list_records(namespace)`, with one
   implementation, `JSONKnowledgeStore` (`kernel/knowledge/json_store.py`),
   that reads one keyed JSON document per namespace
   (`<storage_dir>/<namespace>.json`) from a storage directory explicitly
-  injected by the caller. A missing namespace is treated as empty; malformed
-  knowledge data raises an error rather than being treated as an empty
-  store. No capability consumes it yet — `WineCapability` integration and a
-  wine-specific schema remain planned. There is no write API, search,
-  embeddings, vector retrieval, or web access.
+  injected by the caller — the orchestrator constructs the shared instance
+  from `config.knowledge_storage_dir` (`kernel/config/config.yaml`'s
+  `knowledge.storage_dir`, `storage/knowledge` by default). A missing
+  namespace is treated as empty; malformed knowledge data raises an error
+  rather than being treated as an empty store. `WineCapability` is the first
+  consumer, reading an optional personal wine-preferences profile (see
+  Capabilities below); there is still no write API, search, embeddings,
+  vector retrieval, or web access.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -103,8 +108,11 @@ business logic of their own.
   only a README describing intent.
 - **config** — settings that govern how the kernel and its components
   behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
-  (active provider, provider settings, memory and log locations), secrets load
-  from `.env` (`kernel/config/config.py`).
+  (active provider, provider settings, memory, knowledge, and log locations),
+  secrets load from `.env` (`kernel/config/config.py`). `Config.knowledge_storage_dir`
+  is resolved to an absolute `Path` the same way `log_path` is — relative to
+  the repository root — so `JSONKnowledgeStore` can be constructed directly
+  from it without any further path handling.
 
 The kernel is domain-agnostic. It knows how to run a capability; it does not
 know what wine, travel, or strategy mean.
@@ -129,34 +137,46 @@ know what wine, travel, or strategy mean.
 - **Loader** (`capabilities/loader.py`) — the one place allowed to know about
   concrete capability classes; maps a known id to its class and instantiates
   it (currently `{"wine": WineCapability}`). `CapabilityLoader.load(capability_id,
-  model_provider, memory_manager)` takes the model provider and memory
-  manager explicitly and passes both to the capability's constructor — the
-  loader does not construct or configure either itself.
+  model_provider, memory_manager, knowledge_store)` takes the model
+  provider, memory manager, and knowledge store explicitly and passes all
+  three to the capability's constructor — the loader does not construct or
+  configure any of them itself.
 - **Router** (`kernel/orchestrator/router.py`) — deterministic prompt-to-id
   matching; currently a single rule (`\bwine\b`, case-insensitive) routes to
   `"wine"`, otherwise returns `None`.
 - **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1
-  plus a memory-aware, model-backed fallback. Constructed with two explicit
-  dependencies, `WineCapability(model_provider, memory_manager)`, both
-  injected rather than self-constructed. Wine Pairing v1 is deterministic,
-  keyword-based food-to-wine pairing across eight food categories with a
-  defined priority order for overlapping matches (e.g. "spicy shrimp"
-  resolves to spicy, not shellfish) — no model calls, no memory recall, and
-  `handle()` returns a plain `str` for these, immediately on match. A
+  plus a memory- and knowledge-aware, model-backed fallback. Constructed
+  with three explicit dependencies, `WineCapability(model_provider,
+  memory_manager, knowledge_store)`, all injected rather than
+  self-constructed. Wine Pairing v1 is deterministic, keyword-based
+  food-to-wine pairing across eight food categories with a defined priority
+  order for overlapping matches (e.g. "spicy shrimp" resolves to spicy, not
+  shellfish) — no model calls, no memory recall, no knowledge-store access,
+  and `handle()` returns a plain `str` for these, immediately on match. A
   wine-related prompt that matches none of the eight categories falls back
-  to the injected `ModelProvider` (`kernel/models/base.py`): it first
-  recalls the last 10 entries from the existing `"conversation"` memory
-  namespace via the injected `MemoryManager`, in chronological order, and
-  includes them in the fallback prompt as plain conversational history
-  (role and content per turn) only when entries exist, followed by the
-  current request. The model call is scoped to wine expertise by
-  `prompts/wine/fallback.md`, and `handle()` returns that call's real
-  `ModelResponse` unchanged. `WineCapability` does not persist anything
-  itself — the orchestrator remains responsible for writing memory after
-  `handle()` returns. This is recalled conversation history only, not
-  structured preferences or personal cellar knowledge; there is still no
-  knowledge retrieval, tools, web access, or personal cellar database.
-  Covered by an automated pytest suite
+  to the injected `ModelProvider` (`kernel/models/base.py`): it first reads
+  an optional personal wine-preferences profile via
+  `knowledge_store.get("wine_profile", "profile")` (the only knowledge
+  access it performs), then recalls the last 10 entries from the existing
+  `"conversation"` memory namespace via the injected `MemoryManager`, in
+  chronological order. The fallback prompt is assembled in a fixed order:
+  wine-expert instructions, the personal profile (only when it contains at
+  least one recognized, non-empty field), recalled conversation history
+  (role and content per turn, only when entries exist), then the current
+  request. The recognized profile fields — `preferred_styles`,
+  `disliked_styles`, `budget_range`, `priorities`, `notes` — are validated
+  by small private logic inside `capabilities/wine/capability.py`; an
+  unrecognized field is ignored, and a recognized field with an invalid
+  type or list value raises `ValueError` rather than being silently
+  coerced. The model call is scoped to wine expertise by
+  `prompts/wine/fallback.md`, which distinguishes the durable personal
+  profile from recent, possibly-unrelated conversation context, and
+  `handle()` returns that call's real `ModelResponse` unchanged.
+  `WineCapability` does not persist or write anything itself — the
+  orchestrator remains responsible for writing memory after `handle()`
+  returns, and nothing in this capability ever writes to the knowledge
+  store. There is still no cellar inventory, bottle-level data, tools, or
+  web access. Covered by an automated pytest suite
   (`tests/capabilities/wine/test_capability.py`).
 
 Each capability is meant to be a self-contained domain expert that uses
@@ -183,9 +203,12 @@ wine-specific data owned by that capability.
 knowledge. The kernel's `memory` module defines *how* conversation data is
 structured and stored (JSONL); `storage/` is *where* it is kept at rest
 (`storage/memory/`, `storage/logs/`). `kernel/knowledge`'s
-`JSONKnowledgeStore` reads from `storage/knowledge/` the same way, though no
-capability writes or reads real data there yet. Backups are not yet
-implemented.
+`JSONKnowledgeStore` reads from `storage/knowledge/` the same way — a real
+personal wine profile would live at `storage/knowledge/wine_profile.json` —
+but `storage/**/*.jsonl` and `storage/knowledge/*.json` are gitignored, and
+no such file is committed to this repository. Nothing writes to
+`storage/knowledge/` either; a human would place that file there directly.
+Backups are not yet implemented.
 
 ### Scripts and tests
 
@@ -203,9 +226,10 @@ does today, run via the CLI entry point:
 2. The orchestrator asks the `CapabilityRouter` whether the prompt matches a
    capability.
 3. **If it matches** (routed branch): the `CapabilityLoader` instantiates the
-   matched capability, passing it the orchestrator's own provider and memory
-   manager (`capability_loader(capability_id, self._provider, self._memory)`),
-   and calls its `handle()` method. Today this only ever resolves to `wine`.
+   matched capability, passing it the orchestrator's own provider, memory
+   manager, and knowledge store (`capability_loader(capability_id,
+   self._provider, self._memory, self._knowledge)`), and calls its `handle()`
+   method. Today this only ever resolves to `wine`.
    If `handle()` returns a plain `str` (a deterministic response, no model
    call made), the orchestrator wraps it in a synthetic `ModelResponse` with
    `model="capability:<id>"` and zero token/latency counts. If `handle()`
@@ -246,7 +270,8 @@ this flow — a single call to `handle()` is one full request/response cycle.
 **Implemented:**
 
 - CLI entry point (`kernel/main.py`).
-- Orchestrator: routing/fallback decision, wiring of provider, memory, router.
+- Orchestrator: routing/fallback decision, wiring of provider, memory,
+  knowledge store, and router.
 - Model provider abstraction (`ModelProvider`, `get_provider()`), with an
   Ollama adapter configured as the active provider and exercised end-to-end.
   Adapter modules for Anthropic, OpenAI, and Gemini also exist in the
@@ -259,24 +284,28 @@ this flow — a single call to `handle()` is one full request/response cycle.
 - Capability contract (`handle(prompt) -> str | ModelResponse`), registry,
   explicit loader, and deterministic router.
 - One capability: `WineCapability` — Wine Pairing v1 (eight deterministic
-  food categories, no model or memory involvement) plus a memory-aware,
-  model-backed fallback for wine requests outside those categories,
-  recalling the last 10 `"conversation"` memory entries as context and
-  scoped by `prompts/wine/fallback.md` — with an automated pytest suite.
-  Both the model provider and memory manager are injected explicitly by
-  `CapabilityLoader`, sourced from the orchestrator's own instances.
+  food categories, no model, memory, or knowledge involvement) plus a
+  memory- and knowledge-aware, model-backed fallback for wine requests
+  outside those categories: it reads an optional personal wine-preferences
+  profile from the knowledge store, recalls the last 10 `"conversation"`
+  memory entries as context, and is scoped by `prompts/wine/fallback.md` —
+  with an automated pytest suite. The model provider, memory manager, and
+  knowledge store are all injected explicitly by `CapabilityLoader`, sourced
+  from the orchestrator's own instances.
 - Knowledge: a minimal, read-only `KnowledgeStore` contract
   (`kernel/knowledge/base.py`) and a `JSONKnowledgeStore` implementation
   (`kernel/knowledge/json_store.py`) that reads one keyed JSON document per
-  namespace from an explicitly injected storage directory. Not yet wired
-  into any capability.
+  namespace from an explicitly injected storage directory. Wired into
+  `WineCapability`'s fallback for a personal wine-preferences profile
+  (namespace `"wine_profile"`, key `"profile"`); no real profile data is
+  committed to this repository.
 
 **Planned / not yet implemented:**
 
 - Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
   currently placeholder directories only.
-- Knowledge store integration into a capability (`WineCapability`) and a
-  wine-specific schema; no search, embeddings, or vector retrieval.
+- Cellar inventory, bottle-level data, and purchase/ratings history in the
+  knowledge store; no search, embeddings, or vector retrieval.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

@@ -10,6 +10,7 @@ instantiates it.
 
 from kernel.capabilities import CapabilityRegistry
 from kernel.capabilities.base import Capability
+from kernel.knowledge import KnowledgeStore
 from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider
 
@@ -31,6 +32,7 @@ class CapabilityLoader:
         capability_id: str,
         model_provider: ModelProvider,
         memory_manager: MemoryManager,
+        knowledge_store: KnowledgeStore,
     ) -> Capability:
         """Return a new instance of the capability with the given id."""
 
@@ -41,4 +43,4 @@ class CapabilityLoader:
         if capability_class is None:
             raise ValueError(f"no implementation registered for capability: {capability_id}")
 
-        return capability_class(model_provider, memory_manager)
+        return capability_class(model_provider, memory_manager, knowledge_store)

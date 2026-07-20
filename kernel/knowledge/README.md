@@ -12,6 +12,16 @@ error; malformed knowledge data (invalid JSON, a non-object top-level value,
 or a non-object record) raises `ValueError` instead of being silently
 treated as empty.
 
-No capability consumes the knowledge store yet. `WineCapability` integration
-and a wine-specific schema remain planned. There is no write API, search,
-embeddings, vector retrieval, web access, or autonomous writes.
+`WineCapability` (`capabilities/wine/capability.py`) is the first consumer:
+it reads an optional personal wine-preferences profile at namespace
+`"wine_profile"`, key `"profile"`, via `knowledge_store.get("wine_profile",
+"profile")` only — never `list_records()`, and never outside its
+model-backed fallback path (the eight deterministic pairing categories never
+touch the knowledge store at all). The store itself stays exactly as
+read-only as before; schema validation of the profile record's fields lives
+entirely in `capabilities/wine/capability.py`, not here. Real profile data
+would live at `storage/knowledge/wine_profile.json` (already excluded from
+Git by `.gitignore`); no such file is committed, and nothing in this
+repository writes one. Cellar inventory, bottle-level data, search,
+embeddings, vector retrieval, web access, and any write API remain
+unimplemented.

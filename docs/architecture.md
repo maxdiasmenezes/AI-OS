@@ -142,8 +142,17 @@ know what wine, travel, or strategy mean.
   three to the capability's constructor — the loader does not construct or
   configure any of them itself.
 - **Router** (`kernel/orchestrator/router.py`) — deterministic prompt-to-id
-  matching; currently a single rule (`\bwine\b`, case-insensitive) routes to
-  `"wine"`, otherwise returns `None`.
+  matching; routes to `"wine"` on the literal, case-insensitive whole word
+  `\bwine\b`, or on a small, explicit set of natural wine-selection and
+  food-pairing phrases (e.g. "which bottle should I open", or a
+  pairing/selection verb combined with a small set of router-level food
+  cues such as "pair this with chicken"), otherwise returns `None`. These
+  phrase rules are plain compiled regexes with no model calls, fuzzy
+  matching, scoring, or configuration involved, and are intentionally
+  conservative: generic words like "drink", "bottle", "pair", "open",
+  "suitable", or "food" never route on their own, only specific phrases or
+  combinations do. The router does not depend on or import from
+  `capabilities/wine/capability.py`.
 - **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1
   plus a memory- and knowledge-aware, model-backed fallback. Constructed
   with three explicit dependencies, `WineCapability(model_provider,

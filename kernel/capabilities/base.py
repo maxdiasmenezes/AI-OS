@@ -8,6 +8,8 @@ or routing.
 
 from abc import ABC, abstractmethod
 
+from kernel.models.base import ModelResponse
+
 
 class Capability(ABC):
     """Common interface every capability must implement."""
@@ -19,6 +21,11 @@ class Capability(ABC):
         ...
 
     @abstractmethod
-    def handle(self, prompt: str) -> str:
-        """Handle a single prompt and return a response."""
+    def handle(self, prompt: str) -> str | ModelResponse:
+        """Handle a single prompt and return a response.
+
+        A plain str means a deterministic response with no model call. A
+        ModelResponse means the capability called a model itself and the
+        result should carry that model's real metadata.
+        """
         ...

@@ -15,6 +15,13 @@ preparation/sauce categories take priority over protein categories, in
 this order: dessert, spicy, tomato_pasta, shellfish, fish, pork, poultry,
 red_meat.
 
-Wine-related requests that don't match a supported category (e.g. wine
-regions, specific bottles, budget questions) get an explicit "out of
-scope" response rather than a guess.
+## Model-backed fallback
+
+A wine-related request that doesn't match any of the eight categories
+above (e.g. wine regions, specific bottles, vintages, general buying or
+serving questions) is passed to the injected model provider instead of
+returning a canned "out of scope" message. The model is scoped to
+wine-expert territory by `prompts/wine/fallback.md` and given the original
+request verbatim. Still no cellar data, personal preferences, memory
+injection, tools, or external APIs — just general wine knowledge from the
+model.

@@ -104,8 +104,14 @@ know what wine, travel, or strategy mean.
 **wine** — reached through a small, explicit pipeline:
 
 - **Capability contract** (`kernel/capabilities/base.py`) — an ABC every
-  capability implements: an `id` property and a `handle(prompt) -> str`
-  method.
+  capability implements: an `id` property and a
+  `handle(prompt) -> str | ModelResponse` method. Returning a plain `str`
+  means a deterministic response with no model call; returning a
+  `ModelResponse` (the kernel's provider-agnostic model-result type,
+  `kernel/models/base.py`) means the capability called a model itself and
+  the result carries that model's real metadata. The orchestrator branches
+  on which type it gets back (see Request flow) — it never inspects a
+  capability's internals to decide.
 - **Registry** (`kernel/capabilities/registry.py`) — discovers capability
   directories under `capabilities/` by name, without importing anything
   inside them.
@@ -118,15 +124,16 @@ know what wine, travel, or strategy mean.
 - **Router** (`kernel/orchestrator/router.py`) — deterministic prompt-to-id
   matching; currently a single rule (`\bwine\b`, case-insensitive) routes to
   `"wine"`, otherwise returns `None`.
-- **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1:
-  deterministic, keyword-based food-to-wine pairing across eight food
-  categories with a defined priority order for overlapping matches (e.g.
-  "spicy shrimp" resolves to spicy, not shellfish). No model calls, no
-  external lookups. Its constructor accepts a `ModelProvider` (the kernel
-  abstraction, `kernel/models/base.py`) and retains it, but `handle()` does
-  not call it yet — the provider is wired through in anticipation of a
-  model-backed fallback for out-of-scope requests, planned for a later
-  milestone. Covered by an automated pytest suite
+- **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1
+  plus a model-backed fallback: deterministic, keyword-based food-to-wine
+  pairing across eight food categories with a defined priority order for
+  overlapping matches (e.g. "spicy shrimp" resolves to spicy, not
+  shellfish) — no model calls, no external lookups, and `handle()` returns
+  a plain `str` for these. A wine-related prompt that matches none of the
+  eight categories falls back to the injected `ModelProvider`
+  (`kernel/models/base.py`), scoped to wine expertise by
+  `prompts/wine/fallback.md`, and `handle()` returns that call's real
+  `ModelResponse` unchanged. Covered by an automated pytest suite
   (`tests/capabilities/wine/test_capability.py`).
 
 Each capability is meant to be a self-contained domain expert that uses
@@ -142,6 +149,10 @@ remain unimplemented.
 and capabilities, kept separate from code so they can be reviewed and
 iterated on independently. `prompts/system.md` is implemented and loaded by
 `kernel/prompts/builder.py` for the model-fallback path (see below).
+`prompts/wine/fallback.md` holds the wine-expert-scoping instructions for
+WineCapability's model-backed fallback; it is loaded directly by
+`capabilities/wine/capability.py`, not by `kernel/prompts/`, since it is
+wine-specific data owned by that capability.
 
 ### Storage
 
@@ -167,8 +178,15 @@ does today, run via the CLI entry point:
 2. The orchestrator asks the `CapabilityRouter` whether the prompt matches a
    capability.
 3. **If it matches** (routed branch): the `CapabilityLoader` instantiates the
-   matched capability, and its `handle()` method returns the response text
-   directly — no model call is made. Today this only ever resolves to `wine`.
+   matched capability and calls its `handle()` method. Today this only ever
+   resolves to `wine`. If `handle()` returns a plain `str` (a deterministic
+   response, no model call made), the orchestrator wraps it in a synthetic
+   `ModelResponse` with `model="capability:<id>"` and zero token/latency
+   counts. If `handle()` returns a `ModelResponse` (the capability called a
+   model itself, as `WineCapability` does for wine requests outside its
+   eight deterministic categories), the orchestrator uses that response
+   unchanged, preserving its real model name, token counts, and latency. Any
+   other return type is a programming error and raises `TypeError`.
 4. **If it does not match** (fallback branch): `build_prompt()`
    (`kernel/prompts/builder.py`) assembles a prompt from the system prompt
    (`prompts/system.md`), the last 10 entries recalled from the
@@ -211,8 +229,11 @@ this flow — a single call to `handle()` is one full request/response cycle.
 - Interaction logging to `storage/logs/interactions.jsonl`.
 - System prompt (`prompts/system.md`), assembled with recalled memory for the
   model-fallback path.
-- Capability contract, registry, explicit loader, and deterministic router.
-- One capability: `WineCapability` (Wine Pairing v1), with an automated
+- Capability contract (`handle(prompt) -> str | ModelResponse`), registry,
+  explicit loader, and deterministic router.
+- One capability: `WineCapability` — Wine Pairing v1 (eight deterministic
+  food categories) plus a model-backed fallback for wine requests outside
+  those categories, scoped by `prompts/wine/fallback.md` — with an automated
   pytest suite.
 
 **Planned / not yet implemented:**

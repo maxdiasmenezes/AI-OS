@@ -1,15 +1,23 @@
 """
-Wine capability: deterministic Wine Pairing v1.
+Wine capability: deterministic Wine Pairing v1, with a model-backed fallback.
 
 Matches a prompt against a small, explicit set of food categories and
-returns a wine-style recommendation with a brief explanation. No model
-calls, no external lookups - just keyword rules.
+returns a wine-style recommendation with a brief explanation - no model
+calls, just keyword rules. A wine-related prompt that matches none of the
+categories falls back to the injected ModelProvider, scoped to wine expertise
+via prompts/wine/fallback.md.
 """
 
 import re
+from pathlib import Path
 
 from kernel.capabilities.base import Capability
-from kernel.models.base import ModelProvider
+from kernel.models.base import ModelProvider, ModelResponse
+
+# capabilities/wine/capability.py -> capabilities/wine -> capabilities -> project root
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_FALLBACK_PROMPT_PATH = _PROJECT_ROOT / "prompts" / "wine" / "fallback.md"
+_FALLBACK_INSTRUCTIONS = _FALLBACK_PROMPT_PATH.read_text(encoding="utf-8").strip()
 
 # Each entry: (category id, human label, keywords, wine style, explanation).
 # Keywords are matched case-insensitively as whole words/phrases.
@@ -88,12 +96,6 @@ _PATTERNS = {
     for category_id, data in _CATEGORIES.items()
 }
 
-_OUT_OF_SCOPE_RESPONSE = (
-    "I can currently suggest wine pairings for: red meat, poultry, pork, shellfish, "
-    "fish, tomato-based pasta/pizza, spicy food, and chocolate/dessert. This request "
-    "doesn't match one of those yet, so I can't give a reliable pairing."
-)
-
 
 class WineCapability(Capability):
     """AI employee for wine: deterministic food-to-wine pairing (v1)."""
@@ -105,7 +107,7 @@ class WineCapability(Capability):
     def id(self) -> str:
         return "wine"
 
-    def handle(self, prompt: str) -> str:
+    def handle(self, prompt: str) -> str | ModelResponse:
         for category_id in _PRIORITY_ORDER:
             if _PATTERNS[category_id].search(prompt):
                 data = _CATEGORIES[category_id]
@@ -114,4 +116,8 @@ class WineCapability(Capability):
                     f"- Recommended: {data['wine_style']}\n"
                     f"- Why: {data['explanation']}"
                 )
-        return _OUT_OF_SCOPE_RESPONSE
+        return self._fallback(prompt)
+
+    def _fallback(self, prompt: str) -> ModelResponse:
+        fallback_prompt = f"{_FALLBACK_INSTRUCTIONS}\n\n{prompt}"
+        return self._model_provider.send_prompt(fallback_prompt)

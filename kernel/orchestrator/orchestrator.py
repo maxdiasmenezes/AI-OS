@@ -41,14 +41,22 @@ class Orchestrator:
         capability_id = self._router.route(user_prompt)
         if capability_id is not None:
             capability = self._capability_loader(capability_id, self._provider)
-            text = capability.handle(user_prompt)
-            response = ModelResponse(
-                text=text,
-                model=f"capability:{capability_id}",
-                input_tokens=0,
-                output_tokens=0,
-                latency_seconds=0.0,
-            )
+            capability_result = capability.handle(user_prompt)
+            if isinstance(capability_result, ModelResponse):
+                response = capability_result
+            elif isinstance(capability_result, str):
+                response = ModelResponse(
+                    text=capability_result,
+                    model=f"capability:{capability_id}",
+                    input_tokens=0,
+                    output_tokens=0,
+                    latency_seconds=0.0,
+                )
+            else:
+                raise TypeError(
+                    f"capability {capability_id!r} returned unsupported result type "
+                    f"{type(capability_result).__name__}; expected str or ModelResponse"
+                )
         else:
             augmented_prompt = build_prompt(user_prompt, self._memory)
             response = self._provider.send_prompt(augmented_prompt)

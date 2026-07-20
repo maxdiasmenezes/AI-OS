@@ -193,21 +193,25 @@ know what wine, travel, or strategy mean.
   `region`, `style`, `grapes` as a list of non-empty strings in authored
   order, `estimated_price` paired with `price_currency` — both present or
   both absent, `vivino_rating` from 0 through 5, `drinking_window`,
-  `notes`, and `special_occasion` as a bool, rendered only when `true`). An
-  invalid required or recognized-optional field raises `ValueError` naming
-  the record and field, before the provider is ever called; unknown fields
-  are ignored and nothing is coerced. After validation, zero-quantity
-  records are excluded and the remaining active records are sorted by
-  record key only — never merged, deduplicated, or ranked by price,
-  rating, producer, vintage, or model inference. A private constant caps a
-  single prompt at 100 active records; above that, no partial inventory is
-  sent — an honest section states the count, the limit, and that the model
-  should ask the user to narrow the request instead of claiming to have
-  evaluated the whole cellar, and the provider is still called exactly
-  once. Deterministic bottle-count lookup and wine-name matching over the
-  cellar remain unimplemented — a "how many bottles of X do I have"
-  question is still answered by the model from the structured cellar
-  context, not by exact code-level lookup.
+  `notes`, and `special_occasion` as a bool, rendered only when `true`). This
+  field schema and its validation logic (`validate_cellar_record()`) live in
+  `capabilities/wine/cellar_schema.py`, not in `capability.py` — a shared,
+  domain-level module with no dependency on prompts, provider calls, or
+  fallback behavior. `WineCapability` imports and calls it; it does not
+  duplicate the rules. An invalid required or recognized-optional field
+  raises `ValueError` naming the record and field, before the provider is
+  ever called; unknown fields are ignored and nothing is coerced. After
+  validation, zero-quantity records are excluded and the remaining active
+  records are sorted by record key only — never merged, deduplicated, or
+  ranked by price, rating, producer, vintage, or model inference. A private
+  constant caps a single prompt at 100 active records; above that, no
+  partial inventory is sent — an honest section states the count, the
+  limit, and that the model should ask the user to narrow the request
+  instead of claiming to have evaluated the whole cellar, and the provider
+  is still called exactly once. Deterministic bottle-count lookup and
+  wine-name matching over the cellar remain unimplemented — a "how many
+  bottles of X do I have" question is still answered by the model from the
+  structured cellar context, not by exact code-level lookup.
 
   The model call is scoped to wine expertise by `prompts/wine/fallback.md`,
   which distinguishes the durable personal profile, the real but read-only
@@ -256,15 +260,39 @@ personal wine profile would live at `storage/knowledge/wine_profile.json`,
 and a real personal cellar inventory at
 `storage/knowledge/wine_cellar.json` — but `storage/**/*.jsonl` and
 `storage/knowledge/*.json` are gitignored, and no such files are committed
-to this repository. Nothing writes to `storage/knowledge/` either; a human
-would place those files there directly. Backups are not yet implemented.
+to this repository. Nothing in the runtime kernel writes to
+`storage/knowledge/`; the one exception is `scripts/import_wine_cellar.py`
+(see Scripts and tests below), a human-invoked maintenance script that
+writes `storage/knowledge/wine_cellar.json` directly and outside the kernel
+entirely — it does not go through `KnowledgeStore`, which stays read-only.
+Backups are not yet implemented.
 
 ### Scripts and tests
 
 `scripts/` holds operational and maintenance scripts (setup, migrations,
-utilities). `tests/` holds test suites that verify kernel and capability
-behavior; today this covers `WineCapability`
-(`tests/capabilities/wine/test_capability.py`).
+utilities). One is implemented today: `scripts/import_wine_cellar.py`
+("Safe Cellar Import v1"), a human-controlled, model-free CLI that imports a
+CSV of wine holdings into `storage/knowledge/wine_cellar.json`. It validates
+the complete CSV — headers, row-level type conversion, and every record
+through the shared `capabilities/wine/cellar_schema.py` validator — before
+writing anything. It defaults to a dry run that prints a summary (source
+path, destination path, holding counts, whether the destination already
+exists) without touching disk; a file is only written when the caller passes
+`--write` explicitly, which serves as the human confirmation — there is no
+interactive prompt. A `--write` run replaces the entire destination document
+(no merge, no partial update, no quantity decrementing) by writing to a
+temporary file in the destination directory and moving it into place with
+`os.replace()`, so the write is atomic and a failure at any point leaves an
+existing destination file byte-for-byte unchanged. The script never calls a
+model and never runs on its own — there is no autonomous or scheduled write
+path. Deterministic cellar lookup, filtering, in-place updates, and quantity
+decrementing remain unimplemented; one CSV import is a full snapshot
+replacement, nothing more. `tests/` holds test suites that verify kernel and
+capability behavior; today this covers `WineCapability`
+(`tests/capabilities/wine/test_capability.py`) and the importer
+(`tests/scripts/test_import_wine_cellar.py`), the latter using only
+synthetic, dynamically constructed CSV content under `tmp_path` — no real
+storage data is read or written by the test suite.
 
 ## Request flow
 
@@ -349,18 +377,27 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `WineCapability`'s fallback for a personal wine-preferences profile
   (namespace `"wine_profile"`, key `"profile"`) and a read-only personal
   cellar inventory (namespace `"wine_cellar"`, one record per wine holding,
-  validated and formatted entirely in `capabilities/wine/capability.py`);
-  no real profile or cellar data is committed to this repository.
+  validated by `capabilities/wine/cellar_schema.py` and formatted by
+  `capabilities/wine/capability.py`); no real profile or cellar data is
+  committed to this repository.
+- Safe Cellar Import v1 (`scripts/import_wine_cellar.py`): a human-invoked,
+  model-free CLI, outside the runtime kernel, that validates a CSV against
+  the shared `cellar_schema.py` rules and, only with an explicit `--write`
+  flag, atomically replaces `storage/knowledge/wine_cellar.json` in full.
+  Dry run is the default; `KnowledgeStore` is never used as a write
+  interface.
 
 **Planned / not yet implemented:**
 
 - Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
   currently placeholder directories only.
-- Deterministic bottle-count lookup and wine-name matching over the cellar
-  inventory (the cellar is currently reasoned over by the model only); any
-  write API, quantity decrementing, or import/editing workflow for the
-  cellar; bottle-level purchase/ratings history beyond a cellar record's
-  own fields; no search, embeddings, or vector retrieval.
+- Deterministic bottle-count lookup, wine-name matching, filtering, and
+  in-place updates over the cellar inventory (the cellar is currently
+  reasoned over by the model only, and a CSV import is a full-replacement
+  snapshot, not an editing workflow); quantity decrementing; bottle-level
+  purchase/ratings history beyond a cellar record's own fields; no search,
+  embeddings, or vector retrieval; no write API on `KnowledgeStore` itself,
+  and no autonomous or scheduled write path for the cellar.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

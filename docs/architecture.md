@@ -41,7 +41,9 @@ to the kernel.
                                              |    (wine)      |
                                              +----------------+
 
-  kernel/knowledge, kernel/tools: directories exist; planned, no code yet.
+  kernel/knowledge: read-only KnowledgeStore contract + JSON implementation,
+  not yet wired into any capability. kernel/tools: directory exists;
+  planned, no code yet.
 ```
 
 ## Layers
@@ -77,8 +79,17 @@ business logic of their own.
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
   in `kernel/config/config.yaml` (`storage/memory/` by default).
 - **knowledge** — the shared knowledge base infrastructure (storage and
-  retrieval) capabilities would use to look up domain knowledge. Not yet
-  implemented — `kernel/knowledge/` contains only a README describing intent.
+  retrieval) capabilities would use to look up domain knowledge. A minimal,
+  read-only contract exists: `KnowledgeStore` (`kernel/knowledge/base.py`)
+  defines `get(namespace, key)` and `list_records(namespace)`, with one
+  implementation, `JSONKnowledgeStore` (`kernel/knowledge/json_store.py`),
+  that reads one keyed JSON document per namespace
+  (`<storage_dir>/<namespace>.json`) from a storage directory explicitly
+  injected by the caller. A missing namespace is treated as empty; malformed
+  knowledge data raises an error rather than being treated as an empty
+  store. No capability consumes it yet — `WineCapability` integration and a
+  wine-specific schema remain planned. There is no write API, search,
+  embeddings, vector retrieval, or web access.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -168,11 +179,13 @@ wine-specific data owned by that capability.
 
 ### Storage
 
-`storage/` is where persisted state actually lives: logs and memory. The
-kernel's `memory` module defines *how* conversation data is structured and
-stored (JSONL); `storage/` is *where* it is kept at rest
-(`storage/memory/`, `storage/logs/`). A knowledge base and backups are not
-yet implemented.
+`storage/` is where persisted state actually lives: logs, memory, and
+knowledge. The kernel's `memory` module defines *how* conversation data is
+structured and stored (JSONL); `storage/` is *where* it is kept at rest
+(`storage/memory/`, `storage/logs/`). `kernel/knowledge`'s
+`JSONKnowledgeStore` reads from `storage/knowledge/` the same way, though no
+capability writes or reads real data there yet. Backups are not yet
+implemented.
 
 ### Scripts and tests
 
@@ -252,12 +265,18 @@ this flow — a single call to `handle()` is one full request/response cycle.
   scoped by `prompts/wine/fallback.md` — with an automated pytest suite.
   Both the model provider and memory manager are injected explicitly by
   `CapabilityLoader`, sourced from the orchestrator's own instances.
+- Knowledge: a minimal, read-only `KnowledgeStore` contract
+  (`kernel/knowledge/base.py`) and a `JSONKnowledgeStore` implementation
+  (`kernel/knowledge/json_store.py`) that reads one keyed JSON document per
+  namespace from an explicitly injected storage directory. Not yet wired
+  into any capability.
 
 **Planned / not yet implemented:**
 
 - Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
   currently placeholder directories only.
-- Knowledge base storage and retrieval (`kernel/knowledge/`).
+- Knowledge store integration into a capability (`WineCapability`) and a
+  wine-specific schema; no search, embeddings, or vector retrieval.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

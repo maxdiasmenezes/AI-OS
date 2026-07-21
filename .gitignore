@@ -52,3 +52,4 @@ desktop.ini
 
 # Runtime storage
 storage/**/*.jsonl
+storage/knowledge/*.json

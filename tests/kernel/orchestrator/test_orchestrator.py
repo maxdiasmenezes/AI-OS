@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
+from capabilities.wine.capability import WineCapability
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.memory import MemoryManager
@@ -42,6 +45,37 @@ class FakeCapability(Capability):
     def handle(self, prompt: str) -> str:
         self.received_prompts.append(prompt)
         return self._response_text
+
+
+class FakeModelBackedCapability(Capability):
+    """A capability that calls a model itself and returns its ModelResponse."""
+
+    def __init__(self, capability_id: str, response: ModelResponse):
+        self._id = capability_id
+        self._response = response
+        self.received_prompts: list[str] = []
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def handle(self, prompt: str) -> ModelResponse:
+        self.received_prompts.append(prompt)
+        return self._response
+
+
+class FakeBadCapability(Capability):
+    """A capability that returns a result type the orchestrator must reject."""
+
+    def __init__(self, capability_id: str):
+        self._id = capability_id
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def handle(self, prompt: str):
+        return 12345
 
 
 def _make_config(tmp_path: Path) -> Config:
@@ -94,6 +128,86 @@ def test_wine_prompt_routes_to_capability_and_skips_model(monkeypatch, tmp_path)
     assert response.text == "a bold Malbec would work well"
     assert response.model == "capability:wine"
     assert fake_provider.received_prompts == []
+
+
+# --- Routed branch: model-backed capability results ----------------------
+
+
+def test_capability_returning_model_response_preserves_its_metadata(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    capability_response = ModelResponse(
+        text="A Loire Valley Sauvignon Blanc is a versatile, food-friendly choice.",
+        model="real-provider-model",
+        input_tokens=17,
+        output_tokens=29,
+        latency_seconds=0.42,
+    )
+    fake_capability = FakeModelBackedCapability("wine", capability_response)
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("What's a good wine region to explore?")
+
+    assert response is capability_response
+    assert response.model == "real-provider-model"
+    assert response.input_tokens == 17
+    assert response.output_tokens == 29
+    assert response.latency_seconds == 0.42
+    assert fake_provider.received_prompts == []
+
+    record = _read_last_log_record(config.log_path)
+    assert record["response"] == capability_response.text
+    assert record["model"] == "real-provider-model"
+    assert record["input_tokens"] == 17
+    assert record["output_tokens"] == 29
+    assert record["latency_seconds"] == 0.42
+
+
+def test_capability_returning_unsupported_type_raises_type_error(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    loader = Mock(return_value=FakeBadCapability("wine"))
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+
+    with pytest.raises(TypeError):
+        orchestrator.handle("What's a good wine region to explore?")
+
+
+# --- Routed branch: real WineCapability integration -----------------------
+
+
+def test_orchestrator_with_real_wine_capability_preserves_fallback_metadata(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fallback_response = ModelResponse(
+        text="A Loire Valley Sauvignon Blanc is a versatile, food-friendly choice.",
+        model="fake-model",
+        input_tokens=17,
+        output_tokens=29,
+        latency_seconds=0.42,
+    )
+    fake_provider = FakeModelProvider(fallback_response)
+    loader = Mock(return_value=WineCapability(fake_provider))
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    # Contains the whole word "wine" (routes to WineCapability) but avoids
+    # all eight deterministic food categories, so it hits the fallback path.
+    response = orchestrator.handle("What's a good wine region to explore?")
+
+    assert response is fallback_response
+    assert response.text == fallback_response.text
+    assert response.model == "fake-model"
+    assert response.input_tokens == 17
+    assert response.output_tokens == 29
+    assert response.latency_seconds == 0.42
+
+    record = _read_last_log_record(config.log_path)
+    assert record["response"] == fallback_response.text
+    assert record["model"] == "fake-model"
+    assert record["input_tokens"] == 17
+    assert record["output_tokens"] == 29
+    assert record["latency_seconds"] == 0.42
 
 
 # --- Fallback branch -----------------------------------------------------

@@ -1,26 +1,35 @@
-"""Tests for Wine Pairing v1 (WineCapability)."""
+"""Tests for Wine Pairing v1 (WineCapability) and its model-backed fallback."""
+
+from pathlib import Path
 
 import pytest
 
 from capabilities.wine.capability import WineCapability
 from kernel.models.base import ModelProvider, ModelResponse
 
+# tests/capabilities/wine/test_capability.py -> tests/capabilities -> tests -> project root
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_FALLBACK_INSTRUCTIONS = (_PROJECT_ROOT / "prompts" / "wine" / "fallback.md").read_text(
+    encoding="utf-8"
+).strip()
+
 
 class FakeModelProvider(ModelProvider):
-    """Records whether it was called; no external calls."""
+    """Records prompts it receives and returns a fixed, distinguishable response."""
 
     def __init__(self):
         self.received_prompts: list[str] = []
+        self.response = ModelResponse(
+            text="A Loire Valley Sauvignon Blanc is a versatile, food-friendly choice.",
+            model="fake-model",
+            input_tokens=17,
+            output_tokens=29,
+            latency_seconds=0.42,
+        )
 
     def send_prompt(self, prompt: str) -> ModelResponse:
         self.received_prompts.append(prompt)
-        return ModelResponse(
-            text="unused",
-            model="fake-model",
-            input_tokens=0,
-            output_tokens=0,
-            latency_seconds=0.0,
-        )
+        return self.response
 
 
 @pytest.fixture
@@ -31,14 +40,6 @@ def fake_provider():
 @pytest.fixture
 def wine(fake_provider):
     return WineCapability(fake_provider)
-
-
-def _assert_out_of_scope(response: str) -> None:
-    # Observable contract: names some supported categories, and says it
-    # can't give a reliable pairing - without pinning the exact wording.
-    assert "red meat" in response
-    assert "chocolate/dessert" in response
-    assert "can't give a reliable pairing" in response
 
 
 def test_id_returns_wine(wine):
@@ -83,9 +84,10 @@ def test_matching_is_case_insensitive(wine):
         "My favorite hobby is coding, any wine suggestions?",
     ],
 )
-def test_keywords_match_whole_words_only(wine, prompt):
+def test_keywords_match_whole_words_only(wine, fake_provider, prompt):
     response = wine.handle(prompt)
-    _assert_out_of_scope(response)
+    assert fake_provider.received_prompts == [f"{_FALLBACK_INSTRUCTIONS}\n\n{prompt}"]
+    assert response is fake_provider.response
 
 
 @pytest.mark.parametrize(
@@ -104,12 +106,7 @@ def test_priority_prefers_preparation_over_protein(
     assert "shellfish" not in response
 
 
-def test_unsupported_prompt_returns_out_of_scope_response(wine):
-    response = wine.handle("What's a good Bordeaux vintage from 2015?")
-    _assert_out_of_scope(response)
-
-
-# --- Milestone 21: provider is injected but not yet used -----------------
+# --- Deterministic matches never call the provider -----------------------
 
 
 def test_matched_category_prompt_does_not_call_provider(wine, fake_provider):
@@ -117,6 +114,25 @@ def test_matched_category_prompt_does_not_call_provider(wine, fake_provider):
     assert fake_provider.received_prompts == []
 
 
-def test_out_of_scope_prompt_does_not_call_provider(wine, fake_provider):
+# --- Milestone 22: unmatched prompts fall back to the injected provider --
+
+
+def test_unmatched_prompt_calls_provider_exactly_once(wine, fake_provider):
     wine.handle("What's a good Bordeaux vintage from 2015?")
-    assert fake_provider.received_prompts == []
+    assert len(fake_provider.received_prompts) == 1
+
+
+def test_unmatched_prompt_returns_providers_model_response_unchanged(wine, fake_provider):
+    response = wine.handle("What's a good Bordeaux vintage from 2015?")
+    assert response is fake_provider.response
+
+
+def test_fallback_prompt_contains_instruction_and_original_request(wine, fake_provider):
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+
+    sent_prompt = fake_provider.received_prompts[0]
+    instruction_index = sent_prompt.index(_FALLBACK_INSTRUCTIONS)
+    request_index = sent_prompt.index(prompt)
+
+    assert instruction_index < request_index

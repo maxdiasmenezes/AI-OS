@@ -133,6 +133,25 @@ def test_wine_prompt_routes_to_capability_and_skips_model(monkeypatch, tmp_path)
     assert fake_provider.received_prompts == []
 
 
+def test_natural_wine_intent_prompt_without_word_wine_routes_to_capability(monkeypatch, tmp_path):
+    # "What should I drink with steak?" contains no literal "wine" but is a
+    # natural wine-selection request, so it must still follow the routed
+    # branch (CapabilityRouter's new deterministic natural-phrase rules).
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeCapability("wine", "a robust Cabernet Sauvignon would work well")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("What should I drink with steak?")
+
+    loader.assert_called_once_with("wine", fake_provider, ANY, ANY)
+    assert fake_capability.received_prompts == ["What should I drink with steak?"]
+    assert response.text == "a robust Cabernet Sauvignon would work well"
+    assert response.model == "capability:wine"
+    assert fake_provider.received_prompts == []
+
+
 def test_orchestrator_passes_its_own_provider_and_memory_manager_to_loader(monkeypatch, tmp_path):
     config = _make_config(tmp_path)
     fake_provider = FakeModelProvider(_fake_response())

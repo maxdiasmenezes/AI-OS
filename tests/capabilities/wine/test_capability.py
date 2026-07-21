@@ -1,10 +1,12 @@
 """Tests for Wine Pairing v1 (WineCapability) and its model-backed fallback."""
 
+import json
 from pathlib import Path
 
 import pytest
 
 from capabilities.wine.capability import WineCapability
+from kernel.knowledge import JSONKnowledgeStore
 from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider, ModelResponse
 
@@ -45,6 +47,32 @@ class RecallSpyMemoryManager(MemoryManager):
         return super().recall(namespace, limit)
 
 
+class GetSpyKnowledgeStore(JSONKnowledgeStore):
+    """A real JSONKnowledgeStore (tmp_path-backed) that records get()/list_records() calls."""
+
+    def __init__(self, storage_dir):
+        super().__init__(storage_dir)
+        self.get_calls: list[tuple[str, str]] = []
+        self.list_records_calls: list[str] = []
+
+    def get(self, namespace: str, key: str):
+        self.get_calls.append((namespace, key))
+        return super().get(namespace, key)
+
+    def list_records(self, namespace: str):
+        self.list_records_calls.append(namespace)
+        return super().list_records(namespace)
+
+
+def _write_profile(knowledge_dir: Path, profile: dict) -> None:
+    """Write a synthetic wine_profile.json record directly under tmp_path."""
+
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "wine_profile.json").write_text(
+        json.dumps({"profile": profile}), encoding="utf-8"
+    )
+
+
 @pytest.fixture
 def fake_provider():
     return FakeModelProvider()
@@ -56,8 +84,18 @@ def memory_manager(tmp_path):
 
 
 @pytest.fixture
-def wine(fake_provider, memory_manager):
-    return WineCapability(fake_provider, memory_manager)
+def knowledge_dir(tmp_path):
+    return tmp_path / "knowledge"
+
+
+@pytest.fixture
+def knowledge_store(knowledge_dir):
+    return GetSpyKnowledgeStore(knowledge_dir)
+
+
+@pytest.fixture
+def wine(fake_provider, memory_manager, knowledge_store):
+    return WineCapability(fake_provider, memory_manager, knowledge_store)
 
 
 def test_id_returns_wine(wine):
@@ -139,6 +177,12 @@ def test_matched_category_prompt_does_not_call_memory_recall(wine, memory_manage
     assert memory_manager.recall_calls == []
 
 
+def test_matched_category_prompt_does_not_call_knowledge_store(wine, knowledge_store):
+    wine.handle("What wine goes with steak?")
+    assert knowledge_store.get_calls == []
+    assert knowledge_store.list_records_calls == []
+
+
 @pytest.mark.parametrize(
     "prompt",
     [
@@ -153,11 +197,13 @@ def test_matched_category_prompt_does_not_call_memory_recall(wine, memory_manage
     ],
 )
 def test_all_deterministic_categories_return_immediately_without_side_effects(
-    wine, fake_provider, memory_manager, prompt
+    wine, fake_provider, memory_manager, knowledge_store, prompt
 ):
     wine.handle(prompt)
     assert fake_provider.received_prompts == []
     assert memory_manager.recall_calls == []
+    assert knowledge_store.get_calls == []
+    assert knowledge_store.list_records_calls == []
 
 
 # --- Milestone 22/23: unmatched prompts fall back to the injected provider -
@@ -229,10 +275,126 @@ def test_unmatched_prompt_recalls_last_ten_conversation_entries(wine, fake_provi
     assert "turn 11" in sent_prompt
 
 
-def test_deterministic_matches_do_not_call_recall_even_with_seeded_history(
-    wine, fake_provider, memory_manager
+def test_deterministic_matches_do_not_call_recall_or_knowledge_even_with_seeded_data(
+    wine, fake_provider, memory_manager, knowledge_store, knowledge_dir
 ):
     memory_manager.remember("conversation", "I like bold reds.", metadata={"role": "user"})
+    _write_profile(knowledge_dir, {"notes": "Prefers Old World wines."})
+
     wine.handle("What wine goes with a steak?")
+
     assert memory_manager.recall_calls == []
+    assert knowledge_store.get_calls == []
+    assert knowledge_store.list_records_calls == []
+    assert fake_provider.received_prompts == []
+
+
+# --- Milestone 25: personal wine profile in the fallback prompt ----------
+
+
+def test_unmatched_prompt_with_no_profile_has_no_profile_section(wine, fake_provider):
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine profile:" not in sent_prompt
+
+
+def test_unmatched_prompt_with_empty_profile_has_no_profile_section(
+    wine, fake_provider, knowledge_dir
+):
+    _write_profile(knowledge_dir, {})
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine profile:" not in sent_prompt
+
+
+def test_unmatched_prompt_with_profile_renders_only_populated_fields_in_fixed_order(
+    wine, fake_provider, knowledge_dir
+):
+    _write_profile(
+        knowledge_dir,
+        {
+            "notes": "Prefers Old World wines.",
+            "preferred_styles": ["dry Riesling", "Barolo", "Champagne"],
+            "budget_range": "$20-40 per bottle",
+        },
+    )
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine profile:" in sent_prompt
+    assert "- Preferred styles: dry Riesling, Barolo, Champagne" in sent_prompt
+    assert "- Usual budget: $20-40 per bottle" in sent_prompt
+    assert "- Notes: Prefers Old World wines." in sent_prompt
+
+    # Fields absent from the profile are omitted entirely.
+    assert "Disliked styles" not in sent_prompt
+    assert "Selection priorities" not in sent_prompt
+
+    profile_index = sent_prompt.index("Personal wine profile:")
+    styles_index = sent_prompt.index("Preferred styles")
+    budget_index = sent_prompt.index("Usual budget")
+    notes_index = sent_prompt.index("Notes:")
+    request_index = sent_prompt.index("Current user request:")
+    prompt_index = sent_prompt.index(prompt)
+
+    assert (
+        profile_index
+        < styles_index
+        < budget_index
+        < notes_index
+        < request_index
+        < prompt_index
+    )
+
+
+def test_unmatched_prompt_profile_appears_before_conversation_and_request(
+    wine, fake_provider, memory_manager, knowledge_dir
+):
+    _write_profile(knowledge_dir, {"notes": "Prefers Old World wines."})
+    memory_manager.remember("conversation", "What's a good everyday red?", metadata={"role": "user"})
+    memory_manager.remember("conversation", "Try a Cotes du Rhone.", metadata={"role": "assistant"})
+
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+
+    sent_prompt = fake_provider.received_prompts[0]
+    profile_index = sent_prompt.index("Personal wine profile:")
+    context_index = sent_prompt.index("Conversation context:")
+    request_index = sent_prompt.index("Current user request:")
+    prompt_index = sent_prompt.index(prompt)
+
+    assert profile_index < context_index < request_index < prompt_index
+
+
+def test_unmatched_prompt_profile_ignores_unknown_fields(wine, fake_provider, knowledge_dir):
+    _write_profile(
+        knowledge_dir,
+        {"notes": "Prefers Old World wines.", "favorite_producer": "Antinori"},
+    )
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Antinori" not in sent_prompt
+    assert "favorite_producer" not in sent_prompt
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        {"preferred_styles": "dry Riesling"},
+        {"preferred_styles": ["dry Riesling", ""]},
+        {"preferred_styles": ["dry Riesling", 5]},
+        {"disliked_styles": {"not": "a list"}},
+        {"budget_range": 30},
+        {"notes": ["not", "a", "string"]},
+    ],
+)
+def test_unmatched_prompt_with_invalid_profile_field_raises_value_error(
+    wine, fake_provider, knowledge_dir, profile
+):
+    _write_profile(knowledge_dir, profile)
+
+    with pytest.raises(ValueError):
+        wine.handle("What's a good Bordeaux vintage from 2015?")
+
     assert fake_provider.received_prompts == []

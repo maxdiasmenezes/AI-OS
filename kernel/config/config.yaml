@@ -27,3 +27,6 @@ log_file: "interactions.jsonl"
 
 memory:
   storage_dir: "storage/memory"
+
+knowledge:
+  storage_dir: "storage/knowledge"

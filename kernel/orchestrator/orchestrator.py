@@ -2,17 +2,18 @@
 Orchestrator: owns the request lifecycle.
 
 Given a config and a capability loader, wires up a model provider, a memory
-manager, and a capability router once; given a user prompt, routes it to a
-capability when the router matches one, otherwise falls back to the model
-provider. Either way, persists the exchange to memory, logs the interaction,
-and returns the response. No tools, no retries, no streaming - just routing
-plus the existing flow.
+manager, a read-only knowledge store, and a capability router once; given a
+user prompt, routes it to a capability when the router matches one,
+otherwise falls back to the model provider. Either way, persists the
+exchange to memory, logs the interaction, and returns the response. No
+tools, no retries, no streaming - just routing plus the existing flow.
 """
 
 from typing import Callable
 
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
+from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.logger import log_interaction
 from kernel.memory import MemoryManager
 from kernel.models import ModelResponse, get_provider
@@ -27,11 +28,14 @@ class Orchestrator:
     def __init__(
         self,
         config: Config,
-        capability_loader: Callable[[str, ModelProvider, MemoryManager], Capability],
+        capability_loader: Callable[
+            [str, ModelProvider, MemoryManager, KnowledgeStore], Capability
+        ],
     ) -> None:
         self._config = config
         self._provider = get_provider(config)
         self._memory = MemoryManager(config.memory_settings)
+        self._knowledge = JSONKnowledgeStore(config.knowledge_storage_dir)
         self._router = CapabilityRouter()
         self._capability_loader = capability_loader
 
@@ -44,6 +48,7 @@ class Orchestrator:
                 capability_id,
                 self._provider,
                 self._memory,
+                self._knowledge,
             )
             capability_result = capability.handle(user_prompt)
             if isinstance(capability_result, ModelResponse):

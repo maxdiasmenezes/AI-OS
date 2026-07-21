@@ -10,6 +10,7 @@ from capabilities.loader import CapabilityLoader
 from capabilities.wine.capability import WineCapability
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
+from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider, ModelResponse
 from kernel.orchestrator import Orchestrator
@@ -85,6 +86,7 @@ def _make_config(tmp_path: Path) -> Config:
         provider_settings={},
         log_path=tmp_path / "logs" / "interactions.jsonl",
         memory_settings={"storage_dir": str(tmp_path / "memory")},
+        knowledge_storage_dir=tmp_path / "knowledge",
     )
 
 
@@ -124,7 +126,7 @@ def test_wine_prompt_routes_to_capability_and_skips_model(monkeypatch, tmp_path)
     orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
     response = orchestrator.handle("What wine goes with steak?")
 
-    loader.assert_called_once_with("wine", fake_provider, ANY)
+    loader.assert_called_once_with("wine", fake_provider, ANY, ANY)
     assert fake_capability.received_prompts == ["What wine goes with steak?"]
     assert response.text == "a bold Malbec would work well"
     assert response.model == "capability:wine"
@@ -141,10 +143,11 @@ def test_orchestrator_passes_its_own_provider_and_memory_manager_to_loader(monke
     orchestrator.handle("What wine goes with steak?")
 
     loader.assert_called_once()
-    call_id, call_provider, call_memory = loader.call_args.args
+    call_id, call_provider, call_memory, call_knowledge = loader.call_args.args
     assert call_id == "wine"
     assert call_provider is fake_provider
     assert isinstance(call_memory, MemoryManager)
+    assert isinstance(call_knowledge, KnowledgeStore)
 
     # Prove it's the same MemoryManager instance the orchestrator itself
     # persists to (not just any instance), by recalling through the
@@ -154,6 +157,32 @@ def test_orchestrator_passes_its_own_provider_and_memory_manager_to_loader(monke
         "What wine goes with steak?",
         "a bold Malbec would work well",
     ]
+
+
+def test_orchestrator_passes_its_own_knowledge_store_to_loader(monkeypatch, tmp_path):
+    # Prove it's the same KnowledgeStore instance the orchestrator itself
+    # was configured with (not just any instance), by seeding a synthetic
+    # profile under the configured storage dir and reading it back through
+    # the reference the loader received.
+    config = _make_config(tmp_path)
+    knowledge_dir = config.knowledge_storage_dir
+    knowledge_dir.mkdir(parents=True)
+    (knowledge_dir / "wine_profile.json").write_text(
+        json.dumps({"profile": {"notes": "Prefers Old World wines."}}),
+        encoding="utf-8",
+    )
+
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeCapability("wine", "a bold Malbec would work well")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("What wine goes with steak?")
+
+    _, _, _, call_knowledge = loader.call_args.args
+    assert call_knowledge.get("wine_profile", "profile") == {
+        "notes": "Prefers Old World wines."
+    }
 
 
 # --- Routed branch: model-backed capability results ----------------------
@@ -215,7 +244,8 @@ def test_orchestrator_with_real_wine_capability_preserves_fallback_metadata(monk
     )
     fake_provider = FakeModelProvider(fallback_response)
     wine_memory = MemoryManager(config.memory_settings)
-    loader = Mock(return_value=WineCapability(fake_provider, wine_memory))
+    wine_knowledge = JSONKnowledgeStore(config.knowledge_storage_dir)
+    loader = Mock(return_value=WineCapability(fake_provider, wine_memory, wine_knowledge))
 
     orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
     # Contains the whole word "wine" (routes to WineCapability) but avoids
@@ -273,6 +303,38 @@ def test_end_to_end_routed_wine_fallback_sees_conversation_history_under_tmp_pat
     assert record["input_tokens"] == 17
     assert record["output_tokens"] == 29
     assert record["latency_seconds"] == 0.42
+
+
+def test_end_to_end_routed_wine_fallback_sees_synthetic_profile_under_tmp_path(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fallback_response = ModelResponse(
+        text="A Loire Valley Sauvignon Blanc is a versatile, food-friendly choice.",
+        model="fake-model",
+        input_tokens=17,
+        output_tokens=29,
+        latency_seconds=0.42,
+    )
+    fake_provider = FakeModelProvider(fallback_response)
+
+    # Seed a synthetic wine profile under tmp_path before running the
+    # request, using the same storage dir the orchestrator's KnowledgeStore
+    # reads from.
+    config.knowledge_storage_dir.mkdir(parents=True)
+    (config.knowledge_storage_dir / "wine_profile.json").write_text(
+        json.dumps({"profile": {"preferred_styles": ["dry Riesling", "Barolo"]}}),
+        encoding="utf-8",
+    )
+
+    real_loader = CapabilityLoader()
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle("What's a good wine region to explore?")
+
+    assert response is fallback_response
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Personal wine profile:" in sent_prompt
+    assert "Preferred styles: dry Riesling, Barolo" in sent_prompt
 
 
 # --- Fallback branch -----------------------------------------------------

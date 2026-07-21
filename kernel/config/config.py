@@ -24,11 +24,12 @@ class Config:
     """Everything the kernel needs to run a single prompt."""
 
     def __init__(self, provider: str, provider_settings: dict, log_path: Path,
-                 memory_settings: dict):
+                 memory_settings: dict, knowledge_storage_dir: Path):
         self.provider = provider
         self.provider_settings = provider_settings
         self.log_path = log_path
         self.memory_settings = memory_settings
+        self.knowledge_storage_dir = knowledge_storage_dir
 
 
 def load_config() -> Config:
@@ -45,10 +46,12 @@ def load_config() -> Config:
     provider_settings = settings["providers"][provider]
     log_path = _PROJECT_ROOT / settings["log_dir"] / settings["log_file"]
     memory_settings = settings["memory"]
+    knowledge_storage_dir = _PROJECT_ROOT / settings["knowledge"]["storage_dir"]
 
     return Config(
         provider=provider,
         provider_settings=provider_settings,
         log_path=log_path,
         memory_settings=memory_settings,
+        knowledge_storage_dir=knowledge_storage_dir,
     )

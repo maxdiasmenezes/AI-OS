@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from capabilities.wine.capability import WineCapability
+from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider, ModelResponse
 
 # tests/capabilities/wine/test_capability.py -> tests/capabilities -> tests -> project root
@@ -32,14 +33,31 @@ class FakeModelProvider(ModelProvider):
         return self.response
 
 
+class RecallSpyMemoryManager(MemoryManager):
+    """A real MemoryManager (tmp_path-backed) that records recall() calls."""
+
+    def __init__(self, settings: dict):
+        super().__init__(settings)
+        self.recall_calls: list[tuple[str, int | None]] = []
+
+    def recall(self, namespace: str, limit: int | None = None):
+        self.recall_calls.append((namespace, limit))
+        return super().recall(namespace, limit)
+
+
 @pytest.fixture
 def fake_provider():
     return FakeModelProvider()
 
 
 @pytest.fixture
-def wine(fake_provider):
-    return WineCapability(fake_provider)
+def memory_manager(tmp_path):
+    return RecallSpyMemoryManager({"storage_dir": str(tmp_path / "memory")})
+
+
+@pytest.fixture
+def wine(fake_provider, memory_manager):
+    return WineCapability(fake_provider, memory_manager)
 
 
 def test_id_returns_wine(wine):
@@ -86,7 +104,9 @@ def test_matching_is_case_insensitive(wine):
 )
 def test_keywords_match_whole_words_only(wine, fake_provider, prompt):
     response = wine.handle(prompt)
-    assert fake_provider.received_prompts == [f"{_FALLBACK_INSTRUCTIONS}\n\n{prompt}"]
+    sent_prompt = fake_provider.received_prompts[0]
+    assert _FALLBACK_INSTRUCTIONS in sent_prompt
+    assert prompt in sent_prompt
     assert response is fake_provider.response
 
 
@@ -106,7 +126,7 @@ def test_priority_prefers_preparation_over_protein(
     assert "shellfish" not in response
 
 
-# --- Deterministic matches never call the provider -----------------------
+# --- Deterministic matches never call the provider or memory -------------
 
 
 def test_matched_category_prompt_does_not_call_provider(wine, fake_provider):
@@ -114,7 +134,33 @@ def test_matched_category_prompt_does_not_call_provider(wine, fake_provider):
     assert fake_provider.received_prompts == []
 
 
-# --- Milestone 22: unmatched prompts fall back to the injected provider --
+def test_matched_category_prompt_does_not_call_memory_recall(wine, memory_manager):
+    wine.handle("What wine goes with steak?")
+    assert memory_manager.recall_calls == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What wine goes with chocolate cake?",
+        "What wine goes with a spicy curry?",
+        "What wine pairs with pizza?",
+        "What wine goes with shrimp?",
+        "What wine goes with salmon?",
+        "What wine goes with pork chops?",
+        "What wine goes with roast chicken?",
+        "What wine goes with a steak?",
+    ],
+)
+def test_all_deterministic_categories_return_immediately_without_side_effects(
+    wine, fake_provider, memory_manager, prompt
+):
+    wine.handle(prompt)
+    assert fake_provider.received_prompts == []
+    assert memory_manager.recall_calls == []
+
+
+# --- Milestone 22/23: unmatched prompts fall back to the injected provider -
 
 
 def test_unmatched_prompt_calls_provider_exactly_once(wine, fake_provider):
@@ -136,3 +182,57 @@ def test_fallback_prompt_contains_instruction_and_original_request(wine, fake_pr
     request_index = sent_prompt.index(prompt)
 
     assert instruction_index < request_index
+
+
+# --- Milestone 23: memory-aware fallback ----------------------------------
+
+
+def test_unmatched_prompt_with_empty_memory_has_no_conversation_context_section(
+    wine, fake_provider
+):
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Conversation context:" not in sent_prompt
+
+
+def test_unmatched_prompt_with_seeded_history_includes_entries_in_order(
+    wine, fake_provider, memory_manager
+):
+    memory_manager.remember("conversation", "What's a good everyday red?", metadata={"role": "user"})
+    memory_manager.remember("conversation", "Try a Cotes du Rhone.", metadata={"role": "assistant"})
+
+    prompt = "What's a good Bordeaux vintage from 2015?"
+    wine.handle(prompt)
+
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "Conversation context:" in sent_prompt
+
+    context_index = sent_prompt.index("Conversation context:")
+    user_turn_index = sent_prompt.index("What's a good everyday red?")
+    assistant_turn_index = sent_prompt.index("Try a Cotes du Rhone.")
+    request_index = sent_prompt.index("Current user request:")
+    prompt_index = sent_prompt.index(prompt)
+
+    assert context_index < user_turn_index < assistant_turn_index < request_index < prompt_index
+
+
+def test_unmatched_prompt_recalls_last_ten_conversation_entries(wine, fake_provider, memory_manager):
+    for i in range(12):
+        memory_manager.remember("conversation", f"turn {i}", metadata={"role": "user"})
+
+    wine.handle("What's a good Bordeaux vintage from 2015?")
+
+    assert memory_manager.recall_calls == [("conversation", 10)]
+    sent_prompt = fake_provider.received_prompts[0]
+    assert "turn 0\n" not in sent_prompt
+    assert "turn 1\n" not in sent_prompt
+    assert "turn 11" in sent_prompt
+
+
+def test_deterministic_matches_do_not_call_recall_even_with_seeded_history(
+    wine, fake_provider, memory_manager
+):
+    memory_manager.remember("conversation", "I like bold reds.", metadata={"role": "user"})
+    wine.handle("What wine goes with a steak?")
+    assert memory_manager.recall_calls == []
+    assert fake_provider.received_prompts == []

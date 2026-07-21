@@ -5,14 +5,19 @@ Matches a prompt against a small, explicit set of food categories and
 returns a wine-style recommendation with a brief explanation - no model
 calls, just keyword rules. A wine-related prompt that matches none of the
 categories falls back to the injected ModelProvider, scoped to wine expertise
-via prompts/wine/fallback.md.
+via prompts/wine/fallback.md, with recent conversation history recalled from
+the injected MemoryManager for context.
 """
 
 import re
 from pathlib import Path
 
 from kernel.capabilities.base import Capability
+from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider, ModelResponse
+
+_MEMORY_NAMESPACE = "conversation"
+_MEMORY_LIMIT = 10
 
 # capabilities/wine/capability.py -> capabilities/wine -> capabilities -> project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -100,8 +105,9 @@ _PATTERNS = {
 class WineCapability(Capability):
     """AI employee for wine: deterministic food-to-wine pairing (v1)."""
 
-    def __init__(self, model_provider: ModelProvider) -> None:
+    def __init__(self, model_provider: ModelProvider, memory_manager: MemoryManager) -> None:
         self._model_provider = model_provider
+        self._memory_manager = memory_manager
 
     @property
     def id(self) -> str:
@@ -119,5 +125,13 @@ class WineCapability(Capability):
         return self._fallback(prompt)
 
     def _fallback(self, prompt: str) -> ModelResponse:
-        fallback_prompt = f"{_FALLBACK_INSTRUCTIONS}\n\n{prompt}"
+        entries = self._memory_manager.recall(_MEMORY_NAMESPACE, limit=_MEMORY_LIMIT)
+
+        parts = [_FALLBACK_INSTRUCTIONS]
+        if entries:
+            transcript = "\n".join(f"{e.metadata['role']}: {e.content}" for e in entries)
+            parts.append(f"Conversation context:\n{transcript}")
+        parts.append(f"Current user request:\n{prompt}")
+
+        fallback_prompt = "\n\n".join(parts)
         return self._model_provider.send_prompt(fallback_prompt)

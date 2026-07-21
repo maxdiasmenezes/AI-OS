@@ -120,6 +120,28 @@ committed (see `kernel/knowledge/README.md`). This access only happens on
 the model-backed fallback path, never for the eight deterministic pairing
 categories.
 
+Cellar record validation itself lives in `capabilities/wine/cellar_schema.py`,
+not in `capability.py`. `WineCapability` imports and calls
+`validate_cellar_record()` from that module; it does not implement its own
+copy of the validation rules. `capabilities/wine/cellar_schema.py` is the
+shared, domain-level schema — the single source of truth for what a valid
+cellar record is — and it is deliberately narrow: only field validation lives
+there. Prompt formatting, cellar size limiting, cellar sorting, and fallback
+behavior are prompt-consumption concerns, not schema concerns, and stay
+private to `WineCapability`.
+
+A separate, human-controlled maintenance script,
+`scripts/import_wine_cellar.py` (see `scripts/README.md`), reuses the exact
+same `validate_cellar_record()` to import a CSV into
+`storage/knowledge/wine_cellar.json`. Because both the runtime read path and
+the import write path validate through the same function, the importer never
+accepts a record `WineCapability` would reject, and never rejects one it
+would accept. The runtime itself remains entirely read-only — `WineCapability`
+and `KnowledgeStore` never write anything — importing is a separate, manual,
+human-invoked step, run outside the kernel, that never happens automatically
+and never happens as a side effect of handling a prompt. One CSV import fully
+replaces the cellar document; it does not merge with what was there before.
+
 One JSON record represents one wine **holding**, not one physical bottle —
 the top-level JSON key is the cellar record's own ID; there is no separate
 `id` field inside the record. Every record, including a zero-quantity one,
@@ -178,8 +200,11 @@ Sample Estate Reserve Red do I have?" is still answered by the model,
 reasoning over the structured cellar context in the prompt, not by exact
 code-level lookup. This remains planned, not implemented.
 
-There is still no write API, quantity decrementing, import or editing
-workflow, embeddings, fuzzy matching, or ranking engine — the cellar is
-read-only end to end. As with the profile, a human places
-`storage/knowledge/wine_cellar.json` there directly; no real personal cellar
-data is committed to this repository.
+There is still no write API on `KnowledgeStore` itself, no quantity
+decrementing, no editing workflow, no embeddings, fuzzy matching, or ranking
+engine — the runtime remains read-only end to end. The one write path that
+exists, `scripts/import_wine_cellar.py`, is a separate, human-invoked
+maintenance script (see [Personal wine cellar](#personal-wine-cellar) above
+and `scripts/README.md`); it writes `storage/knowledge/wine_cellar.json`
+directly, replacing the whole document, and never runs automatically. No real
+personal cellar data is committed to this repository.

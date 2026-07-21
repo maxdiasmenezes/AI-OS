@@ -24,19 +24,32 @@ knowledge store at all):
   keyed by the record's own ID rather than a duplicate `id` field inside it.
 
 The store itself stays exactly as read-only as before; schema validation of
-both the profile record's and each cellar record's fields lives entirely in
-`capabilities/wine/capability.py`, not here. For the cellar namespace,
-`WineCapability` validates every record returned by `list_records()`
-(including zero-quantity ones) before deciding which are active, excludes
-zero-quantity holdings, sorts the rest by record key, and caps a single
-fallback prompt at 100 active records — refusing to send a silently
-truncated partial inventory above that cap. None of that filtering,
-sorting, or limiting happens here in the knowledge layer; this module only
-ever returns exactly what is on disk. Real profile and cellar data would
-live at `storage/knowledge/wine_profile.json` and
+the profile record's fields lives in `capabilities/wine/capability.py`, and
+cellar record field validation lives in
+`capabilities/wine/cellar_schema.py` (`validate_cellar_record()`) — neither
+lives here. For the cellar namespace, `WineCapability` validates every
+record returned by `list_records()` (including zero-quantity ones) before
+deciding which are active, excludes zero-quantity holdings, sorts the rest
+by record key, and caps a single fallback prompt at 100 active records —
+refusing to send a silently truncated partial inventory above that cap.
+None of that filtering, sorting, or limiting happens here in the knowledge
+layer; this module only ever returns exactly what is on disk. Real profile
+and cellar data would live at `storage/knowledge/wine_profile.json` and
 `storage/knowledge/wine_cellar.json` respectively (already excluded from Git
-by `.gitignore`); no such files are committed, and nothing in this
-repository writes one. Deterministic bottle-count lookup and wine-name
-matching over the cellar, bottle-level purchase/ratings history beyond what
-a cellar record already carries, search, embeddings, vector retrieval, web
-access, and any write API all remain unimplemented.
+by `.gitignore`); no such files are committed.
+
+`KnowledgeStore` itself still exposes no write API, and `JSONKnowledgeStore`
+is never used to write either file — that contract is unchanged.
+`storage/knowledge/wine_cellar.json` does have exactly one writer today:
+`scripts/import_wine_cellar.py` (see `scripts/README.md`), a local,
+human-invoked maintenance script that lives entirely outside the runtime
+kernel. It is not a capability, is never reached through the orchestrator,
+and does not call `KnowledgeStore` — it validates a CSV using the same
+`validate_cellar_record()` that `WineCapability` reads through, then writes
+the JSON file directly and atomically, replacing the whole document, only
+when a human runs it with an explicit `--write` flag. This does not expand
+what `KnowledgeStore` itself can do; the kernel's read-only contract is
+unchanged. Deterministic bottle-count lookup and wine-name matching over the
+cellar, bottle-level purchase/ratings history beyond what a cellar record
+already carries, search, embeddings, vector retrieval, and web access all
+remain unimplemented.

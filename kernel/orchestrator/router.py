@@ -8,8 +8,13 @@ CapabilityLoader.
 
 import re
 
-# Whole-word "wine" mention - the original, broadest signal.
-_WINE_WORD_PATTERN = re.compile(r"\bwine\b", re.IGNORECASE)
+# Whole-word "wine" or "wines" mention - the original, broadest signal.
+_WINE_WORD_PATTERN = re.compile(r"\bwines?\b", re.IGNORECASE)
+
+# "my cellar" - a conservative, explicit cellar-ownership cue, distinct from
+# the generic words the milestone forbids routing on alone (own, have,
+# bottles, vintages, producer, region, country).
+_MY_CELLAR_PATTERN = re.compile(r"\bmy\s+cellar\b", re.IGNORECASE)
 
 # Small, explicit set of food/meal cues used to disambiguate otherwise
 # generic selection/pairing language. Deliberately independent of
@@ -40,6 +45,7 @@ _SUITABLE_FOR_FOOD_PATTERN = re.compile(
 
 _WINE_INTENT_PATTERNS = (
     _WINE_WORD_PATTERN,
+    _MY_CELLAR_PATTERN,
     _BOTTLE_SELECTION_PATTERN,
     _PAIRING_WITH_FOOD_PATTERN,
     _SUITABLE_FOR_FOOD_PATTERN,

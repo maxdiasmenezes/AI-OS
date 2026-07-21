@@ -412,6 +412,62 @@ def test_end_to_end_routed_wine_fallback_sees_synthetic_cellar_under_tmp_path(
     assert not (_PROJECT_ROOT / "storage" / "knowledge" / "wine_cellar.json").exists()
 
 
+# --- Milestone 29: deterministic cellar lookup, real WineCapability -------
+
+
+def test_end_to_end_deterministic_cellar_total_query_skips_provider(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    # The fake provider's response must never be used on this path - if it
+    # were, the assertions on model/token/latency below would fail.
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+
+    config.knowledge_storage_dir.mkdir(parents=True)
+    (config.knowledge_storage_dir / "wine_cellar.json").write_text(
+        json.dumps(
+            {
+                "sample-red-2021": {
+                    "producer": "Sample Estate",
+                    "wine_name": "Reserve Red",
+                    "color": "red",
+                    "quantity": 3,
+                    "vintage": 2021,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_loader = CapabilityLoader()
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle("How many bottles of wine do I have in total?")
+
+    assert fake_provider.received_prompts == []
+    assert "3 bottles" in response.text
+    assert response.model == "capability:wine"
+    assert response.input_tokens == 0
+    assert response.output_tokens == 0
+    assert response.latency_seconds == 0.0
+
+    record = _read_last_log_record(config.log_path)
+    assert record["prompt"] == "How many bottles of wine do I have in total?"
+    assert record["response"] == response.text
+    assert record["model"] == "capability:wine"
+    assert record["input_tokens"] == 0
+    assert record["output_tokens"] == 0
+    assert record["latency_seconds"] == 0.0
+
+    memory = MemoryManager(config.memory_settings)
+    entries = memory.recall("conversation")
+    assert len(entries) == 2
+    assert entries[0].content == "How many bottles of wine do I have in total?"
+    assert entries[0].metadata["role"] == "user"
+    assert entries[1].content == response.text
+    assert entries[1].metadata["role"] == "assistant"
+
+    # Nothing should have been written under the repository's real storage/.
+    assert not (_PROJECT_ROOT / "storage" / "knowledge" / "wine_cellar.json").exists()
+
+
 # --- Fallback branch -----------------------------------------------------
 
 

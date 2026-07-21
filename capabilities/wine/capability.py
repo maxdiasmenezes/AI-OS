@@ -1,10 +1,17 @@
 """
-Wine capability: deterministic Wine Pairing v1, with a model-backed fallback.
+Wine capability: deterministic Wine Pairing v1, Deterministic Cellar Lookup
+v1, and a model-backed fallback.
 
-Matches a prompt against a small, explicit set of food categories and
-returns a wine-style recommendation with a brief explanation - no model
-calls, just keyword rules. A wine-related prompt that matches none of the
-categories falls back to the injected ModelProvider, scoped to wine expertise
+handle() tries three things in order. First, it matches the prompt against a
+small, explicit set of food categories and returns a wine-style
+recommendation with a brief explanation - no model calls, just keyword
+rules. Second, for a prompt that doesn't match any food category, it detects
+a small set of factual cellar questions (total bottle count, exact
+quantity, exact ownership, producer holdings, vintage listing) via
+capabilities.wine.cellar_lookup and answers them directly from validated
+`wine_cellar` records - again no model call, and the only KnowledgeStore
+access is `list_records("wine_cellar")`. Third, anything that matches
+neither falls back to the injected ModelProvider, scoped to wine expertise
 via prompts/wine/fallback.md, with recent conversation history recalled from
 the injected MemoryManager and an optional personal wine profile and
 read-only cellar inventory read from the injected KnowledgeStore for context.
@@ -13,6 +20,7 @@ read-only cellar inventory read from the injected KnowledgeStore for context.
 import re
 from pathlib import Path
 
+from capabilities.wine.cellar_lookup import answer_cellar_query, parse_cellar_query
 from capabilities.wine.cellar_schema import validate_cellar_record
 from kernel.capabilities.base import Capability
 from kernel.knowledge import KnowledgeStore
@@ -281,6 +289,13 @@ class WineCapability(Capability):
                     f"- Recommended: {data['wine_style']}\n"
                     f"- Why: {data['explanation']}"
                 )
+
+        cellar_query = parse_cellar_query(prompt)
+        if cellar_query is not None:
+            query_type, target = cellar_query
+            records = self._knowledge_store.list_records(_CELLAR_NAMESPACE)
+            return answer_cellar_query(query_type, target, records)
+
         return self._fallback(prompt)
 
     def _fallback(self, prompt: str) -> ModelResponse:

@@ -26,12 +26,75 @@ this order: dessert, spicy, tomato_pasta, shellfish, fish, pork, poultry,
 red_meat. A deterministic match returns immediately — it never touches the
 model provider, the memory manager, or the knowledge store.
 
+## Deterministic Cellar Lookup v1
+
+After the eight pairing categories and before the model-backed fallback,
+`WineCapability` checks the prompt against a second, independent
+deterministic layer: `capabilities/wine/cellar_lookup.py`. This answers a
+small, explicit set of factual cellar questions directly from validated
+`wine_cellar` records, with no model call — total active bottle count,
+exact quantity for one wine, exact ownership (by wine name, producer,
+producer + wine name, region, or country), producer holdings listing, and
+vintage listing. Query detection happens on the prompt text alone, before
+any knowledge-store access; only a detected query touches the store, and
+only via `knowledge_store.list_records("wine_cellar")` — never `get()`,
+never memory recall, never the model provider. `handle()` returns a plain
+`str` for a detected cellar query, exactly like a pairing match.
+
+Supported phrasings are conservative and literal, e.g.:
+
+- Total: "How many bottles are in my cellar?"
+- Quantity: "How many bottles of Reserve Red are in my cellar?"
+- Ownership: "Do I have any Burgundy wine?"
+- Producer listing: "Show me my wines from Sample Estate."
+- Vintage listing: "What vintages of Reserve Red are in my cellar?"
+
+A bare question with no explicit wine or cellar cue — "Do I own Sample
+Estate Reserve Red?", "Do I have any Burgundy?" — never reaches
+`WineCapability` at all: `CapabilityRouter` (`kernel/orchestrator/router.py`)
+only routes to `wine` on an explicit whole-word `wine`/`wines` mention or a
+conservative `my cellar` phrase cue, deliberately never on generic words
+like "own", "have", "bottles", "vintages", "producer", "region", or
+"country" alone — it cannot safely tell "Do I own a red car?" apart from
+"Do I own Sample Estate Reserve Red?" without that explicit cue. Phrase the
+request as "Do I own any Sample Estate Reserve Red wine?" or "Do I have
+Burgundy in my cellar?" instead.
+
+Matching is exact and case-insensitive after normalization
+(`str.casefold()`, whitespace collapsed to single spaces, trailing `? . !`
+stripped) — nothing else. No accent stripping, no internal punctuation
+changes, no substring matching, no fuzzy or semantic matching, no aliases.
+A wine identity is normalized producer + normalized wine_name; records that
+share an identity but differ in vintage, price, rating, or record ID
+aggregate together for quantity and vintage answers. A wine-name-only
+target that matches more than one distinct producer is ambiguous and
+returns a clarification listing the distinct producers (sorted, original
+spelling) instead of guessing; supplying producer + wine name together is
+never ambiguous. Ownership matches on region, producer, or country may
+legitimately span several wine identities — that is not ambiguity, and the
+answer reports the total active quantity and holding count for that
+category. Only active (`quantity > 0`) records count toward totals,
+ownership, and listings; a target that matches only zero-quantity records
+gets an explicit "quantity is zero" answer rather than being reported as
+either owned or absent, and a target matching no record at all gets an
+explicit "no match" answer. Every record in the namespace — including
+unrelated and zero-quantity ones — is validated with the same
+`validate_cellar_record()` used elsewhere before any of this runs; one
+invalid record raises `ValueError` and aborts the whole answer, exactly
+like the model-backed cellar path.
+
+This layer adds no recommendation ranking, pairing or suitability logic,
+fuzzy or semantic matching, model-assisted name resolution, or cellar
+writes — it is read-only lookup only, covered by
+`tests/capabilities/wine/test_cellar_lookup.py`.
+
 ## Model-backed fallback
 
-A wine-related request that doesn't match any of the eight categories
-above (e.g. wine regions, specific bottles, vintages, general buying or
-serving questions) is passed to the injected model provider instead of
-returning a canned "out of scope" message.
+A wine-related request that doesn't match any of the eight pairing
+categories or a deterministic cellar query above (e.g. wine regions,
+specific bottles, vintages, general buying or serving questions,
+recommendations, or suitability judgments) is passed to the injected model
+provider instead of returning a canned "out of scope" message.
 
 Before calling the provider, the fallback:
 
@@ -194,11 +257,12 @@ supplied, and that the model should ask the user to narrow the request
 rather than claim to have evaluated the whole cellar. Either way the
 provider is still called exactly once.
 
-Deterministic bottle-count lookup and wine-name matching are **not**
-implemented in this milestone — a question like "how many bottles of
-Sample Estate Reserve Red do I have?" is still answered by the model,
-reasoning over the structured cellar context in the prompt, not by exact
-code-level lookup. This remains planned, not implemented.
+A question like "how many bottles of Sample Estate Reserve Red do I have?"
+is answered deterministically instead — see
+[Deterministic Cellar Lookup v1](#deterministic-cellar-lookup-v1) above —
+whenever it matches one of that layer's conservative, literal phrasings.
+Only prompts that don't match any of those phrasings still reach the model
+here, reasoning over this same structured cellar context.
 
 There is still no write API on `KnowledgeStore` itself, no quantity
 decrementing, no editing workflow, no embeddings, fuzzy matching, or ranking

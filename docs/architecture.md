@@ -43,7 +43,8 @@ to the kernel.
 
   kernel/knowledge: read-only KnowledgeStore contract + JSON implementation,
   wired into WineCapability's model-backed fallback for an optional personal
-  wine profile. kernel/tools: directory exists; planned, no code yet.
+  wine profile and a read-only personal wine cellar inventory.
+  kernel/tools: directory exists; planned, no code yet.
 ```
 
 ## Layers
@@ -92,9 +93,10 @@ business logic of their own.
   `knowledge.storage_dir`, `storage/knowledge` by default). A missing
   namespace is treated as empty; malformed knowledge data raises an error
   rather than being treated as an empty store. `WineCapability` is the first
-  consumer, reading an optional personal wine-preferences profile (see
-  Capabilities below); there is still no write API, search, embeddings,
-  vector retrieval, or web access.
+  consumer, reading an optional personal wine-preferences profile via
+  `get()` and an optional, read-only personal cellar inventory via
+  `list_records()` (see Capabilities below); there is still no write API,
+  search, embeddings, vector retrieval, or web access.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -165,28 +167,65 @@ know what wine, travel, or strategy mean.
   wine-related prompt that matches none of the eight categories falls back
   to the injected `ModelProvider` (`kernel/models/base.py`): it first reads
   an optional personal wine-preferences profile via
-  `knowledge_store.get("wine_profile", "profile")` (the only knowledge
-  access it performs), then recalls the last 10 entries from the existing
-  `"conversation"` memory namespace via the injected `MemoryManager`, in
-  chronological order. The fallback prompt is assembled in a fixed order:
-  wine-expert instructions, the personal profile (only when it contains at
-  least one recognized, non-empty field), recalled conversation history
-  (role and content per turn, only when entries exist), then the current
-  request. The recognized profile fields — `preferred_styles`,
-  `disliked_styles`, `budget_range`, `priorities`, `notes` — are validated
-  by small private logic inside `capabilities/wine/capability.py`; an
-  unrecognized field is ignored, and a recognized field with an invalid
-  type or list value raises `ValueError` rather than being silently
-  coerced. The model call is scoped to wine expertise by
-  `prompts/wine/fallback.md`, which distinguishes the durable personal
-  profile from recent, possibly-unrelated conversation context, and
+  `knowledge_store.get("wine_profile", "profile")`, then reads the personal
+  cellar inventory via `knowledge_store.list_records("wine_cellar")` (the
+  only two knowledge accesses it performs), then recalls the last 10
+  entries from the existing `"conversation"` memory namespace via the
+  injected `MemoryManager`, in chronological order. The fallback prompt is
+  assembled in a fixed order: wine-expert instructions, the personal
+  profile (only when it contains at least one recognized, non-empty
+  field), the personal cellar (only when at least one active record
+  exists, or when the active cellar exceeds the v1 size limit), recalled
+  conversation history (role and content per turn, only when entries
+  exist), then the current request. The recognized profile fields —
+  `preferred_styles`, `disliked_styles`, `budget_range`, `priorities`,
+  `notes` — are validated by small private logic inside
+  `capabilities/wine/capability.py`; an unrecognized field is ignored, and
+  a recognized field with an invalid type or list value raises
+  `ValueError` rather than being silently coerced.
+
+  Each `wine_cellar` record represents one wine holding (not one physical
+  bottle), keyed by its own record ID with no duplicate `id` field inside
+  it. Every record, including zero-quantity ones, must carry four required
+  fields (`producer`, `wine_name`, `color` as non-empty strings, `quantity`
+  as a non-negative int excluding `bool`); ten further fields are optional
+  (`vintage` as an int 1800–2100 or the exact string `"NV"`, `country`,
+  `region`, `style`, `grapes` as a list of non-empty strings in authored
+  order, `estimated_price` paired with `price_currency` — both present or
+  both absent, `vivino_rating` from 0 through 5, `drinking_window`,
+  `notes`, and `special_occasion` as a bool, rendered only when `true`). An
+  invalid required or recognized-optional field raises `ValueError` naming
+  the record and field, before the provider is ever called; unknown fields
+  are ignored and nothing is coerced. After validation, zero-quantity
+  records are excluded and the remaining active records are sorted by
+  record key only — never merged, deduplicated, or ranked by price,
+  rating, producer, vintage, or model inference. A private constant caps a
+  single prompt at 100 active records; above that, no partial inventory is
+  sent — an honest section states the count, the limit, and that the model
+  should ask the user to narrow the request instead of claiming to have
+  evaluated the whole cellar, and the provider is still called exactly
+  once. Deterministic bottle-count lookup and wine-name matching over the
+  cellar remain unimplemented — a "how many bottles of X do I have"
+  question is still answered by the model from the structured cellar
+  context, not by exact code-level lookup.
+
+  The model call is scoped to wine expertise by `prompts/wine/fallback.md`,
+  which distinguishes the durable personal profile, the real but read-only
+  cellar inventory, and recent, possibly-unrelated conversation context,
+  and adds explicit everyday-versus-special-occasion guidance: never
+  assume an occasion is special unless the request clearly says so, prefer
+  lower-priced or lower-rated bottles for everyday requests, reserve
+  `special_occasion: true` bottles for clearly stated special occasions,
+  and never claim a bottle was consumed or its quantity decremented.
   `handle()` returns that call's real `ModelResponse` unchanged.
   `WineCapability` does not persist or write anything itself — the
   orchestrator remains responsible for writing memory after `handle()`
   returns, and nothing in this capability ever writes to the knowledge
-  store. There is still no cellar inventory, bottle-level data, tools, or
-  web access. Covered by an automated pytest suite
-  (`tests/capabilities/wine/test_capability.py`).
+  store. There is still no bottle-level purchase/ratings history beyond a
+  cellar record's own fields, import or editing workflow, or web access.
+  Covered by an automated pytest suite
+  (`tests/capabilities/wine/test_capability.py`) and one end-to-end
+  orchestrator test (`tests/kernel/orchestrator/test_orchestrator.py`).
 
 Each capability is meant to be a self-contained domain expert that uses
 kernel services (memory, knowledge, tools, models) to do its job. Capabilities
@@ -213,11 +252,12 @@ knowledge. The kernel's `memory` module defines *how* conversation data is
 structured and stored (JSONL); `storage/` is *where* it is kept at rest
 (`storage/memory/`, `storage/logs/`). `kernel/knowledge`'s
 `JSONKnowledgeStore` reads from `storage/knowledge/` the same way — a real
-personal wine profile would live at `storage/knowledge/wine_profile.json` —
-but `storage/**/*.jsonl` and `storage/knowledge/*.json` are gitignored, and
-no such file is committed to this repository. Nothing writes to
-`storage/knowledge/` either; a human would place that file there directly.
-Backups are not yet implemented.
+personal wine profile would live at `storage/knowledge/wine_profile.json`,
+and a real personal cellar inventory at
+`storage/knowledge/wine_cellar.json` — but `storage/**/*.jsonl` and
+`storage/knowledge/*.json` are gitignored, and no such files are committed
+to this repository. Nothing writes to `storage/knowledge/` either; a human
+would place those files there directly. Backups are not yet implemented.
 
 ### Scripts and tests
 
@@ -296,25 +336,31 @@ this flow — a single call to `handle()` is one full request/response cycle.
   food categories, no model, memory, or knowledge involvement) plus a
   memory- and knowledge-aware, model-backed fallback for wine requests
   outside those categories: it reads an optional personal wine-preferences
-  profile from the knowledge store, recalls the last 10 `"conversation"`
-  memory entries as context, and is scoped by `prompts/wine/fallback.md` —
-  with an automated pytest suite. The model provider, memory manager, and
-  knowledge store are all injected explicitly by `CapabilityLoader`, sourced
-  from the orchestrator's own instances.
+  profile and a read-only personal cellar inventory from the knowledge
+  store, recalls the last 10 `"conversation"` memory entries as context,
+  and is scoped by `prompts/wine/fallback.md` — with an automated pytest
+  suite plus one end-to-end orchestrator test. The model provider, memory
+  manager, and knowledge store are all injected explicitly by
+  `CapabilityLoader`, sourced from the orchestrator's own instances.
 - Knowledge: a minimal, read-only `KnowledgeStore` contract
   (`kernel/knowledge/base.py`) and a `JSONKnowledgeStore` implementation
   (`kernel/knowledge/json_store.py`) that reads one keyed JSON document per
   namespace from an explicitly injected storage directory. Wired into
   `WineCapability`'s fallback for a personal wine-preferences profile
-  (namespace `"wine_profile"`, key `"profile"`); no real profile data is
-  committed to this repository.
+  (namespace `"wine_profile"`, key `"profile"`) and a read-only personal
+  cellar inventory (namespace `"wine_cellar"`, one record per wine holding,
+  validated and formatted entirely in `capabilities/wine/capability.py`);
+  no real profile or cellar data is committed to this repository.
 
 **Planned / not yet implemented:**
 
 - Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
   currently placeholder directories only.
-- Cellar inventory, bottle-level data, and purchase/ratings history in the
-  knowledge store; no search, embeddings, or vector retrieval.
+- Deterministic bottle-count lookup and wine-name matching over the cellar
+  inventory (the cellar is currently reasoned over by the model only); any
+  write API, quantity decrementing, or import/editing workflow for the
+  cellar; bottle-level purchase/ratings history beyond a cellar record's
+  own fields; no search, embeddings, or vector retrieval.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

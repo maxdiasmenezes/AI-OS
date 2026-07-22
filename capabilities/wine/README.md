@@ -264,11 +264,32 @@ whenever it matches one of that layer's conservative, literal phrasings.
 Only prompts that don't match any of those phrasings still reach the model
 here, reasoning over this same structured cellar context.
 
-There is still no write API on `KnowledgeStore` itself, no quantity
-decrementing, no editing workflow, no embeddings, fuzzy matching, or ranking
-engine — the runtime remains read-only end to end. The one write path that
-exists, `scripts/import_wine_cellar.py`, is a separate, human-invoked
-maintenance script (see [Personal wine cellar](#personal-wine-cellar) above
-and `scripts/README.md`); it writes `storage/knowledge/wine_cellar.json`
-directly, replacing the whole document, and never runs automatically. No real
-personal cellar data is committed to this repository.
+There is still no write API on `KnowledgeStore` itself, no editing workflow
+reachable from a conversation, no embeddings, fuzzy matching, or ranking
+engine — the runtime remains read-only end to end. `WineCapability` never
+decrements a quantity as a side effect of handling a prompt, no matter how
+the request is phrased (e.g. "I just drank a bottle of Reserve Red" does not
+change the cellar) — the model-backed fallback is explicitly instructed
+never to claim a bottle was consumed or its quantity decremented (see
+`prompts/wine/fallback.md`), and there is no code path from `WineCapability`,
+`CapabilityRouter`, or `Orchestrator` into either maintenance script below.
+
+Two separate, human-invoked maintenance scripts exist outside the kernel,
+both documented in `scripts/README.md`:
+
+- `scripts/import_wine_cellar.py` — replaces the **entire**
+  `storage/knowledge/wine_cellar.json` document from a CSV.
+- `scripts/update_wine_cellar_quantity.py` — changes only the `quantity`
+  field of **one existing holding**, selected by its exact, case-sensitive
+  Cellar ID; every other field on that record, and every other record, is
+  left untouched.
+
+Neither script is reachable from `WineCapability`, `CapabilityLoader`, the
+router, or the orchestrator; both are run directly by a human from the
+command line, never call a model, and never go through `KnowledgeStore` (it
+stays strictly read-only). A holding whose quantity reaches zero via the
+quantity-update script remains stored in the cellar — inactive, not
+deleted — the same as a zero-quantity record produced by a CSV import: it is
+simply excluded from `WineCapability`'s active totals, listings, and
+fallback prompt context, exactly as before. No real personal cellar data is
+committed to this repository.

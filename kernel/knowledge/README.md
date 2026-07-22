@@ -51,19 +51,35 @@ by `.gitignore`); no such files are committed.
 
 `KnowledgeStore` itself still exposes no write API, and `JSONKnowledgeStore`
 is never used to write either file — that contract is unchanged.
-`storage/knowledge/wine_cellar.json` does have exactly one writer today:
-`scripts/import_wine_cellar.py` (see `scripts/README.md`), a local,
-human-invoked maintenance script that lives entirely outside the runtime
-kernel. It is not a capability, is never reached through the orchestrator,
-and does not call `KnowledgeStore` — it validates a CSV using the same
-`validate_cellar_record()` that `WineCapability` reads through, then writes
-the JSON file directly and atomically, replacing the whole document, only
-when a human runs it with an explicit `--write` flag. This does not expand
-what `KnowledgeStore` itself can do; the kernel's read-only contract is
-unchanged. Deterministic bottle-count lookup and wine-name matching over the
-cellar now exist (`capabilities/wine/cellar_lookup.py`), entirely as
-read-only, exact-match logic layered on top of `list_records()` — they add
-no write path, no fuzzy or semantic matching, and no ranking. Bottle-level
+`storage/knowledge/wine_cellar.json` now has two writers, and both are local,
+human-invoked maintenance scripts that live entirely outside the runtime
+kernel, documented in `scripts/README.md`:
+
+- `scripts/import_wine_cellar.py` validates a CSV using the same
+  `validate_cellar_record()` that `WineCapability` reads through, then writes
+  the JSON file directly and atomically, replacing the whole document, only
+  when a human runs it with an explicit `--write` flag.
+- `scripts/update_wine_cellar_quantity.py` (Safe Cellar Quantity Update v1)
+  changes only the `quantity` field of one existing holding, selected by its
+  exact Cellar ID. It re-validates every record in the cellar — with the
+  same shared `validate_cellar_record()` — both before and after computing
+  the proposed quantity, deep-copies the original parsed document so
+  unrecognized fields and untouched records survive unchanged, and, like the
+  importer, only writes atomically when a human passes an explicit `--write`
+  flag; every run defaults to a dry run.
+
+Neither script is a capability, neither is ever reached through the
+orchestrator, and neither calls `KnowledgeStore` to write — both write the
+JSON file directly with plain file I/O. This does not expand what
+`KnowledgeStore` itself can do, and it does not create an autonomous write
+path: both scripts are one-shot, explicitly human-invoked commands, never
+triggered automatically, on a schedule, or as a side effect of handling a
+prompt. The kernel's read-only contract is unchanged. Deterministic
+bottle-count lookup and wine-name matching over the cellar also exist
+(`capabilities/wine/cellar_lookup.py`), entirely as read-only, exact-match
+logic layered on top of `list_records()` — they add no write path, no fuzzy
+or semantic matching, and no ranking. Adding or removing holdings, editing
+any field other than quantity, automatic decrementing, bottle-level
 purchase/ratings history beyond what a cellar record already carries,
-search, embeddings, vector retrieval, and web access all remain
-unimplemented.
+backups, change history, search, embeddings, vector retrieval, and web
+access all remain unimplemented.

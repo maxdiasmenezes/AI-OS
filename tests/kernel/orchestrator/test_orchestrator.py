@@ -11,7 +11,7 @@ from capabilities.wine.capability import WineCapability
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
-from kernel.memory import MemoryManager
+from kernel.memory import MemoryEntry, MemoryManager
 from kernel.models.base import ModelProvider, ModelResponse
 from kernel.orchestrator import Orchestrator
 
@@ -80,6 +80,45 @@ class FakeBadCapability(Capability):
         return 12345
 
 
+class RecordingMemory:
+    """A minimal, structurally compatible memory fake that records every
+    remember()/recall() call it receives, without inheriting from
+    MemoryManager (standing in for a future FixedNamespaceMemory adapter)."""
+
+    def __init__(self):
+        self.remember_calls: list[tuple] = []
+        self.recall_calls: list[tuple] = []
+        self._entries: list[MemoryEntry] = []
+
+    def remember(self, namespace, content, metadata=None):
+        self.remember_calls.append((namespace, content, metadata))
+        self._entries.append(MemoryEntry(namespace=namespace, content=content, metadata=metadata))
+
+    def recall(self, namespace, limit=None):
+        self.recall_calls.append((namespace, limit))
+        entries = [e for e in self._entries if e.namespace == namespace]
+        return entries if limit is None else entries[-limit:]
+
+
+class MemoryUsingCapability(Capability):
+    """A capability that reads from the memory dependency it was given,
+    proving a capability can use the exact object the loader received."""
+
+    def __init__(self, capability_id: str, response_text: str, memory):
+        self._id = capability_id
+        self._response_text = response_text
+        self._memory = memory
+        self.recalled_at_handle_time: list = []
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def handle(self, prompt: str) -> str:
+        self.recalled_at_handle_time = self._memory.recall("conversation")
+        return self._response_text
+
+
 def _make_config(tmp_path: Path) -> Config:
     return Config(
         provider="fake",
@@ -97,6 +136,18 @@ def _make_orchestrator(monkeypatch, config, fake_provider, capability_loader):
         lambda cfg: fake_provider,
     )
     return Orchestrator(config, capability_loader=capability_loader)
+
+
+def _make_orchestrator_with_memory(monkeypatch, config, fake_provider, capability_loader, memory_manager):
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.get_provider",
+        lambda cfg: fake_provider,
+    )
+    return Orchestrator(
+        config,
+        capability_loader=capability_loader,
+        memory_manager=memory_manager,
+    )
 
 
 def _fake_response(text: str = "fallback response") -> ModelResponse:
@@ -588,3 +639,174 @@ def test_fallback_branch_logs_interaction(monkeypatch, tmp_path):
     assert record["input_tokens"] == 11
     assert record["output_tokens"] == 22
     assert record["latency_seconds"] == 0.5
+
+
+# --- Milestone 32A: memory injection seam ---------------------------------
+
+
+def test_default_construction_constructs_exactly_one_memory_manager_from_config(
+    monkeypatch, tmp_path
+):
+    # A. Default construction still builds a real MemoryManager from
+    # config.memory_settings, and builds exactly one.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    loader = Mock(return_value=FakeCapability("wine", "a bold Malbec would work well"))
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.get_provider", lambda cfg: fake_provider
+    )
+
+    constructed_settings = []
+    original_init = MemoryManager.__init__
+
+    def spy_init(self, settings):
+        constructed_settings.append(settings)
+        original_init(self, settings)
+
+    monkeypatch.setattr(MemoryManager, "__init__", spy_init)
+
+    Orchestrator(config, capability_loader=loader)
+
+    assert constructed_settings == [config.memory_settings]
+
+
+def test_positional_construction_without_memory_manager_still_works(monkeypatch, tmp_path):
+    # E. The existing two-positional-argument construction remains valid.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    loader = Mock()
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.get_provider", lambda cfg: fake_provider
+    )
+
+    orchestrator = Orchestrator(config, loader)
+
+    assert isinstance(orchestrator, Orchestrator)
+
+
+def test_memory_manager_parameter_is_keyword_only(monkeypatch, tmp_path):
+    # E. The injected memory dependency cannot be passed positionally.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    loader = Mock()
+    fake_memory = RecordingMemory()
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.get_provider", lambda cfg: fake_provider
+    )
+
+    with pytest.raises(TypeError):
+        Orchestrator(config, loader, fake_memory)
+
+
+def test_injecting_memory_manager_skips_constructing_a_new_one(monkeypatch, tmp_path):
+    # B. Supplying a memory dependency means no second MemoryManager is
+    # constructed.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_memory = RecordingMemory()
+    loader = Mock(return_value=FakeCapability("wine", "a bold Malbec would work well"))
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.get_provider", lambda cfg: fake_provider
+    )
+
+    constructed_settings = []
+    original_init = MemoryManager.__init__
+
+    def spy_init(self, settings):
+        constructed_settings.append(settings)
+        original_init(self, settings)
+
+    monkeypatch.setattr(MemoryManager, "__init__", spy_init)
+
+    Orchestrator(config, capability_loader=loader, memory_manager=fake_memory)
+
+    assert constructed_settings == []
+
+
+def test_capability_loader_receives_the_exact_injected_memory_object(monkeypatch, tmp_path):
+    # B & D. capability_loader receives the exact injected object, not a
+    # newly constructed or wrapped one.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_memory = RecordingMemory()
+    captured = {}
+
+    def loader(capability_id, provider, memory, knowledge):
+        captured["memory"] = memory
+        return FakeCapability(capability_id, "a bold Malbec would work well")
+
+    orchestrator = _make_orchestrator_with_memory(
+        monkeypatch, config, fake_provider, loader, fake_memory
+    )
+    orchestrator.handle("What wine goes with steak?")
+
+    assert captured["memory"] is fake_memory
+
+
+def test_fallback_path_uses_injected_memory_for_recall_and_remember(monkeypatch, tmp_path):
+    # C. Orchestrator's own recall/remember operations reach the injected
+    # memory object, exercised via the model-fallback path.
+    config = _make_config(tmp_path)
+    fixed_response = _fake_response("it's sunny tomorrow")
+    fake_provider = FakeModelProvider(fixed_response)
+    fake_memory = RecordingMemory()
+    loader = Mock()
+
+    orchestrator = _make_orchestrator_with_memory(
+        monkeypatch, config, fake_provider, loader, fake_memory
+    )
+    response = orchestrator.handle("What's the weather tomorrow?")
+
+    loader.assert_not_called()
+    assert response is fixed_response
+    assert fake_memory.recall_calls == [("conversation", 10)]
+    assert fake_memory.remember_calls == [
+        ("conversation", "What's the weather tomorrow?", {"role": "user"}),
+        ("conversation", "it's sunny tomorrow", {"role": "assistant"}),
+    ]
+
+
+def test_routed_path_remember_calls_reach_the_injected_memory_object(monkeypatch, tmp_path):
+    # C. The remember() calls Orchestrator makes after a routed capability
+    # response also reach the injected memory object.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_memory = RecordingMemory()
+    fake_capability = FakeCapability("wine", "a bold Malbec would work well")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator_with_memory(
+        monkeypatch, config, fake_provider, loader, fake_memory
+    )
+    orchestrator.handle("What wine goes with steak?")
+
+    assert fake_memory.remember_calls == [
+        ("conversation", "What wine goes with steak?", {"role": "user"}),
+        ("conversation", "a bold Malbec would work well", {"role": "assistant"}),
+    ]
+
+
+def test_capability_can_recall_through_the_exact_injected_memory_object(monkeypatch, tmp_path):
+    # D. A capability that uses the memory dependency it was given reaches
+    # the exact same injected object, seeing data seeded on it beforehand.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_memory = RecordingMemory()
+    fake_memory.remember("conversation", "earlier note", metadata={"role": "assistant"})
+
+    captured_capability = {}
+
+    def loader(capability_id, provider, memory, knowledge):
+        capability = MemoryUsingCapability(
+            capability_id, "a bold Malbec would work well", memory
+        )
+        captured_capability["capability"] = capability
+        return capability
+
+    orchestrator = _make_orchestrator_with_memory(
+        monkeypatch, config, fake_provider, loader, fake_memory
+    )
+    orchestrator.handle("What wine goes with steak?")
+
+    capability = captured_capability["capability"]
+    assert [e.content for e in capability.recalled_at_handle_time] == ["earlier note"]

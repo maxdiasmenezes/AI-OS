@@ -9,17 +9,30 @@ exchange to memory, logs the interaction, and returns the response. No
 tools, no retries, no streaming - just routing plus the existing flow.
 """
 
-from typing import Callable
+from typing import Callable, Protocol
 
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.logger import log_interaction
-from kernel.memory import MemoryManager
+from kernel.memory import MemoryEntry, MemoryManager
 from kernel.models import ModelResponse, get_provider
 from kernel.models.base import ModelProvider
 from kernel.orchestrator.router import CapabilityRouter
 from kernel.prompts import build_prompt
+
+
+class SupportsMemory(Protocol):
+    """Structural contract for the memory dependency Orchestrator uses.
+
+    Lets a composition root inject a delegating adapter (e.g. a
+    namespace-scoped wrapper) in place of a concrete MemoryManager, without
+    requiring it to inherit from that class.
+    """
+
+    def remember(self, namespace: str, content: str, metadata: dict | None = None) -> None: ...
+
+    def recall(self, namespace: str, limit: int | None = None) -> list[MemoryEntry]: ...
 
 
 class Orchestrator:
@@ -29,12 +42,16 @@ class Orchestrator:
         self,
         config: Config,
         capability_loader: Callable[
-            [str, ModelProvider, MemoryManager, KnowledgeStore], Capability
+            [str, ModelProvider, SupportsMemory, KnowledgeStore], Capability
         ],
+        *,
+        memory_manager: SupportsMemory | None = None,
     ) -> None:
         self._config = config
         self._provider = get_provider(config)
-        self._memory = MemoryManager(config.memory_settings)
+        self._memory = (
+            memory_manager if memory_manager is not None else MemoryManager(config.memory_settings)
+        )
         self._knowledge = JSONKnowledgeStore(config.knowledge_storage_dir)
         self._router = CapabilityRouter()
         self._capability_loader = capability_loader

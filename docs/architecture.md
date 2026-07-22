@@ -359,14 +359,55 @@ Both scripts never call a model and never run on their own — there is no
 autonomous or scheduled write path for either. Cellar filtering, adding or
 removing holdings, and editing any field other than quantity remain
 unimplemented (deterministic *read-only* cellar lookup exists separately, in
-`capabilities/wine/cellar_lookup.py` — see Capabilities above). `tests/`
-holds test suites that verify kernel and capability behavior; today this
-covers `WineCapability` (`tests/capabilities/wine/test_capability.py` and
-`tests/capabilities/wine/test_cellar_lookup.py`), the importer
-(`tests/scripts/test_import_wine_cellar.py`), and the quantity-update script
-(`tests/scripts/test_update_wine_cellar_quantity.py`), the latter two using
-only synthetic, dynamically constructed fixtures under `tmp_path` — no real
-storage data is read or written by the test suite.
+`capabilities/wine/cellar_lookup.py` — see Capabilities above).
+
+A third script, `scripts/wine_acceptance_check.py` ("Wine Data Readiness and
+Acceptance Check v1"), is the committed, read-only half of a **hybrid
+milestone**: this script — plus its automated tests — is committed code, but
+onboarding real personal data (writing a real CSV and a real
+`wine_profile.json`, running the importer with `--write`, and actually
+executing this acceptance check against them) happens locally, after merge,
+and is explicitly out of scope for what's committed here. Unlike the two
+scripts above, it never writes anything at all — no `--write` flag exists.
+It validates the local `wine_profile.json` and `wine_cellar.json` (default
+paths under `storage/knowledge/`, injectable for testing) using the same
+`capabilities/wine/cellar_schema.py` validator as the rest of the wine
+stack, computes factual cellar statistics, and then runs two categories of
+checks through the real `WineCapability.handle()`: deterministic
+cellar-query cases (total bottle count, exact quantity, producer ownership,
+producer holdings, vintage listing, region/country ownership, zero-quantity
+behavior, an ambiguous wine name, multiple vintages of one wine, and an
+unknown wine), selected from the real cellar data itself and reported
+PASS/FAIL/SKIP; and a prompt-assembly case that exercises the model-backed
+fallback's prompt construction structurally, without asserting on wording.
+Deterministic checks run against a private fail-fast provider and fail-fast
+memory object that raise immediately if touched, proving those paths remain
+model- and memory-free; the prompt-assembly check runs against a private
+recording fake provider (captures the assembled prompt without printing it
+in full, since it contains personal data) and a private no-op memory object.
+This no-op memory object is not the real `MemoryManager` — the script never
+constructs or reads from the repository's persistent memory at all. An
+explicit `--call-model` flag additionally runs a concise, fixed set of
+prompts through the real, configured provider (constructed lazily, only
+inside that opt-in path, via the existing `get_provider()` factory) and
+prints the responses labeled `MANUAL REVIEW REQUIRED`, since the script
+never asserts anything about a model's actual wording or pairing quality;
+without that flag, no model provider is constructed or contacted, so a
+plain run works even with no local model server running. This script
+introduces no new capability, public interface, dependency, or change to
+`WineCapability`, the router, the orchestrator, `KnowledgeStore`, or any
+provider — it is read-only test-double-driven verification layered on top
+of the existing wine stack. No real profile or cellar data is committed to
+this repository.
+
+`tests/` holds test suites that verify kernel and capability behavior;
+today this covers `WineCapability` (`tests/capabilities/wine/test_capability.py`
+and `tests/capabilities/wine/test_cellar_lookup.py`), the importer
+(`tests/scripts/test_import_wine_cellar.py`), the quantity-update script
+(`tests/scripts/test_update_wine_cellar_quantity.py`), and the acceptance
+check (`tests/scripts/test_wine_acceptance_check.py`) — all four
+`tests/scripts/` suites use only synthetic, dynamically constructed fixtures
+under `tmp_path`; no real storage data is read or written by the test suite.
 
 ## Request flow
 
@@ -483,6 +524,19 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `--set` is a no-op that leaves the file byte-for-byte unchanged even with
   `--write`. Dry run is the default; `KnowledgeStore` is never used as a
   write interface.
+- Wine Data Readiness and Acceptance Check v1 (`scripts/wine_acceptance_check.py`):
+  a human-invoked, read-only, model-free-by-default utility — the committed
+  half of a hybrid milestone, with real-data onboarding and execution
+  happening locally after merge. It validates the local `wine_profile.json`
+  and `wine_cellar.json` with the shared `cellar_schema.py` validator,
+  reports factual cellar statistics, and runs deterministic cellar-query and
+  prompt-assembly checks through the real `WineCapability.handle()` using
+  private fail-fast and recording-fake test doubles for the provider and
+  memory — never the real `MemoryManager` and never the real provider unless
+  the caller passes `--call-model`, which lazily constructs the configured
+  provider via `get_provider()` and labels its responses `MANUAL REVIEW
+  REQUIRED`. Writes nothing, adds no new capability or provider-architecture
+  change, and commits no real profile or cellar data.
 
 **Planned / not yet implemented:**
 

@@ -185,3 +185,179 @@ does not add or remove holdings, does not edit any other field, and does not
 decrement automatically — every run is a separate, explicit, human-invoked
 command. It never runs on its own, and this milestone still implements no
 backups or change history.
+
+## Wine Data Readiness and Acceptance Check v1 (`wine_acceptance_check.py`)
+
+A human-invoked, **read-only** utility that verifies a local wine profile
+(`storage/knowledge/wine_profile.json`) and cellar
+(`storage/knowledge/wine_cellar.json`) are structurally usable by
+`WineCapability` — before you rely on them for real use. It does not create,
+import, or edit either file; use `import_wine_cellar.py` and
+`update_wine_cellar_quantity.py` (above) for that, and write
+`wine_profile.json` by hand (see `storage/knowledge/README.md`).
+
+**Safety model:**
+
+- Runs entirely outside the runtime kernel — invoked directly by a human,
+  never by the orchestrator or a capability.
+- **Model-free by default.** No model provider is constructed or contacted
+  unless `--call-model` is passed explicitly, and even then the real
+  provider is constructed lazily, only inside that opt-in code path. A
+  plain run works with no local model server running at all.
+- **No persistent memory.** The script never constructs or uses the
+  repository's real `MemoryManager` and never reads existing conversation
+  history. It uses a tiny private no-op memory object for prompt-assembly
+  checks (returns no recalled turns, records nothing, writes nothing) and a
+  fail-fast memory object for deterministic checks that raises immediately
+  if `WineCapability` ever tries to touch it — proving those code paths
+  really are memory-free.
+- **Writes nothing.** No profile, cellar, quantity, memory, log, report, or
+  other repository file is ever created or modified. There is no `--write`
+  flag; this script never has a destructive mode.
+- Deterministic cellar-query checks run through the real
+  `WineCapability.handle()` with a fail-fast provider *and* fail-fast
+  memory, so any unexpected provider or memory access fails the check
+  immediately instead of silently succeeding.
+- Prompt-assembly checks run through the real `WineCapability.handle()`
+  with a recording fake provider (captures the assembled fallback prompt,
+  returns a fixed response) and the no-op memory — never the configured
+  real provider.
+
+## Commands
+
+Model-free acceptance run (default — the only thing this script does unless
+told otherwise):
+
+```
+uv run python -m scripts.wine_acceptance_check
+```
+
+Model-free run, plus a concise set of real-provider prompts for manual
+review:
+
+```
+uv run python -m scripts.wine_acceptance_check --call-model
+```
+
+## Status meanings
+
+- **PASS** — the check succeeded.
+- **FAIL** — the check failed; a required, model-free check failing makes
+  the whole run fail (exit code 1).
+- **SKIP** — a condition-dependent check (e.g. a region, a zero-quantity
+  holding, an ambiguous wine name, multiple vintages of one wine) had no
+  matching real data to exercise it. SKIP does not fail the run; it is
+  reported separately as an "optional checks skipped" count.
+- **MANUAL REVIEW** — only appears with `--call-model`. The real model
+  produced a non-empty response, printed for a human to judge; the script
+  never asserts anything about a model's actual wording, pairing choices,
+  or subjective quality, so a MANUAL REVIEW result is not proof the
+  response was good — read it yourself before trusting it.
+
+Model-backed responses under `--call-model` **always require human
+review** — the script only mechanically confirms the call succeeded and the
+response was non-empty, nothing about content or correctness.
+
+## What a run reports
+
+A model-free run prints: the resolved profile and cellar paths; profile
+readiness; cellar statistics (total/active/zero-quantity holdings, active
+bottle total, unique producers, represented countries/regions); each
+deterministic acceptance check (A–K); prompt-assembly readiness;
+confirmation that no real provider was called; confirmation that no files
+were written; a final required-check pass count; and an optional-check skip
+count. It never prints the complete cellar document or the complete captured
+fallback prompt, since both may contain personal data — only derived
+statistics and short pass/fail summaries.
+
+**Do not paste real acceptance output into a public issue, chat, or file
+committed to this repository** — a real run can legitimately print your real
+producer names, wine names, regions, and profile preferences (though never
+prices, ratings, or full record dumps).
+
+## Default local paths
+
+```
+<repository-root>/storage/knowledge/wine_profile.json
+<repository-root>/storage/knowledge/wine_cellar.json
+```
+
+Both are gitignored (`storage/knowledge/*.json`) and never committed. The
+underlying `run_acceptance()`/`main()` functions accept both paths as
+explicit overrides for testing; the two files must live in the same
+directory and keep these exact filenames, since `WineCapability` reads both
+through one `KnowledgeStore` instance pointed at that directory.
+
+## `wine_profile.json` shape
+
+The real file stays local and is never committed — only synthetic,
+illustrative values are shown here:
+
+```json
+{
+  "profile": {
+    "preferred_styles": ["Synthetic Style A", "Synthetic Style B"],
+    "disliked_styles": ["Synthetic Disliked Style"],
+    "budget_range": "$20-40 per bottle (synthetic)",
+    "priorities": ["Synthetic Priority"],
+    "notes": "Synthetic free-text notes."
+  }
+}
+```
+
+Recognized fields: `preferred_styles`, `disliked_styles`, and `priorities`
+(lists of strings), `budget_range` and `notes` (strings). Unknown fields are
+ignored, not rejected. **Food dislikes belong in `notes`, not
+`disliked_styles`** — `disliked_styles` is for wine styles (e.g. "oaky
+Chardonnay"), not foods; a note like "avoid pairing with very spicy dishes"
+belongs in `notes`.
+
+## Real cellar CSV
+
+The real cellar CSV that feeds `import_wine_cellar.py` stays **outside this
+repository** entirely — only the resulting, gitignored
+`storage/knowledge/wine_cellar.json` exists locally. See the CSV format
+section above for the full column reference; a few conventions worth
+repeating here since they affect acceptance results directly:
+
+- `vintage`: the exact string `NV`, an integer year (1800–2100), or blank
+  (omitted) for "not recorded" — never `0` or empty-string-as-a-value.
+- Blank optional cells mean the field is absent, not empty-string.
+- `grapes` is `;`-separated within one cell; order is preserved.
+- `special_occasion` is `true`/`false` only.
+- Prices need both `estimated_price` and `price_currency`, or neither.
+- Quantities are non-negative integers; a wine you no longer physically hold
+  should be `0`, not deleted — deterministic zero-quantity behavior depends
+  on the record still existing.
+- Duplicate vintages of the same producer+wine (different Cellar IDs) are
+  expected and are exactly what the multiple-vintages acceptance case
+  checks for.
+- Duplicate wine names across different producers are expected and are
+  exactly what the ambiguous-wine-name acceptance case checks for — the
+  deterministic layer asks for the producer rather than guessing.
+- All text is read and written as UTF-8; accented and non-Latin producer,
+  region, and wine names are supported as-is.
+- Cellar IDs (the CSV's `id` column) should be stable across re-imports —
+  pick a scheme (e.g. `producer-slug-wine-slug-vintage`) and keep using it,
+  since `update_wine_cellar_quantity.py` selects records by exact Cellar ID.
+
+## Recommended real-data onboarding sequence
+
+1. Write your real cellar CSV (outside this repository) and your real
+   `storage/knowledge/wine_profile.json` by hand, using the shape above.
+2. Dry-run the importer and review its summary:
+   `uv run python -m scripts.import_wine_cellar <csv_path>`
+3. Confirm the destination is git-ignored and the tree is otherwise clean:
+   `git check-ignore -v storage/knowledge/wine_cellar.json` and
+   `git status --porcelain -- storage/`.
+4. Write for real: `uv run python -m scripts.import_wine_cellar <csv_path> --write`
+5. Run this acceptance check:
+   `uv run python -m scripts.wine_acceptance_check`
+6. Optionally, review real model-backed responses:
+   `uv run python -m scripts.wine_acceptance_check --call-model`
+7. For a quantity change: dry-run first
+   (`uv run python -m scripts.update_wine_cellar_quantity <id> --decrement`),
+   apply explicitly (`... --write`), then re-run the acceptance check to
+   verify the cellar is still structurally sound, and spot-check the
+   specific holding's new quantity in the printed statistics or a targeted
+   query.

@@ -812,3 +812,85 @@ def test_valid_cellar_fallback_calls_provider_exactly_once_and_returns_exact_res
     response = wine.handle("What's a good Bordeaux vintage from 2015?")
     assert len(fake_provider.received_prompts) == 1
     assert response is fake_provider.response
+
+
+# --- Milestone 29: deterministic cellar lookup -----------------------------
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "How many bottles of wine do I have in total?",
+        "How many bottles of Reserve Red are in my cellar?",
+        "Do I have Reserve Red in my cellar?",
+        "Show me my wines from Sample Estate.",
+        "What vintages of Reserve Red are in my cellar?",
+    ],
+)
+def test_deterministic_cellar_query_returns_str_and_calls_list_records_exactly_once(
+    wine, fake_provider, memory_manager, knowledge_store, knowledge_dir, prompt
+):
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+
+    response = wine.handle(prompt)
+
+    assert isinstance(response, str)
+    assert knowledge_store.list_records_calls == ["wine_cellar"]
+    assert knowledge_store.get_calls == []
+    assert memory_manager.recall_calls == []
+    assert fake_provider.received_prompts == []
+
+
+def test_deterministic_total_query_reflects_seeded_cellar(wine, knowledge_dir):
+    _write_cellar(knowledge_dir, {"sample-red-2021": _SAMPLE_RECORD})
+    response = wine.handle("How many bottles are in my cellar?")
+    assert "3 bottles" in response
+
+
+def test_deterministic_cellar_query_with_no_cellar_namespace_is_still_deterministic(
+    wine, fake_provider, knowledge_store
+):
+    response = wine.handle("How many bottles are in my cellar?")
+    assert response == "The active cellar contains 0 bottles across 0 holdings."
+    assert knowledge_store.list_records_calls == ["wine_cellar"]
+    assert fake_provider.received_prompts == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "How many?",
+        "Do I own this?",
+        "Show me everything.",
+        "What do I have?",
+        "What vintages exist?",
+        "What's a good Bordeaux vintage from 2015?",
+    ],
+)
+def test_unsupported_factual_like_phrasing_falls_through_to_model_backed_fallback(
+    wine, fake_provider, prompt
+):
+    response = wine.handle(prompt)
+    assert response is fake_provider.response
+    assert len(fake_provider.received_prompts) == 1
+
+
+def test_deterministic_cellar_query_with_invalid_cellar_data_raises_before_provider_call(
+    wine, fake_provider, knowledge_dir
+):
+    invalid_record = dict(_SAMPLE_RECORD, quantity=-1)
+    _write_cellar(knowledge_dir, {"sample-red-2021": invalid_record})
+
+    with pytest.raises(ValueError):
+        wine.handle("How many bottles are in my cellar?")
+
+    assert fake_provider.received_prompts == []
+
+
+def test_pairing_categories_still_take_priority_over_cellar_query_detection(wine, fake_provider):
+    # "What wine goes with a steak?" is a pairing prompt, not a cellar query -
+    # it must still resolve to the deterministic pairing answer, not fall
+    # through to cellar-query parsing or the model fallback.
+    response = wine.handle("What wine goes with a steak?")
+    assert "red meat" in response
+    assert fake_provider.received_prompts == []

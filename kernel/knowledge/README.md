@@ -13,15 +13,26 @@ or a non-object record) raises `ValueError` instead of being silently
 treated as empty.
 
 `WineCapability` (`capabilities/wine/capability.py`) is the first consumer,
-using both methods the contract exposes, and only on its model-backed
-fallback path (the eight deterministic pairing categories never touch the
-knowledge store at all):
+using both methods the contract exposes. The eight deterministic pairing
+categories never touch the knowledge store at all. Two other paths do:
 
 - `knowledge_store.get("wine_profile", "profile")` — an optional personal
-  wine-preferences profile, a single record.
+  wine-preferences profile, a single record, read only on the model-backed
+  fallback path.
 - `knowledge_store.list_records("wine_cellar")` — an optional personal
   cellar inventory, one record per wine holding (not per physical bottle),
   keyed by the record's own ID rather than a duplicate `id` field inside it.
+  Read on the model-backed fallback path (to build cellar context for the
+  model), and also, independently, by Deterministic Cellar Lookup v1
+  (`capabilities/wine/cellar_lookup.py`) for a small set of factual cellar
+  questions it answers without any model call — total bottle count, exact
+  quantity, exact ownership, producer holdings, and vintage listing. That
+  path detects a supported query from the prompt text alone before ever
+  touching the store, and, once detected, calls `list_records()` only —
+  never `get()` — so a deterministic cellar answer still costs exactly one
+  knowledge-store read and zero model calls. See
+  `capabilities/wine/README.md` for the supported phrasings and matching
+  rules.
 
 The store itself stays exactly as read-only as before; schema validation of
 the profile record's fields lives in `capabilities/wine/capability.py`, and
@@ -50,6 +61,9 @@ the JSON file directly and atomically, replacing the whole document, only
 when a human runs it with an explicit `--write` flag. This does not expand
 what `KnowledgeStore` itself can do; the kernel's read-only contract is
 unchanged. Deterministic bottle-count lookup and wine-name matching over the
-cellar, bottle-level purchase/ratings history beyond what a cellar record
-already carries, search, embeddings, vector retrieval, and web access all
-remain unimplemented.
+cellar now exist (`capabilities/wine/cellar_lookup.py`), entirely as
+read-only, exact-match logic layered on top of `list_records()` — they add
+no write path, no fuzzy or semantic matching, and no ranking. Bottle-level
+purchase/ratings history beyond what a cellar record already carries,
+search, embeddings, vector retrieval, and web access all remain
+unimplemented.

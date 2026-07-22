@@ -102,3 +102,61 @@ def test_suitable_for_business_meeting_does_not_route():
 def test_unrelated_ordinary_prompt_does_not_route():
     router = CapabilityRouter()
     assert router.route("Can you help me draft an email to my landlord?") is None
+
+
+# --- Milestone 29: plural "wine(s)" and "my cellar" cue (positive) --------
+
+
+def test_plural_wines_routes_to_wine():
+    router = CapabilityRouter()
+    assert router.route("Show me my wines from Sample Estate.") == "wine"
+
+
+def test_my_cellar_phrase_routes_to_wine():
+    router = CapabilityRouter()
+    assert router.route("How many bottles are in my cellar?") == "wine"
+    assert router.route("What vintages of Reserve Red are in my cellar?") == "wine"
+
+
+def test_singular_wine_still_routes_to_wine():
+    router = CapabilityRouter()
+    assert router.route("What wine goes with steak?") == "wine"
+
+
+def test_plural_and_cellar_cues_are_case_insensitive():
+    router = CapabilityRouter()
+    assert router.route("SHOW ME MY WINES FROM SAMPLE ESTATE.") == "wine"
+    assert router.route("HOW MANY BOTTLES ARE IN MY CELLAR?") == "wine"
+
+
+# --- Milestone 29: cellar-query false positives (negative) ----------------
+
+
+def test_bottles_of_water_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("How many bottles of water do I have?") is None
+
+
+def test_own_a_red_car_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("Do I own a red car?") is None
+
+
+def test_show_me_files_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("Show me files from Sample Estate.") is None
+
+
+def test_vintages_of_watches_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("What vintages of watches do you own?") is None
+
+
+def test_bottle_opener_still_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("I need a bottle opener.") is None
+
+
+def test_visit_a_winery_still_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("Let's visit a winery.") is None

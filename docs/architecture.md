@@ -43,7 +43,8 @@ to the kernel.
 
   kernel/knowledge: read-only KnowledgeStore contract + JSON implementation,
   wired into WineCapability's model-backed fallback for an optional personal
-  wine profile and a read-only personal wine cellar inventory.
+  wine profile and a read-only personal wine cellar inventory, and into its
+  Deterministic Cellar Lookup v1 for the same read-only cellar inventory.
   kernel/tools: directory exists; planned, no code yet.
 ```
 
@@ -145,27 +146,74 @@ know what wine, travel, or strategy mean.
   configure any of them itself.
 - **Router** (`kernel/orchestrator/router.py`) — deterministic prompt-to-id
   matching; routes to `"wine"` on the literal, case-insensitive whole word
-  `\bwine\b`, or on a small, explicit set of natural wine-selection and
+  `\bwines?\b` (singular or plural), on a conservative `\bmy\s+cellar\b`
+  phrase cue, or on a small, explicit set of natural wine-selection and
   food-pairing phrases (e.g. "which bottle should I open", or a
   pairing/selection verb combined with a small set of router-level food
   cues such as "pair this with chicken"), otherwise returns `None`. These
   phrase rules are plain compiled regexes with no model calls, fuzzy
   matching, scoring, or configuration involved, and are intentionally
   conservative: generic words like "drink", "bottle", "pair", "open",
-  "suitable", or "food" never route on their own, only specific phrases or
-  combinations do. The router does not depend on or import from
-  `capabilities/wine/capability.py`.
-- **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1
-  plus a memory- and knowledge-aware, model-backed fallback. Constructed
-  with three explicit dependencies, `WineCapability(model_provider,
-  memory_manager, knowledge_store)`, all injected rather than
-  self-constructed. Wine Pairing v1 is deterministic, keyword-based
-  food-to-wine pairing across eight food categories with a defined priority
-  order for overlapping matches (e.g. "spicy shrimp" resolves to spicy, not
-  shellfish) — no model calls, no memory recall, no knowledge-store access,
-  and `handle()` returns a plain `str` for these, immediately on match. A
-  wine-related prompt that matches none of the eight categories falls back
-  to the injected `ModelProvider` (`kernel/models/base.py`): it first reads
+  "suitable", "food", "own", "have", "bottles", "vintages", "producer",
+  "region", or "country" never route on their own, only specific words or
+  phrase combinations do — so a bare question like "Do I own Sample Estate
+  Reserve Red?" does not route, since the router cannot safely distinguish
+  it from "Do I own a red car?" without an explicit wine or cellar cue; the
+  same question phrased as "Do I own any Sample Estate Reserve Red wine?"
+  does route. The router does not depend on or import from
+  `capabilities/wine/capability.py`, and carries no cellar-record knowledge
+  or wine-name lists of its own.
+- **WineCapability** (`capabilities/wine/capability.py`) — Wine Pairing v1,
+  plus Deterministic Cellar Lookup v1, plus a memory- and knowledge-aware,
+  model-backed fallback, tried in that fixed order on every `handle()`
+  call. Constructed with three explicit dependencies,
+  `WineCapability(model_provider, memory_manager, knowledge_store)`, all
+  injected rather than self-constructed. Wine Pairing v1 is deterministic,
+  keyword-based food-to-wine pairing across eight food categories with a
+  defined priority order for overlapping matches (e.g. "spicy shrimp"
+  resolves to spicy, not shellfish) — no model calls, no memory recall, no
+  knowledge-store access, and `handle()` returns a plain `str` for these,
+  immediately on match.
+
+  A prompt that matches none of the eight pairing categories is checked
+  next against Deterministic Cellar Lookup v1
+  (`capabilities/wine/cellar_lookup.py`): a small, explicit set of factual
+  cellar questions — total active bottle count, exact quantity for one
+  wine, exact ownership (by wine name, producer, producer + wine name,
+  region, or country), producer holdings listing, and vintage listing —
+  answered directly from validated `wine_cellar` records, with no model
+  call. Query detection (`parse_cellar_query()`) runs on the prompt text
+  alone, before any knowledge-store access, against a small set of literal,
+  conservative phrasings (e.g. "How many bottles of Reserve Red are in my
+  cellar?", "Do I have any Burgundy wine?", "Show me my wines from Sample
+  Estate.") — broad fragments like "How many?" or "What do I have?" and any
+  pairing/recommendation prompt are not detected. Once a query is detected,
+  `WineCapability` calls `knowledge_store.list_records("wine_cellar")` —
+  the only knowledge access this path performs, never `get()` — and passes
+  the raw records to `answer_cellar_query()`, which validates every record
+  with the same `validate_cellar_record()` used by the fallback path
+  before doing anything else, so one invalid record (including an unrelated
+  or zero-quantity one) raises `ValueError` and aborts the whole answer.
+  Matching is exact, case-insensitive equality after normalization
+  (`str.casefold()`, collapsed whitespace, trailing `? . !` stripped) —
+  no accent stripping, no substring or fuzzy matching, no aliases. A wine
+  identity is normalized producer + normalized wine_name; only active
+  (`quantity > 0`) records count toward totals, ownership, and listings.
+  A wine-name-only target spanning more than one distinct producer is
+  ambiguous and returns a clarification instead of guessing; supplying
+  producer + wine name is never ambiguous, and an ownership match on
+  region, producer, or country legitimately spanning several wine
+  identities is not treated as ambiguity either. A target matching only
+  zero-quantity records, or no record at all, gets an explicit factual
+  answer saying so rather than silence or a guess. This layer returns a
+  plain `str` immediately on a detected query, exactly like a pairing
+  match, and adds no recommendation ranking, pairing/suitability logic,
+  fuzzy or semantic matching, model-assisted name resolution, or cellar
+  writes. Covered by `tests/capabilities/wine/test_cellar_lookup.py`.
+
+  A prompt that matches neither the eight pairing categories nor a
+  deterministic cellar query falls back to the injected `ModelProvider`
+  (`kernel/models/base.py`): it first reads
   an optional personal wine-preferences profile via
   `knowledge_store.get("wine_profile", "profile")`, then reads the personal
   cellar inventory via `knowledge_store.list_records("wine_cellar")` (the
@@ -208,10 +256,11 @@ know what wine, travel, or strategy mean.
   partial inventory is sent — an honest section states the count, the
   limit, and that the model should ask the user to narrow the request
   instead of claiming to have evaluated the whole cellar, and the provider
-  is still called exactly once. Deterministic bottle-count lookup and
-  wine-name matching over the cellar remain unimplemented — a "how many
-  bottles of X do I have" question is still answered by the model from the
-  structured cellar context, not by exact code-level lookup.
+  is still called exactly once. A "how many bottles of X do I have"
+  question reaches this fallback, and is answered by the model from the
+  structured cellar context, only when it does not match one of
+  Deterministic Cellar Lookup v1's conservative phrasings above — when it
+  does, the deterministic layer answers it directly instead.
 
   The model call is scoped to wine expertise by `prompts/wine/fallback.md`,
   which distinguishes the durable personal profile, the real but read-only
@@ -285,11 +334,14 @@ temporary file in the destination directory and moving it into place with
 `os.replace()`, so the write is atomic and a failure at any point leaves an
 existing destination file byte-for-byte unchanged. The script never calls a
 model and never runs on its own — there is no autonomous or scheduled write
-path. Deterministic cellar lookup, filtering, in-place updates, and quantity
-decrementing remain unimplemented; one CSV import is a full snapshot
-replacement, nothing more. `tests/` holds test suites that verify kernel and
-capability behavior; today this covers `WineCapability`
-(`tests/capabilities/wine/test_capability.py`) and the importer
+path. Cellar filtering, in-place updates, and quantity decrementing remain
+unimplemented in the importer itself; one CSV import is a full snapshot
+replacement, nothing more (deterministic *read-only* cellar lookup exists
+separately, in `capabilities/wine/cellar_lookup.py` — see Capabilities
+above). `tests/` holds test suites that verify kernel and capability
+behavior; today this covers `WineCapability`
+(`tests/capabilities/wine/test_capability.py` and
+`tests/capabilities/wine/test_cellar_lookup.py`) and the importer
 (`tests/scripts/test_import_wine_cellar.py`), the latter using only
 synthetic, dynamically constructed CSV content under `tmp_path` — no real
 storage data is read or written by the test suite.
@@ -361,15 +413,23 @@ this flow — a single call to `handle()` is one full request/response cycle.
 - Capability contract (`handle(prompt) -> str | ModelResponse`), registry,
   explicit loader, and deterministic router.
 - One capability: `WineCapability` — Wine Pairing v1 (eight deterministic
-  food categories, no model, memory, or knowledge involvement) plus a
-  memory- and knowledge-aware, model-backed fallback for wine requests
-  outside those categories: it reads an optional personal wine-preferences
-  profile and a read-only personal cellar inventory from the knowledge
-  store, recalls the last 10 `"conversation"` memory entries as context,
-  and is scoped by `prompts/wine/fallback.md` — with an automated pytest
-  suite plus one end-to-end orchestrator test. The model provider, memory
-  manager, and knowledge store are all injected explicitly by
-  `CapabilityLoader`, sourced from the orchestrator's own instances.
+  food categories, no model, memory, or knowledge involvement), plus
+  Deterministic Cellar Lookup v1 (`capabilities/wine/cellar_lookup.py`):
+  total bottle count, exact quantity, exact ownership (by wine name,
+  producer, producer + wine name, region, or country), producer holdings
+  listing, and vintage listing, answered from validated `wine_cellar`
+  records with no model call and only a `list_records("wine_cellar")`
+  read, detected from a small set of conservative, literal phrasings
+  before any knowledge access — plus a memory- and knowledge-aware,
+  model-backed fallback for wine requests outside both of those: it reads
+  an optional personal wine-preferences profile and a read-only personal
+  cellar inventory from the knowledge store, recalls the last 10
+  `"conversation"` memory entries as context, and is scoped by
+  `prompts/wine/fallback.md` — with an automated pytest suite (including
+  `tests/capabilities/wine/test_cellar_lookup.py`) plus one end-to-end
+  orchestrator test per path. The model provider, memory manager, and
+  knowledge store are all injected explicitly by `CapabilityLoader`,
+  sourced from the orchestrator's own instances.
 - Knowledge: a minimal, read-only `KnowledgeStore` contract
   (`kernel/knowledge/base.py`) and a `JSONKnowledgeStore` implementation
   (`kernel/knowledge/json_store.py`) that reads one keyed JSON document per
@@ -378,8 +438,9 @@ this flow — a single call to `handle()` is one full request/response cycle.
   (namespace `"wine_profile"`, key `"profile"`) and a read-only personal
   cellar inventory (namespace `"wine_cellar"`, one record per wine holding,
   validated by `capabilities/wine/cellar_schema.py` and formatted by
-  `capabilities/wine/capability.py`); no real profile or cellar data is
-  committed to this repository.
+  `capabilities/wine/capability.py`); the same cellar inventory and
+  validator are also read directly by Deterministic Cellar Lookup v1. No
+  real profile or cellar data is committed to this repository.
 - Safe Cellar Import v1 (`scripts/import_wine_cellar.py`): a human-invoked,
   model-free CLI, outside the runtime kernel, that validates a CSV against
   the shared `cellar_schema.py` rules and, only with an explicit `--write`
@@ -391,13 +452,16 @@ this flow — a single call to `handle()` is one full request/response cycle.
 
 - Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
   currently placeholder directories only.
-- Deterministic bottle-count lookup, wine-name matching, filtering, and
-  in-place updates over the cellar inventory (the cellar is currently
-  reasoned over by the model only, and a CSV import is a full-replacement
-  snapshot, not an editing workflow); quantity decrementing; bottle-level
-  purchase/ratings history beyond a cellar record's own fields; no search,
-  embeddings, or vector retrieval; no write API on `KnowledgeStore` itself,
-  and no autonomous or scheduled write path for the cellar.
+- Cellar filtering and in-place updates, quantity decrementing, and any
+  editing workflow (a CSV import is still a full-replacement snapshot, not
+  an edit); recommendation ranking, pairing/suitability judgments, or
+  model-assisted name resolution over the cellar (deterministic bottle-count
+  lookup and exact wine-name matching are implemented — see Capabilities
+  above — but only as exact, read-only lookups, never fuzzy matching,
+  ranking, or writes); bottle-level purchase/ratings history beyond a
+  cellar record's own fields; no search, embeddings, or vector retrieval;
+  no write API on `KnowledgeStore` itself, and no autonomous or scheduled
+  write path for the cellar.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

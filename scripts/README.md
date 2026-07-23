@@ -105,3 +105,83 @@ Field notes:
 repository's existing `.gitignore` rule (`storage/knowledge/*.json`). No real
 personal cellar data — and no CSV fixture containing it — is committed to
 this repository.
+
+## Safe Cellar Quantity Update v1 (`update_wine_cellar_quantity.py`)
+
+A second human-controlled, local maintenance script. Where
+`import_wine_cellar.py` replaces the **entire** cellar document from a CSV,
+this script changes **only the `quantity` field of one existing holding**,
+selected by its exact Cellar ID — nothing else about that record, and no
+other record, is touched.
+
+**Safety model:**
+
+- Runs entirely outside the runtime kernel — invoked directly by a human,
+  never by the orchestrator, `WineCapability`, or a model.
+- Never calls a model provider.
+- Never goes through `KnowledgeStore`, which remains strictly read-only; this
+  script reads and writes `wine_cellar.json` directly with plain file I/O.
+- Defaults to a **dry run**: the requested update is fully validated and a
+  summary is printed, but nothing is written. A file is only written when
+  `--write` is passed explicitly — that flag *is* the human confirmation;
+  there is no interactive confirmation prompt.
+- Selects the target holding by **exact, case-sensitive equality** against
+  the top-level Cellar ID key only. No normalization, no producer/wine-name
+  search, no substring or fuzzy matching, no model-generated suggestions. An
+  unknown Cellar ID is rejected with a clear error naming the ID requested.
+- Validates the **complete existing cellar** — every record, including
+  unrelated and zero-quantity ones — before calculating anything, and
+  validates the **complete resulting cellar** again after applying the
+  proposed change, before writing anything. One invalid record anywhere
+  aborts the whole operation; there is no partial update.
+- Preserves the original document: only the selected record's `quantity`
+  field is changed. Every other field on that record — including fields the
+  current schema doesn't recognize — and every other record are carried
+  through byte-for-byte equivalent (the parsed document is deep-copied, not
+  reconstructed from validated output).
+- Writes atomically, the same way `import_wine_cellar.py` does: a temporary
+  file in the destination directory, flushed and closed, then moved into
+  place with `os.replace()`; the temporary file is removed if anything goes
+  wrong first.
+
+## Commands
+
+```
+uv run python -m scripts.update_wine_cellar_quantity <cellar_id> --set <N>
+uv run python -m scripts.update_wine_cellar_quantity <cellar_id> --decrement
+uv run python -m scripts.update_wine_cellar_quantity <cellar_id> --decrement <N>
+```
+
+Add `--write` to any of the above to apply the update after validation.
+Without `--write`, every command is a dry run. Examples:
+
+```
+uv run python -m scripts.update_wine_cellar_quantity sample-red-2021 --decrement
+uv run python -m scripts.update_wine_cellar_quantity sample-red-2021 --decrement 2 --write
+uv run python -m scripts.update_wine_cellar_quantity sample-red-2021 --set 5 --write
+```
+
+## Quantity behavior
+
+- `--set N` sets the quantity to exactly `N` (`N` must be a non-negative
+  integer).
+- `--decrement` (no value) decrements the quantity by **1**.
+- `--decrement N` decrements the quantity by the given `N`, which must be a
+  positive integer — zero, negative, decimal, or boolean-like values are all
+  rejected.
+- Decrementing exactly to **zero is allowed**; the record is kept in the
+  cellar with `quantity: 0`, never removed.
+- A result **below zero is rejected outright** — it is never clamped to
+  zero.
+- Exactly one of `--set` or `--decrement` is required; both together, or
+  neither, is rejected. These rules are enforced independently of argparse,
+  so calling the underlying Python function directly cannot bypass them.
+- If `--set` proposes the quantity the record already has, that's a
+  successful **no-op**: the summary says so plainly, and the file is left
+  byte-for-byte unchanged even when `--write` is passed.
+
+This script only ever changes a `quantity` value on one existing record. It
+does not add or remove holdings, does not edit any other field, and does not
+decrement automatically — every run is a separate, explicit, human-invoked
+command. It never runs on its own, and this milestone still implements no
+backups or change history.

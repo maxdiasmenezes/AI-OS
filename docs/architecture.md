@@ -310,40 +310,62 @@ and a real personal cellar inventory at
 `storage/knowledge/wine_cellar.json` — but `storage/**/*.jsonl` and
 `storage/knowledge/*.json` are gitignored, and no such files are committed
 to this repository. Nothing in the runtime kernel writes to
-`storage/knowledge/`; the one exception is `scripts/import_wine_cellar.py`
-(see Scripts and tests below), a human-invoked maintenance script that
-writes `storage/knowledge/wine_cellar.json` directly and outside the kernel
-entirely — it does not go through `KnowledgeStore`, which stays read-only.
-Backups are not yet implemented.
+`storage/knowledge/`; the two exceptions are `scripts/import_wine_cellar.py`
+and `scripts/update_wine_cellar_quantity.py` (see Scripts and tests below),
+human-invoked maintenance scripts that write `storage/knowledge/wine_cellar.json`
+directly and outside the kernel entirely — neither goes through
+`KnowledgeStore`, which stays read-only. Backups are not yet implemented.
 
 ### Scripts and tests
 
 `scripts/` holds operational and maintenance scripts (setup, migrations,
-utilities). One is implemented today: `scripts/import_wine_cellar.py`
-("Safe Cellar Import v1"), a human-controlled, model-free CLI that imports a
-CSV of wine holdings into `storage/knowledge/wine_cellar.json`. It validates
-the complete CSV — headers, row-level type conversion, and every record
-through the shared `capabilities/wine/cellar_schema.py` validator — before
-writing anything. It defaults to a dry run that prints a summary (source
-path, destination path, holding counts, whether the destination already
-exists) without touching disk; a file is only written when the caller passes
-`--write` explicitly, which serves as the human confirmation — there is no
-interactive prompt. A `--write` run replaces the entire destination document
-(no merge, no partial update, no quantity decrementing) by writing to a
-temporary file in the destination directory and moving it into place with
-`os.replace()`, so the write is atomic and a failure at any point leaves an
-existing destination file byte-for-byte unchanged. The script never calls a
-model and never runs on its own — there is no autonomous or scheduled write
-path. Cellar filtering, in-place updates, and quantity decrementing remain
-unimplemented in the importer itself; one CSV import is a full snapshot
-replacement, nothing more (deterministic *read-only* cellar lookup exists
-separately, in `capabilities/wine/cellar_lookup.py` — see Capabilities
-above). `tests/` holds test suites that verify kernel and capability
-behavior; today this covers `WineCapability`
-(`tests/capabilities/wine/test_capability.py` and
-`tests/capabilities/wine/test_cellar_lookup.py`) and the importer
-(`tests/scripts/test_import_wine_cellar.py`), the latter using only
-synthetic, dynamically constructed CSV content under `tmp_path` — no real
+utilities). Two are implemented today, both human-controlled, model-free
+CLIs that write `storage/knowledge/wine_cellar.json` directly and outside
+the runtime kernel:
+
+- `scripts/import_wine_cellar.py` ("Safe Cellar Import v1") imports a CSV of
+  wine holdings, replacing the entire destination document. It validates the
+  complete CSV — headers, row-level type conversion, and every record
+  through the shared `capabilities/wine/cellar_schema.py` validator — before
+  writing anything. It defaults to a dry run that prints a summary (source
+  path, destination path, holding counts, whether the destination already
+  exists) without touching disk; a file is only written when the caller
+  passes `--write` explicitly, which serves as the human confirmation —
+  there is no interactive prompt. A `--write` run replaces the entire
+  destination document (no merge, no partial update, no quantity
+  decrementing) by writing to a temporary file in the destination directory
+  and moving it into place with `os.replace()`, so the write is atomic and a
+  failure at any point leaves an existing destination file byte-for-byte
+  unchanged.
+- `scripts/update_wine_cellar_quantity.py` ("Safe Cellar Quantity Update
+  v1") changes only the `quantity` field of one existing holding, selected
+  by exact, case-sensitive Cellar ID — no normalization, no producer/wine-name
+  fallback, no fuzzy matching. `--set N` sets the quantity directly; `--decrement`
+  (optionally followed by `N`, defaulting to 1) subtracts from the current
+  quantity; a result below zero is rejected outright, never clamped, while
+  decrementing exactly to zero is allowed and keeps the record (inactive,
+  not deleted). It validates the complete existing cellar before computing
+  the proposed quantity and the complete resulting cellar again before
+  writing, using the same shared `cellar_schema.py` validator; one invalid
+  record anywhere aborts the whole operation. The original parsed document
+  is deep-copied and only the target record's `quantity` field is changed,
+  so unrecognized fields and untouched records are preserved exactly rather
+  than reconstructed from validated output. Like the importer, it defaults
+  to a dry run, writes atomically only with an explicit `--write` flag, and
+  a proposed quantity equal to the current one is a no-op that leaves the
+  file byte-for-byte unchanged even with `--write`.
+
+Both scripts never call a model and never run on their own — there is no
+autonomous or scheduled write path for either. Cellar filtering, adding or
+removing holdings, and editing any field other than quantity remain
+unimplemented (deterministic *read-only* cellar lookup exists separately, in
+`capabilities/wine/cellar_lookup.py` — see Capabilities above). `tests/`
+holds test suites that verify kernel and capability behavior; today this
+covers `WineCapability` (`tests/capabilities/wine/test_capability.py` and
+`tests/capabilities/wine/test_cellar_lookup.py`), the importer
+(`tests/scripts/test_import_wine_cellar.py`), and the quantity-update script
+(`tests/scripts/test_update_wine_cellar_quantity.py`), the latter two using
+only synthetic, dynamically constructed fixtures under `tmp_path` — no real
 storage data is read or written by the test suite.
 
 ## Request flow
@@ -447,21 +469,36 @@ this flow — a single call to `handle()` is one full request/response cycle.
   flag, atomically replaces `storage/knowledge/wine_cellar.json` in full.
   Dry run is the default; `KnowledgeStore` is never used as a write
   interface.
+- Safe Cellar Quantity Update v1 (`scripts/update_wine_cellar_quantity.py`):
+  a second human-invoked, model-free CLI, outside the runtime kernel and not
+  reachable from `WineCapability`, the router, or the orchestrator, that
+  changes only the `quantity` field of one existing holding selected by
+  exact, case-sensitive Cellar ID (`--set N` or `--decrement [N]`, default
+  decrement of 1, zero allowed as a final quantity, below-zero rejected and
+  never clamped). It validates the complete cellar with the same shared
+  `cellar_schema.py` rules both before and after computing the proposed
+  quantity, preserves unrecognized fields and untouched records exactly by
+  deep-copying the original parsed document, and, only with an explicit
+  `--write` flag, atomically replaces the destination file — a same-value
+  `--set` is a no-op that leaves the file byte-for-byte unchanged even with
+  `--write`. Dry run is the default; `KnowledgeStore` is never used as a
+  write interface.
 
 **Planned / not yet implemented:**
 
 - Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
   currently placeholder directories only.
-- Cellar filtering and in-place updates, quantity decrementing, and any
-  editing workflow (a CSV import is still a full-replacement snapshot, not
-  an edit); recommendation ranking, pairing/suitability judgments, or
-  model-assisted name resolution over the cellar (deterministic bottle-count
-  lookup and exact wine-name matching are implemented — see Capabilities
-  above — but only as exact, read-only lookups, never fuzzy matching,
-  ranking, or writes); bottle-level purchase/ratings history beyond a
-  cellar record's own fields; no search, embeddings, or vector retrieval;
-  no write API on `KnowledgeStore` itself, and no autonomous or scheduled
-  write path for the cellar.
+- Adding or removing cellar holdings, editing any field other than
+  quantity, automatic/conversation-driven quantity decrementing, backups, or
+  change history (the importer is still a full-replacement snapshot and the
+  quantity-update script is still quantity-only); recommendation ranking,
+  pairing/suitability judgments, or model-assisted name resolution over the
+  cellar (deterministic bottle-count lookup and exact wine-name matching are
+  implemented — see Capabilities above — but only as exact, read-only
+  lookups, never fuzzy matching, ranking, or writes); bottle-level
+  purchase/ratings history beyond a cellar record's own fields; no search,
+  embeddings, or vector retrieval; no write API on `KnowledgeStore` itself,
+  and no autonomous or scheduled write path for the cellar.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

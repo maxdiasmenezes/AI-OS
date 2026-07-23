@@ -77,7 +77,21 @@ business logic of their own.
   the capability loader (`capability_loader(capability_id, self._provider,
   self._memory, self._knowledge)`), so a capability can reuse the same
   instances the orchestrator already built, rather than constructing or
-  configuring its own.
+  configuring its own. By default, `Orchestrator` still constructs its own
+  `MemoryManager` from `config.memory_settings`, exactly as before. A
+  composition root may instead inject an already-constructed memory
+  dependency via an optional, keyword-only `memory_manager` constructor
+  parameter (`Orchestrator(config, capability_loader, memory_manager=...)`);
+  when supplied, that exact object — typed only against the small structural
+  `SupportsMemory` protocol (`remember()`/`recall()`) so a delegating adapter
+  need not inherit from `MemoryManager` — is used for Orchestrator's own
+  recall/remember operations and passed to every capability via
+  `capability_loader`, with no additional `MemoryManager` constructed and no
+  mutation or wrapping of the supplied object. This seam exists so an
+  interface composition root (e.g. a future WhatsApp interface) can supply an
+  interface-specific namespace adapter without private-attribute mutation;
+  omitting the parameter leaves CLI and all existing runtime behavior
+  unchanged. No such adapter is implemented yet.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured

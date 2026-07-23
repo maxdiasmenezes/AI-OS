@@ -13,14 +13,16 @@ to the kernel.
 
 ```
                     +------------------+
-                    |    interfaces    |   planned: README stubs only
-                    | claude / whatsapp|   (claude, whatsapp, web, voice),
-                    |   web / voice    |   not wired to the kernel yet
-                    +--------+---------+
-                             |
+                    |    interfaces    |   whatsapp: implemented, own HTTP
+                    | claude / whatsapp|   server + composition root
+                    |   web / voice    |   (interfaces/whatsapp/server.py);
+                    +--------+---------+   claude/web/voice: README stubs
+                             |             only, not wired yet
                     +--------v---------+
-                    |   kernel.main    |   implemented: current entry point
-                    |      (CLI)       |
+                    | kernel.main /    |   implemented: two independent
+                    | whatsapp.server  |   composition roots - the CLI and
+                    |  (composition    |   WhatsApp each build their own
+                    |     roots)       |   Orchestrator directly
                     +--------+---------+
                              |
                     +--------v---------+
@@ -53,15 +55,189 @@ to the kernel.
 ### Interfaces
 
 `interfaces/` holds the intended entry points through which a human will
-interact with AI-OS: Claude, WhatsApp, a web app, and voice. Each currently
-exists only as a directory with a short README describing its intent — none
-contain code, and none are wired to the orchestrator yet. The system's actual
-entry point today is a CLI: `python -m kernel.main "<prompt>"`
-(`kernel/main.py`), which is a composition root rather than part of
-`interfaces/`. Once a real interface is built, it will translate a
-channel-specific message into a call into the orchestrator, and translate the
-result back into that channel's format — interfaces are meant to contain no
-business logic of their own.
+interact with AI-OS: Claude, WhatsApp, a web app, and voice. `claude/`,
+`web/`, and `voice/` each still exist only as a directory with a short
+README describing intent — no code, not wired to the orchestrator. The
+system's other entry point is still a CLI: `python -m kernel.main
+"<prompt>"` (`kernel/main.py`), a composition root outside `interfaces/`.
+Once a real interface is built, it translates a channel-specific message
+into a call into the orchestrator, and translates the result back into
+that channel's format — interfaces are meant to contain no business logic
+of their own.
+
+**WhatsApp** (`interfaces/whatsapp/`) is implemented: a self-contained
+composition root and loopback-only HTTP server that reaches the same
+`Orchestrator` the CLI does, without going through `kernel/main.py`.
+**Single-user only** — it authorizes exactly one sender, by exact string
+equality, with no allow-list, no multi-user support, and no
+normalization. It is built from focused modules, each with a single
+responsibility:
+
+- **config** (`config.py`) — loads and validates WhatsApp-specific
+  environment configuration (`WhatsAppConfig`, `load_whatsapp_config()`),
+  separate from `kernel/config/config.py`: the Cloud API verify token, app
+  secret, access token, phone number ID, the single authorized sender ID
+  (`WHATSAPP_AUTHORIZED_SENDER_ID`, exact-match only), the Cloud API
+  version (`WHATSAPP_API_VERSION` — **required, no code default**; a
+  missing or malformed value fails startup, and this module embeds no
+  real Graph API version anywhere), and two optional operational
+  settings: `WHATSAPP_HOST` (default `127.0.0.1`, validated as
+  loopback-only — `0.0.0.0`, LAN addresses, public addresses, and
+  arbitrary hostnames are all rejected; only a loopback IP literal or
+  `localhost` is accepted, and `server.py` binds a genuine `AF_INET6`
+  socket when the validated host is IPv6, so `::1` actually works rather
+  than failing to bind) and `WHATSAPP_PORT` (default `8000`). Every
+  required value is validated at startup — a missing or invalid one
+  raises `WhatsAppConfigError` immediately, before the HTTP server binds
+  to anything; validation errors never echo back the invalid value for a
+  secret or personal-identifier field (they may for `host`/`port`/
+  `api_version`, none of which are secret). `.env` is loaded the same way
+  `kernel/config/config.py` does (`override=False`, explicit rather than
+  relying on the library default); an explicit `env` mapping can be
+  passed in for testing. `WhatsAppConfig` itself is `@dataclass(frozen=True)`
+  — assigning to a field raises `FrozenInstanceError` — with
+  `verify_token`, `app_secret`, `access_token`, `phone_number_id`, and
+  `authorized_sender_id` all marked `field(repr=False)`, so none of them
+  appear if the config object is ever logged or printed by accident; only
+  `host`, `port`, and `api_version` are visible in `repr()`.
+- **signature** (`signature.py`) — `verify_signature(app_secret, raw_body,
+  signature_header)` accepts only a header of the exact shape
+  `sha256=<64 hex characters>`, and validates it (an HMAC-SHA256 of the
+  exact raw request bytes) using `hmac.compare_digest`, over the body
+  before any JSON parsing happens.
+- **dedup** (`dedup.py`) — `SeenMessageCache` is a thread-safe, bounded
+  FIFO cache of message-ID strings only (no sender IDs, text, timestamps,
+  or other payload fields; nothing persisted across a restart), with two
+  operations: `add_if_new(message_id) -> bool` atomically reserves an ID
+  (returns whether it was new), and `discard(message_id) -> None`
+  releases a reservation so a later redelivery of that same ID is
+  accepted rather than treated as a duplicate forever. Default capacity
+  256; the oldest ID is evicted once the bound is exceeded.
+- **payload** (`payload.py`) — `parse_webhook_payload(body)`
+  conservatively extracts every inbound message (`IncomingMessage`) from a
+  webhook's `entry[].changes[].value.messages[]` batches; every access is
+  defensive (`.get()`, `isinstance` checks) and a malformed or
+  unrecognized entry is skipped rather than raising, since a single bad
+  entry must never take down parsing of the rest of the batch. Only
+  `type == "text"` messages get a populated `text` field; every other type
+  (image, audio, status update, etc.) is still returned, with
+  `text=None`, so the caller can reply with a fixed "unsupported" message
+  rather than silently dropping it.
+- **client** (`client.py`) — `WhatsAppClient.send_text_message(to, body)`
+  is a thin `urllib.request`-based POST to the Cloud API's
+  `/{api_version}/{phone_number_id}/messages` endpoint (mirroring
+  `kernel/models/ollama.py`'s use of `urllib` rather than adding an HTTP
+  dependency), with `urlopen` and the outbound timeout (default 10
+  seconds) left as injectable constructor parameters so tests never make
+  a real network call. It makes exactly one attempt — no retries — parses
+  the response and returns the Cloud API's outbound message ID, and
+  raises `WhatsAppClientError` if the request fails or the response
+  doesn't contain a usable ID. Neither its exceptions nor its logs ever
+  include the access token, recipient, request body, or response body.
+- **handler** (`handler.py`) — performs no authorization or
+  deduplication; both already happened in `server.py` before this module
+  is ever involved. `classify_message(message)` is a pure function that
+  turns an already-authorized `IncomingMessage` into a `TextTask` (valid
+  text, ready for the orchestrator) or a `FixedReplyTask` (one of three
+  fixed replies — unsupported type, empty text, or text over the
+  configured inbound limit, default 4,096 Unicode characters — the
+  orchestrator is never called for these). `MessageHandler.handle_task(task)`
+  is what the background worker calls: for a `TextTask` it calls
+  `Orchestrator.handle(text)` inside a `try/except`, correctly handling
+  both of its possible return shapes — a plain `str` used directly, or a
+  `ModelResponse` whose `.text` is used — and treating `None`, any other
+  return type, empty/whitespace-only text (either shape), or a raised
+  exception as an equivalent processing failure: exactly one fixed reply,
+  `PROCESSING_FAILURE_REPLY` ("I could not process that message. Please
+  try again later."), logged only as a generic `processing_error`
+  category with no exception object, message, or traceback ever logged —
+  a synthetic or real exception's text could itself carry a sender ID,
+  user text, or a secret. A genuinely valid response is relayed, replaced
+  outright with a fixed `LONG_RESPONSE_NOTICE` (never truncating, never
+  appending a marker, and never describing 4,096 as a WhatsApp platform
+  limit — it is an AI-OS application limit) if it exceeds the configured
+  outbound limit; for a `FixedReplyTask` the reply is sent directly. No
+  log line in this module ever includes a sender ID (masked or
+  otherwise), message text, or AI response text; a failed reply (fixed or
+  otherwise) is logged once as a generic `outbound_failure` category and
+  dropped, never retried.
+- **memory** (`memory.py`) — `FixedNamespaceMemory` is the concrete
+  namespace adapter the `memory_manager` injection seam (see Orchestrator
+  below) was built for: it wraps a real `MemoryManager` and pins every
+  `remember()`/`recall()` call to one fixed namespace (`"whatsapp"` by
+  default), regardless of what namespace the caller passes in, so all
+  memory reachable through this interface — the orchestrator's own and
+  every capability's — stays isolated from the CLI or any other interface
+  sharing the same underlying storage.
+- **server** (`server.py`) — the composition root, the HTTP layer, *and*
+  the one place authorization and deduplication happen. `build_orchestrator
+  (config, capability_loader)` constructs the real `MemoryManager`, wraps
+  it in `FixedNamespaceMemory`, and constructs `Orchestrator(config,
+  capability_loader=capability_loader, memory_manager=scoped_memory)` —
+  the exact same `scoped_memory` object reaches the orchestrator's own
+  recall/remember calls and every capability, since nothing about the
+  seam copies or wraps it further. `build_server()` wires this together
+  with `WhatsAppClient` and a `MessageHandler` (which itself holds no
+  dedup cache or allow-list — see handler above) into a `WhatsAppServer`.
+  The server itself is `http.server.ThreadingHTTPServer`, bound to
+  `whatsapp_config.host` (validated loopback-only by `config.py` — never
+  bindable to a public or LAN address), since exposing it directly would
+  put the raw Cloud API access token and an unauthenticated webhook path
+  straight on the network; a real deployment terminates TLS and exposes
+  it publicly through a separate reverse proxy or tunnel, which this
+  repository does not provide. Exactly two operations exist -
+  `GET /webhook` and `POST /webhook`; every other path is `404`, and
+  `PUT`/`DELETE`/`PATCH`/`HEAD`/`OPTIONS` on `/webhook` are `405` (the
+  same methods elsewhere are `404` or `405`) — `send_error()` is
+  overridden so no path ever falls through to `http.server`'s default
+  error page, which would otherwise reflect the request method/path back
+  into an HTML body. The default request logger is overridden so a `GET`
+  request's query string (which can carry `hub.verify_token`) is never
+  logged. `GET /webhook` answers Meta's verification handshake (requires
+  `hub.mode=subscribe`, a present `hub.challenge`, and compares
+  `hub.verify_token` with `hmac.compare_digest` rather than `==`, guarded
+  against a missing token to avoid `compare_digest` raising on `None`).
+  `POST /webhook` first rejects on `Content-Length` problems (missing →
+  `411`; malformed or negative → `400`, and a negative value is checked
+  before any `rfile.read()` call; over the configured body limit, default
+  1,000,000 bytes → `413`, without reading the body; body shorter than
+  declared → `400`), then verifies the raw-body signature (`403` if
+  invalid) *before* parsing the JSON body (`400` if malformed) — and only
+  then, for each parsed
+  message, synchronously validates the destination phone number ID,
+  validates the sender against the single configured
+  `WHATSAPP_AUTHORIZED_SENDER_ID`, and reserves its message ID in
+  `SeenMessageCache` — all three *before* the message is classified into
+  a task and submitted to the bounded (`queue.Queue`, default capacity
+  16) worker queue. An unauthorized sender or wrong destination is
+  dropped without ever touching the dedup cache, and the response is
+  still `200` (Meta's delivery succeeded; retrying wouldn't help). A
+  duplicate message ID is dropped before a task is ever created, also
+  `200`. If the queue is full, the just-made reservation is released via
+  `SeenMessageCache.discard` — so a later redelivery of that ID is
+  accepted rather than lost — processing of the rest of that batch stops
+  immediately (messages already queued earlier in the same batch keep
+  their reservation, so they aren't reprocessed if the whole batch is
+  redelivered), and the response is `503`, never `200`. The response
+  never waits on the orchestrator or an outbound Cloud API call — those
+  happen afterward, in a single background worker thread that performs no
+  authorization or deduplication itself, processes one task at a time in
+  FIFO order, never dies on an exception (a `handle_task()` failure that
+  escapes `MessageHandler`'s own handling is caught and logged only as a
+  generic `worker_error` category, with no traceback or exception detail,
+  and the worker moves on to the next task), and calls `task_done()` on
+  every item including the shutdown sentinel. `WhatsAppServer.stop()`
+  shuts the HTTP server down, then enqueues the shutdown sentinel *after*
+  whatever is already queued (so already-queued tasks are drained before
+  the worker sees it) and joins the worker with a bounded timeout, for a
+  graceful exit with no in-flight or already-queued message abandoned
+  mid-processing.
+
+Covered by an automated pytest suite (`tests/interfaces/whatsapp/`, one
+file per module) that makes no real network call — `WhatsAppClient` tests
+inject a fake `urlopen`; server tests exercise the real HTTP server only
+over loopback on an OS-assigned ephemeral port, including a few raw-socket
+tests for Content-Length edge cases `urllib` cannot express.
 
 ### Kernel
 
@@ -91,7 +267,9 @@ business logic of their own.
   interface composition root (e.g. a future WhatsApp interface) can supply an
   interface-specific namespace adapter without private-attribute mutation;
   omitting the parameter leaves CLI and all existing runtime behavior
-  unchanged. No such adapter is implemented yet.
+  unchanged. `interfaces/whatsapp/memory.py`'s `FixedNamespaceMemory` is
+  that adapter, wired in by `interfaces/whatsapp/server.py`'s
+  `build_orchestrator()` — see Interfaces above.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
@@ -551,11 +729,51 @@ this flow — a single call to `handle()` is one full request/response cycle.
   provider via `get_provider()` and labels its responses `MANUAL REVIEW
   REQUIRED`. Writes nothing, adds no new capability or provider-architecture
   change, and commits no real profile or cellar data.
+- WhatsApp interface (`interfaces/whatsapp/`): a second, independent
+  composition root — alongside `kernel/main.py` — that reaches the same
+  `Orchestrator` over a loopback-only, standard-library HTTP server bound
+  to a validated-loopback-only host. **Single-user only**: exactly one
+  authorized sender (`WHATSAPP_AUTHORIZED_SENDER_ID`), matched by exact
+  equality, no allow-list. Own environment configuration and validation
+  (`config.py`, including a required Cloud API version with no code
+  default), raw-body HMAC-SHA256 webhook signature verification
+  (`signature.py`), a bounded thread-safe FIFO message-ID dedup cache with
+  atomic reserve/release (`dedup.py`, `SeenMessageCache`), conservative
+  multi-message payload parsing (`payload.py`), a `urllib`-based Cloud API
+  client with no retries that returns a usable outbound message ID
+  (`client.py`), pure message classification plus task processing with no
+  authorization or dedup of its own (`handler.py`), and a
+  `FixedNamespaceMemory` adapter (`memory.py`) — the concrete
+  implementation of the orchestrator's `memory_manager` injection seam
+  (see Orchestrator above). `server.py` performs destination/sender
+  authorization and dedup reservation synchronously, before a message is
+  ever queued: exactly `GET /webhook` and `POST /webhook` exist (every
+  other path is `404`); an unauthorized sender, wrong destination, or
+  duplicate message ID gets `200` and never reaches the queue, dedup
+  cache (for the first two), or orchestrator; a full queue releases its
+  dedup reservation and returns `503`. A single background worker thread
+  processes pre-authorized tasks only, in FIFO order, with graceful
+  shutdown. Long orchestrator responses are replaced outright with a
+  fixed notice, never truncated. Logging throughout excludes sender IDs
+  (in any form), message text, AI response text, tokens, and secrets —
+  including exception content: an orchestrator/provider failure or a
+  worker-level exception is logged only as a generic category
+  (`processing_error`, `outbound_failure`, `worker_error`), never the
+  exception object, its message, or a traceback. `WhatsAppConfig` is a
+  frozen dataclass with secrets/personal identifiers excluded from
+  `repr()`. Both the GET token check and the POST signature check use
+  `hmac.compare_digest`; only `GET`/`POST` on `/webhook` are handled, an
+  IPv6 loopback host (`::1`) binds correctly via a dedicated `AF_INET6`
+  server variant, and no request path ever reaches `http.server`'s
+  default error page. No real network call in the test suite
+  (`tests/interfaces/whatsapp/`), including raw-socket tests for HTTP
+  edge cases `urllib` cannot express.
 
 **Planned / not yet implemented:**
 
-- Real interfaces (Claude, WhatsApp, web, voice) wired to the orchestrator —
-  currently placeholder directories only.
+- Real interfaces for Claude, web, and voice wired to the orchestrator —
+  currently placeholder directories only (WhatsApp is implemented; see
+  above).
 - Adding or removing cellar holdings, editing any field other than
   quantity, automatic/conversation-driven quantity decrementing, backups, or
   change history (the importer is still a full-replacement snapshot and the

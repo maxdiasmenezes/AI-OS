@@ -14,10 +14,12 @@ from kernel.knowledge import KnowledgeStore
 from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider
 
+from capabilities.tasks.capability import TasksCapability
 from capabilities.wine.capability import WineCapability
 
 _CAPABILITY_CLASSES: dict[str, type[Capability]] = {
     "wine": WineCapability,
+    "tasks": TasksCapability,
 }
 
 

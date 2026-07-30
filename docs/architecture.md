@@ -47,7 +47,9 @@ to the kernel.
   wired into WineCapability's model-backed fallback for an optional personal
   wine profile and a read-only personal wine cellar inventory, and into its
   Deterministic Cellar Lookup v1 for the same read-only cellar inventory.
-  kernel/tools: directory exists; planned, no code yet.
+  kernel/tools: implemented (Milestone 33) - the safe computer task
+  execution layer (allowlist-only actions, timeouts, confirmation,
+  audit), consumed by capabilities/tasks/TasksCapability.
 ```
 
 ## Layers
@@ -143,9 +145,20 @@ responsibility:
   configured inbound limit, default 4,096 Unicode characters — the
   orchestrator is never called for these). `MessageHandler.handle_task(task)`
   is what the background worker calls: for a `TextTask` it calls
-  `Orchestrator.handle(text)` inside a `try/except`, correctly handling
-  both of its possible return shapes — a plain `str` used directly, or a
-  `ModelResponse` whose `.text` is used — and treating `None`, any other
+  `Orchestrator.handle(text, context=_TRUSTED_CONTEXT)` inside a
+  `try/except` — `_TRUSTED_CONTEXT` (Milestone 33,
+  `RequestContext(allow_computer_actions=True, actor="whatsapp")`) is
+  built once at module load and passed on every `TextTask`, since a
+  `TextTask` only ever exists for a message that already passed
+  `server.py`'s synchronous exact-sender authorization before being
+  queued — this is the one and only place this interface grants
+  computer-action trust, and it neither depends on nor duplicates that
+  phone-number check itself (see kernel/orchestrator/orchestrator.py and
+  kernel/orchestrator/context.py above). `FixedReplyTask`s never call the
+  orchestrator at all, so no context is ever built for them. That
+  `try/except` correctly handles both of `Orchestrator.handle()`'s
+  possible return shapes — a plain `str` used directly, or a
+  `ModelResponse` whose `.text` is used — and treats `None`, any other
   return type, empty/whitespace-only text (either shape), or a raised
   exception as an equivalent processing failure: exactly one fixed reply,
   `PROCESSING_FAILURE_REPLY` ("I could not process that message. Please
@@ -270,6 +283,28 @@ tests for Content-Length edge cases `urllib` cannot express.
   unchanged. `interfaces/whatsapp/memory.py`'s `FixedNamespaceMemory` is
   that adapter, wired in by `interfaces/whatsapp/server.py`'s
   `build_orchestrator()` — see Interfaces above.
+
+  **Milestone 33 — computer-action authorization gate.** `handle()` also
+  accepts an optional, keyword-capable `context: RequestContext | None`
+  parameter (`kernel/orchestrator/context.py`), defaulting to
+  `RequestContext()` — `allow_computer_actions=False` — when omitted, so
+  every existing caller (the CLI, and any test that doesn't pass one)
+  stays denied. `Capability` (`kernel/capabilities/base.py`) gained one new
+  concrete (non-abstract) class attribute, `requires_computer_actions:
+  bool = False`; every existing capability inherits `False` unchanged.
+  When the routed capability's `requires_computer_actions` is `True` and
+  the request's context doesn't grant `allow_computer_actions`,
+  `Orchestrator.handle()` returns a fixed, deterministic denial
+  (`COMPUTER_ACTIONS_DENIED_TEXT`) — the capability's `handle()` is never
+  called, and the request never falls through to the model-fallback
+  branch either. The denial still goes through the same
+  remember/log tail as any other response. This mechanism is
+  domain-agnostic: the orchestrator does not know that "tasks" exists or
+  what a computer action is, only that some capability declared it needs
+  extra trust. The only caller that constructs an authorizing context is
+  `interfaces/whatsapp/handler.py`, and only for a message that already
+  passed WhatsApp's own exact-sender authorization — see Interfaces above
+  and Capabilities below.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
@@ -299,8 +334,77 @@ tests for Content-Length edge cases `urllib` cannot express.
   end-to-end today; the other adapters are present in the codebase but not
   verified as the active path.
 - **tools** — reusable tools (actions, integrations, lookups) that
-  capabilities could invoke. Not yet implemented — `kernel/tools/` contains
-  only a README describing intent.
+  capabilities could invoke. Implemented (Milestone 33): the safe computer
+  task execution layer, transport-agnostic and consumed today only by
+  `capabilities/tasks/TasksCapability` — see Capabilities below for the
+  full command surface. `kernel/tools/types.py` defines `ActionRequest`
+  (an action name plus an optional symbolic `resource_key` — never a raw
+  path or argument list) and `ActionResult`. `kernel/tools/registry.py`'s
+  `ActionRegistry` is the fixed, non-configurable allowlist of exactly
+  four actions (`system_status`, `list_files`, `open_application`,
+  `run_registered_script`) and which two of them are sensitive
+  (`open_application`, `run_registered_script`); no fifth action is ever
+  reachable, no matter what a caller asks for.
+  `kernel/tools/config.py`'s `load_tools_config()` reads the *machine-local,
+  gitignored* `kernel/config/tools.yaml` (copied from the committed
+  `kernel/config/tools.example.yaml` placeholder) — the only place real
+  filesystem/application paths for this machine exist — and fails closed
+  two different ways: a missing file yields an entirely empty
+  `ToolsConfig` (every resource-scoped action then denies everything, by
+  having nothing allowlisted), while a *present but invalid* file
+  (malformed YAML, a duplicate key — including one that only collides
+  case-insensitively, a relative path where an absolute one is required,
+  or any unrecognized field) always raises `ToolsConfigError`, which
+  `capabilities/tasks/capability.py` converts into a fixed, generic "task
+  system unavailable" reply rather than ever treating the error as
+  permission to proceed. Every path in `tools.yaml` (a directory, an
+  executable, a script's interpreter/path/cwd) must be absolute, and every
+  key is matched case-insensitively. `kernel/tools/executor.py`'s
+  `SafeTaskExecutor.execute()` is the single choke point every action
+  passes through: it rejects an unknown action outright, calls the
+  matched handler with the loaded `ToolsConfig`, converts any handler
+  exception into a fixed, generic failure (no exception object, message,
+  or traceback ever surfaces), and unconditionally calls
+  `kernel/tools/audit.py`'s `record()` regardless of outcome.
+  `kernel/tools/audit.py` appends one JSONL record per attempt to
+  `storage/logs/task_actions.jsonl` — a symbolic action name, a symbolic
+  resource key (e.g. `"notepad"`, never a resolved path), and one of a
+  fixed set of outcome codes (`proposed`, `confirmed`, `executed`,
+  `rejected`, `expired`, `cancelled`, `timed_out`, `failed`) — never a
+  secret, token, phone number, message body, traceback, or resolved
+  private filesystem path; a write failure there is caught and logged
+  only as a generic category, never raised.
+  `kernel/tools/confirmation.py`'s `ConfirmationStore` is a single-slot,
+  TTL-bound (2 minutes), thread-safe, in-process store for the two
+  sensitive actions: `propose()` registers a pending action,
+  `consume()` atomically reads and clears it in one step — before the
+  caller ever acts on the result — so a confirmation can never be replayed
+  even if execution afterward fails, and separately reports whether what
+  it found (if anything) had expired. It's a *process-wide* singleton
+  (`default_store`), deliberately not an attribute on any capability
+  instance, because `CapabilityLoader` constructs a brand new capability
+  object on every single request. `kernel/tools/process_control.py` is
+  the only place a real OS process is spawned, always
+  `subprocess.Popen(argv, cwd=cwd, shell=False, ...)` with a list-form
+  `argv` sourced entirely from `tools.yaml`: `launch_detached()` (used by
+  `open_application`) starts a process and returns immediately, never
+  waiting for it to exit; `run_with_timeout()` (used by
+  `run_registered_script`) waits up to a per-script configured timeout
+  and, on expiry, kills the *entire* process tree via `psutil` (every
+  descendant the process spawned, not just the immediate child) before
+  reporting a `timed_out` result. The four handlers under
+  `kernel/tools/handlers/` each implement exactly one action:
+  `system_status.py` reads no configuration at all (CPU/memory via
+  `psutil`, disk via `shutil.disk_usage`, uptime from `psutil.boot_time()`,
+  and short, hardcoded-timeout HTTP reachability checks against a local
+  Ollama and a local ngrok API); `list_files.py` accepts only a registered
+  symbolic directory key, canonicalizes the configured root once, lists
+  its immediate (non-recursive) contents capped at 100 entries, and
+  independently re-resolves every entry to exclude anything a symlink,
+  junction, or other reparse point would make appear to live outside that
+  canonical root; `open_application.py` and `run_registered_script.py`
+  accept only a registered symbolic key — never a sender-supplied path,
+  executable, working directory, or (for scripts) argument of any kind.
 - **config** — settings that govern how the kernel and its components
   behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
   (active provider, provider settings, memory, knowledge, and log locations),
@@ -472,12 +576,60 @@ know what wine, travel, or strategy mean.
   (`tests/capabilities/wine/test_capability.py`) and one end-to-end
   orchestrator test (`tests/kernel/orchestrator/test_orchestrator.py`).
 
+**tasks** (Milestone 33) is the second implemented capability —
+`capabilities/tasks/TasksCapability` — a small, explicitly allowlisted set
+of computer actions on this machine, reached only through a strict
+`/task ...` command grammar, never natural language and never a model
+fallback. `handle()` is fully deterministic: no model call, no memory
+recall, no knowledge-store access, ever.
+
+- **Authorization.** `TasksCapability.requires_computer_actions = True`
+  (the new `Capability` class attribute — see Orchestrator above), so
+  `Orchestrator.handle()` refuses to call this capability's `handle()` at
+  all unless the request's `RequestContext` explicitly grants
+  `allow_computer_actions`. This capability performs no authorization of
+  its own and duplicates none of WhatsApp's — it trusts the orchestrator's
+  gate completely, and knows nothing about phone numbers or any other
+  interface-specific check.
+- **Command grammar** (`capabilities/tasks/command_parser.py`) — exactly
+  seven literal forms, matched case-insensitively on `/task` and the verb:
+  `/task status`, `/task files <key>`, `/task open <key>`,
+  `/task run <key>`, `/task confirm`, `/task cancel`, `/task help`. Any
+  extra token, missing token, or unrecognized verb is a `ParseError` with
+  a stable, symbolic reason — never guessed at, never partially honored.
+  `<key>` is a registered symbolic name resolved through
+  `kernel/config/tools.yaml`, never a path.
+- **Confirmation.** `open_application` and `run_registered_script` are
+  sensitive (per `kernel/tools/registry.py`): the first matching command
+  only calls `ConfirmationStore.propose()` and replies with a prompt to
+  confirm — nothing executes yet. `/task confirm` within 2 minutes calls
+  `consume()` and, if something unexpired was pending, executes it exactly
+  once; `/task cancel` clears it explicitly; letting it sit past 2 minutes
+  reports as expired on the next `/task confirm`. `system_status` and
+  `list_files` are not sensitive and execute immediately.
+- **Execution.** A non-sensitive (or just-confirmed) command becomes one
+  `kernel.tools.ActionRequest`, run through a fresh
+  `kernel.tools.SafeTaskExecutor`; the `ActionResult.message` is returned
+  as-is (already safe to relay — see kernel/tools above).
+  `system_status` never touches `kernel/config/tools.yaml` at all (a
+  hardcoded, empty `ToolsConfig`), so it stays available even if that file
+  is missing or invalid; every other action loads it fresh on each call,
+  and a `ToolsConfigError` becomes a fixed "task system unavailable"
+  reply, audited as `failed`, never treated as permission to proceed.
+  Every step (proposed, confirmed, executed, rejected, expired,
+  cancelled, timed out, failed) is audited via `kernel.tools.audit`.
+  Covered by `tests/capabilities/tasks/` (command parser, confirmation
+  flow, config-failure handling) and `tests/kernel/tools/` (every
+  kernel/tools/ module and handler), plus dedicated
+  `RequestContext`/authorization-gate tests in
+  `tests/kernel/orchestrator/test_orchestrator.py`.
+
 Each capability is meant to be a self-contained domain expert that uses
 kernel services (memory, knowledge, tools, models) to do its job. Capabilities
 do not talk to interfaces directly, and they do not talk to each other
 directly — all cross-capability coordination goes through the orchestrator.
-Only `wine` exists so far; strategy, research, travel, and life administration
-remain unimplemented.
+`wine` and `tasks` exist so far; strategy, research, travel, and life
+administration remain unimplemented.
 
 ### Prompts
 
@@ -768,6 +920,19 @@ this flow — a single call to `handle()` is one full request/response cycle.
   default error page. No real network call in the test suite
   (`tests/interfaces/whatsapp/`), including raw-socket tests for HTTP
   edge cases `urllib` cannot express.
+
+- Milestone 33 — Safe Computer Task Execution: `kernel/orchestrator/context.py`'s
+  `RequestContext` (default-deny `allow_computer_actions`) plus
+  `Capability.requires_computer_actions` gate which capabilities
+  `Orchestrator.handle()` will call at all; `kernel/tools/` (a fixed
+  four-action `ActionRegistry`, `SafeTaskExecutor`, machine-local
+  `tools.yaml` config with two-mode fail-closed loading, single-slot TTL
+  `ConfirmationStore`, `psutil`-backed process-tree-killing timeout
+  enforcement, and a symbolic-only `task_actions.jsonl` audit trail); and
+  `capabilities/tasks/TasksCapability`, reachable only through the strict
+  `/task ...` command grammar and only when
+  `interfaces/whatsapp/handler.py`'s trusted context is present. See
+  Kernel and Capabilities above for the full detail.
 
 **Planned / not yet implemented:**
 

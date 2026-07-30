@@ -9,6 +9,7 @@ exchange to memory, logs the interaction, and returns the response. No
 tools, no retries, no streaming - just routing plus the existing flow.
 """
 
+import logging
 from typing import Callable, Protocol
 
 from kernel.capabilities.base import Capability
@@ -18,8 +19,27 @@ from kernel.logger import log_interaction
 from kernel.memory import MemoryEntry, MemoryManager
 from kernel.models import ModelResponse, get_provider
 from kernel.models.base import ModelProvider
+from kernel.orchestrator.context import RequestContext
 from kernel.orchestrator.router import CapabilityRouter
 from kernel.prompts import build_prompt
+from kernel.tools import audit
+
+logger = logging.getLogger(__name__)
+
+# Deterministic, fixed denial text - never mentions the capability id, the
+# prompt, or any reason - returned when a matched capability requires
+# computer-action trust the request's RequestContext doesn't grant. This
+# response is synthetic: the model provider is never invoked to produce it,
+# and the routed capability's handle() is never called either.
+COMPUTER_ACTIONS_DENIED_TEXT = "This request is not authorized to perform computer actions."
+
+# Stable, symbolic audit fields for a denied computer-action attempt - see
+# kernel/tools/audit.py. The orchestrator stays domain-agnostic: it audits
+# "computer_actions" generically, using whatever capability id the router
+# matched (e.g. "tasks") as the resource, never anything specific to what
+# that capability does.
+_AUDIT_ACTION = "computer_actions"
+_AUDIT_OUTCOME_REJECTED_UNAUTHORIZED = "rejected_unauthorized"
 
 
 class SupportsMemory(Protocol):
@@ -56,8 +76,17 @@ class Orchestrator:
         self._router = CapabilityRouter()
         self._capability_loader = capability_loader
 
-    def handle(self, user_prompt: str) -> ModelResponse:
-        """Run one request end-to-end and return the response."""
+    def handle(self, user_prompt: str, context: RequestContext | None = None) -> ModelResponse:
+        """Run one request end-to-end and return the response.
+
+        context defaults to a fully untrusted RequestContext() when omitted,
+        so every existing caller - the CLI, and any test that doesn't pass
+        one - stays denied for a capability that requires computer-action
+        trust. See kernel/orchestrator/context.py.
+        """
+
+        if context is None:
+            context = RequestContext()
 
         capability_id = self._router.route(user_prompt)
         if capability_id is not None:
@@ -67,22 +96,48 @@ class Orchestrator:
                 self._memory,
                 self._knowledge,
             )
-            capability_result = capability.handle(user_prompt)
-            if isinstance(capability_result, ModelResponse):
-                response = capability_result
-            elif isinstance(capability_result, str):
+            if capability.requires_computer_actions and not context.allow_computer_actions:
+                # Deny deterministically, before handle() is ever called -
+                # this is already the final response, so it skips straight
+                # to the shared remember/log tail below rather than the
+                # model fallback branch.
+                logger.info("computer_actions_denied capability=%s", capability_id)
+                # Audit every rejected attempt, using only stable symbolic
+                # values (never the prompt, an actor identifier, or any
+                # other detail). A write failure here must never change or
+                # prevent the deterministic denial response below - matches
+                # audit.record()'s own never-raises guarantee, and stays
+                # defensive against it regardless.
+                try:
+                    audit.record(
+                        _AUDIT_ACTION, capability_id, _AUDIT_OUTCOME_REJECTED_UNAUTHORIZED
+                    )
+                except Exception:
+                    logger.warning("computer_actions_denied_audit_failed")
                 response = ModelResponse(
-                    text=capability_result,
-                    model=f"capability:{capability_id}",
+                    text=COMPUTER_ACTIONS_DENIED_TEXT,
+                    model=f"capability:{capability_id}:denied",
                     input_tokens=0,
                     output_tokens=0,
                     latency_seconds=0.0,
                 )
             else:
-                raise TypeError(
-                    f"capability {capability_id!r} returned unsupported result type "
-                    f"{type(capability_result).__name__}; expected str or ModelResponse"
-                )
+                capability_result = capability.handle(user_prompt)
+                if isinstance(capability_result, ModelResponse):
+                    response = capability_result
+                elif isinstance(capability_result, str):
+                    response = ModelResponse(
+                        text=capability_result,
+                        model=f"capability:{capability_id}",
+                        input_tokens=0,
+                        output_tokens=0,
+                        latency_seconds=0.0,
+                    )
+                else:
+                    raise TypeError(
+                        f"capability {capability_id!r} returned unsupported result type "
+                        f"{type(capability_result).__name__}; expected str or ModelResponse"
+                    )
         else:
             augmented_prompt = build_prompt(user_prompt, self._memory)
             response = self._provider.send_prompt(augmented_prompt)

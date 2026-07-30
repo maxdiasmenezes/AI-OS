@@ -8,6 +8,14 @@ CapabilityLoader.
 
 import re
 
+# Milestone 33: the strict "/task" command prefix routes to the "tasks"
+# capability. This only detects the prefix - the full command grammar
+# ("/task status", "/task open <key>", etc.) is parsed deterministically
+# inside capabilities/tasks/command_parser.py, not here. Anchored to the
+# start of the (stripped) prompt, since this is a command, not a phrase
+# that can appear mid-sentence.
+_TASK_COMMAND_PATTERN = re.compile(r"^/task(\s|$)", re.IGNORECASE)
+
 # Whole-word "wine" or "wines" mention - the original, broadest signal.
 _WINE_WORD_PATTERN = re.compile(r"\bwines?\b", re.IGNORECASE)
 
@@ -58,6 +66,8 @@ class CapabilityRouter:
     def route(self, prompt: str) -> str | None:
         """Return the capability id that should handle prompt, or None."""
 
+        if _TASK_COMMAND_PATTERN.match(prompt.strip()):
+            return "tasks"
         if any(pattern.search(prompt) for pattern in _WINE_INTENT_PATTERNS):
             return "wine"
         return None

@@ -74,7 +74,7 @@ class FakeOrchestrator:
         self._text = text
         self.received_prompts = []
 
-    def handle(self, prompt):
+    def handle(self, prompt, context=None):
         self.received_prompts.append(prompt)
         return _model_response(self._text)
 
@@ -89,7 +89,7 @@ class BlockingOrchestrator:
         self._release = threading.Event()
         self.received_prompts = []
 
-    def handle(self, prompt):
+    def handle(self, prompt, context=None):
         self.received_prompts.append(prompt)
         self.started.set()
         self._release.wait(timeout=5)

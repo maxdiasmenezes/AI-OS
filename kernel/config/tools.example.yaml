@@ -1,0 +1,40 @@
+# Example configuration for kernel/tools/ (Milestone 33: Safe Computer Task
+# Execution). Copy this file to kernel/config/tools.yaml and replace every
+# placeholder with real, absolute paths for this machine.
+#
+# kernel/config/tools.yaml is gitignored - it holds real local filesystem
+# and application paths for one machine and must never be committed. This
+# example file is the only version of this configuration tracked in git,
+# and every value below is a synthetic placeholder.
+#
+# Validation rules (kernel/tools/config.py) - a tools.yaml that violates
+# any of these fails to load entirely (fail closed), rather than partially
+# applying:
+#   - Every path (directory, executable, cwd, interpreter, script_path)
+#     must be absolute. A relative path is rejected.
+#   - No duplicate keys - not even ones that only collide after
+#     case-folding (e.g. "Documents" and "documents" together are
+#     rejected).
+#   - No unrecognized top-level or per-entry field.
+#   - A key the WhatsApp sender types (e.g. "documents", "notepad") is
+#     matched case-insensitively against these keys - the resolved path
+#     behind it is never sender-supplied.
+
+list_files:
+  approved_directories:
+    documents: "C:/Users/REPLACE_ME/Documents"
+    downloads: "C:/Users/REPLACE_ME/Downloads"
+
+open_application:
+  approved_applications:
+    notepad:
+      executable: "C:/Windows/System32/notepad.exe"
+      cwd: "C:/Windows/System32"
+
+run_registered_script:
+  approved_scripts:
+    example_script:
+      interpreter: "C:/REPLACE_ME/AI-OS/.venv/Scripts/python.exe"
+      script_path: "C:/REPLACE_ME/AI-OS/scripts/REPLACE_ME.py"
+      cwd: "C:/REPLACE_ME/AI-OS"
+      timeout_seconds: 30

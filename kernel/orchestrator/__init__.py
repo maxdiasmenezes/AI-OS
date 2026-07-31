@@ -6,6 +6,7 @@ orchestrator.py directly, matching the convention used by
 kernel/memory/__init__.py.
 """
 
+from kernel.orchestrator.context import RequestContext
 from kernel.orchestrator.orchestrator import Orchestrator
 
-__all__ = ["Orchestrator"]
+__all__ = ["Orchestrator", "RequestContext"]

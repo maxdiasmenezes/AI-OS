@@ -16,10 +16,20 @@ outbound_failure).
 import logging
 
 from kernel.models.base import ModelResponse
+from kernel.orchestrator.context import RequestContext
 
 from interfaces.whatsapp.client import WhatsAppClientError
 
 logger = logging.getLogger(__name__)
+
+# Milestone 33: every TextTask reaching this module has already passed
+# WhatsApp's own exact-sender authorization, synchronously, in
+# server.py's POST handling, before it was ever queued - see
+# server.py's module docstring. This is the one and only place this
+# interface grants computer-action trust; it never depends on, or
+# duplicates, the phone-number check itself. See
+# kernel/orchestrator/context.py for why the default is deny.
+_TRUSTED_CONTEXT = RequestContext(allow_computer_actions=True, actor="whatsapp")
 
 # AI-OS application limits enforced by this interface - not claims about
 # any WhatsApp platform limit. Both are injectable via MessageHandler /
@@ -138,7 +148,7 @@ class MessageHandler:
 
     def _handle_text_task(self, task: TextTask) -> None:
         try:
-            result = self._orchestrator.handle(task.text)
+            result = self._orchestrator.handle(task.text, context=_TRUSTED_CONTEXT)
         except Exception:
             # Never log the exception object, its message, or a traceback -
             # a real (or synthetic) exception's text could itself carry

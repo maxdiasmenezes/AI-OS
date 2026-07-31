@@ -13,7 +13,9 @@ from kernel.config.config import Config
 from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.memory import MemoryEntry, MemoryManager
 from kernel.models.base import ModelProvider, ModelResponse
-from kernel.orchestrator import Orchestrator
+from kernel.orchestrator import Orchestrator, RequestContext
+from kernel.orchestrator.orchestrator import COMPUTER_ACTIONS_DENIED_TEXT
+from kernel.tools import audit
 
 # tests/kernel/orchestrator/test_orchestrator.py -> tests/kernel -> tests -> project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -64,6 +66,26 @@ class FakeModelBackedCapability(Capability):
     def handle(self, prompt: str) -> ModelResponse:
         self.received_prompts.append(prompt)
         return self._response
+
+
+class FakeTrustedCapability(Capability):
+    """A capability that requires computer-action trust. handle() raises if
+    it is ever called - proving Orchestrator never invokes it when denied."""
+
+    requires_computer_actions = True
+
+    def __init__(self, capability_id: str, response_text: str):
+        self._id = capability_id
+        self._response_text = response_text
+        self.received_prompts: list[str] = []
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def handle(self, prompt: str) -> str:
+        self.received_prompts.append(prompt)
+        return self._response_text
 
 
 class FakeBadCapability(Capability):
@@ -810,3 +832,244 @@ def test_capability_can_recall_through_the_exact_injected_memory_object(monkeypa
 
     capability = captured_capability["capability"]
     assert [e.content for e in capability.recalled_at_handle_time] == ["earlier note"]
+
+
+# --- Milestone 33: RequestContext / computer-action authorization gate ----
+
+
+def test_default_call_with_no_context_denies_capability_requiring_computer_actions(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("/task status")
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+    assert fake_capability.received_prompts == []  # handle() never called
+    assert fake_provider.received_prompts == []  # never falls through to the model
+
+
+def test_denied_computer_action_attempt_is_audited_with_stable_symbolic_values(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    audit_calls = []
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.audit.record",
+        lambda action, resource_key, outcome: audit_calls.append((action, resource_key, outcome)),
+    )
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("/task open notepad; rm -rf secrets")
+
+    assert audit_calls == [("computer_actions", "tasks", "rejected_unauthorized")]
+
+
+def test_authorized_request_never_writes_a_denial_audit_record(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "status: ok")
+    loader = Mock(return_value=fake_capability)
+
+    audit_calls = []
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.audit.record",
+        lambda action, resource_key, outcome: audit_calls.append((action, resource_key, outcome)),
+    )
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle(
+        "/task status", context=RequestContext(allow_computer_actions=True, actor="whatsapp")
+    )
+
+    assert audit_calls == []
+
+
+def test_denial_audit_record_never_includes_the_prompt_or_actor(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    audit_calls = []
+    monkeypatch.setattr(
+        "kernel.orchestrator.orchestrator.audit.record",
+        lambda action, resource_key, outcome: audit_calls.append((action, resource_key, outcome)),
+    )
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle(
+        "/task run backup_wine_data",
+        context=RequestContext(allow_computer_actions=False, actor="15551234567"),
+    )
+
+    action, resource_key, outcome = audit_calls[0]
+    assert action == "computer_actions"
+    assert resource_key == "tasks"
+    assert outcome == "rejected_unauthorized"
+    assert "run backup_wine_data" not in str(audit_calls)
+    assert "15551234567" not in str(audit_calls)
+
+
+def test_denial_audit_write_failure_never_changes_or_blocks_the_denial_response(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    def raising_record(action, resource_key, outcome):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("kernel.orchestrator.orchestrator.audit.record", raising_record)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("/task open notepad")  # must not raise
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+    assert fake_capability.received_prompts == []
+    assert fake_provider.received_prompts == []
+
+    record = _read_last_log_record(config.log_path)
+    assert record["response"] == COMPUTER_ACTIONS_DENIED_TEXT
+
+
+def test_real_audit_module_write_failure_is_also_non_fatal_end_to_end(monkeypatch, tmp_path):
+    # Belt-and-suspenders: exercise the real kernel.tools.audit.record()
+    # (not a mock) with a log path that cannot be written to, proving the
+    # denial response survives even without the orchestrator's own
+    # try/except - audit.record() itself never raises.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    unwritable_log_path = tmp_path / "unwritable_task_actions.jsonl"
+    unwritable_log_path.mkdir()  # a directory in place of the file - open() will fail
+    monkeypatch.setattr(audit, "_DEFAULT_LOG_PATH", unwritable_log_path)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("/task open notepad")  # must not raise
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+
+
+def test_explicit_denying_context_denies_capability_requiring_computer_actions(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle(
+        "/task status", context=RequestContext(allow_computer_actions=False)
+    )
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+    assert fake_capability.received_prompts == []
+    assert fake_provider.received_prompts == []
+
+
+def test_trusted_context_allows_capability_requiring_computer_actions_to_run(
+    monkeypatch, tmp_path
+):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "status: ok")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle(
+        "/task status", context=RequestContext(allow_computer_actions=True, actor="whatsapp")
+    )
+
+    assert response.text == "status: ok"
+    assert fake_capability.received_prompts == ["/task status"]
+    assert fake_provider.received_prompts == []
+
+
+def test_untrusted_capability_still_runs_regardless_of_context(monkeypatch, tmp_path):
+    # A capability that does NOT require computer-action trust (e.g. wine)
+    # must be completely unaffected by an untrusted/default context.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeCapability("wine", "a bold Malbec would work well")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("What wine goes with steak?")
+
+    assert response.text == "a bold Malbec would work well"
+    assert fake_capability.received_prompts == ["What wine goes with steak?"]
+
+
+def test_denied_response_is_still_persisted_to_memory_and_logged(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    fake_capability = FakeTrustedCapability("tasks", "should not be returned")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("/task open notepad")
+
+    memory = MemoryManager(config.memory_settings)
+    entries = memory.recall("conversation")
+    assert len(entries) == 2
+    assert entries[0].content == "/task open notepad"
+    assert entries[1].content == COMPUTER_ACTIONS_DENIED_TEXT
+
+    record = _read_last_log_record(config.log_path)
+    assert record["prompt"] == "/task open notepad"
+    assert record["response"] == COMPUTER_ACTIONS_DENIED_TEXT
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+
+
+def test_real_tasks_capability_via_cli_style_call_is_denied_deterministically(
+    monkeypatch, tmp_path
+):
+    # End-to-end with the real router + real CapabilityLoader + real
+    # TasksCapability: a CLI-style call (no context passed at all) must be
+    # denied before command_parser or kernel/tools is ever reached.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle("/task status")
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+    assert fake_provider.received_prompts == []
+
+
+def test_real_tasks_capability_via_trusted_context_executes_status(
+    monkeypatch, tmp_path, deterministic_system_status
+):
+    # End-to-end with the real router + real CapabilityLoader + real
+    # TasksCapability + real SafeTaskExecutor: a trusted context reaches
+    # system_status, which needs no local tools.yaml configuration. Every
+    # real machine/service reading is patched deterministic
+    # (deterministic_system_status, tests/conftest.py) - this test never
+    # contacts a real Ollama or ngrok, and its result never depends on
+    # whether either is running on this machine.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle(
+        "/task status", context=RequestContext(allow_computer_actions=True, actor="whatsapp")
+    )
+
+    assert response.text == deterministic_system_status
+    assert fake_provider.received_prompts == []

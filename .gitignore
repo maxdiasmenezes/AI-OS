@@ -53,3 +53,8 @@ desktop.ini
 # Runtime storage
 storage/**/*.jsonl
 storage/knowledge/*.json
+
+# Milestone 33: local machine-specific safe task execution config - real
+# absolute filesystem/application paths for this one machine. See
+# kernel/config/tools.example.yaml for the committed placeholder.
+kernel/config/tools.yaml

@@ -40,14 +40,17 @@ class FakeOrchestrator:
     """Returns whatever `result` is configured with - a plain str, a real
     ModelResponse, an exception to raise, or any other (invalid) value -
     so handle_task()'s contract with Orchestrator.handle() can be tested
-    precisely, rather than assumed."""
+    precisely, rather than assumed. Also records the context kwarg every
+    call received, so Milestone 33's trusted-context wiring can be tested."""
 
     def __init__(self, result="a reply"):
         self._result = result
         self.received_prompts: list = []
+        self.received_contexts: list = []
 
-    def handle(self, prompt: str):
+    def handle(self, prompt: str, context=None):
         self.received_prompts.append(prompt)
+        self.received_contexts.append(context)
         if isinstance(self._result, BaseException):
             raise self._result
         return self._result
@@ -150,6 +153,32 @@ def test_outgoing_length_limit_is_injectable():
     handler.handle_task(TextTask(SENDER, "hi"))
 
     assert client.sent == [(SENDER, LONG_RESPONSE_NOTICE)]
+
+
+def test_text_task_is_handled_with_a_trusted_computer_actions_context():
+    # Milestone 33: this interface is the one place that grants
+    # allow_computer_actions=True, and only for an already-authorized,
+    # already-classified TextTask - see handler.py's _TRUSTED_CONTEXT.
+    orchestrator = FakeOrchestrator("ok")
+    client = RecordingClient()
+    handler = MessageHandler(orchestrator, client)
+
+    handler.handle_task(TextTask(SENDER, "hello"))
+
+    assert len(orchestrator.received_contexts) == 1
+    context = orchestrator.received_contexts[0]
+    assert context.allow_computer_actions is True
+    assert context.actor == "whatsapp"
+
+
+def test_fixed_reply_task_never_calls_orchestrator_so_no_context_is_built():
+    orchestrator = FakeOrchestrator("should not be reached")
+    client = RecordingClient()
+    handler = MessageHandler(orchestrator, client)
+
+    handler.handle_task(FixedReplyTask(SENDER, UNSUPPORTED_MESSAGE_REPLY))
+
+    assert orchestrator.received_contexts == []
 
 
 def test_client_failure_while_replying_does_not_raise():

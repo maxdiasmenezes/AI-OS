@@ -14,6 +14,15 @@ from kernel.models.base import ModelResponse
 class Capability(ABC):
     """Common interface every capability must implement."""
 
+    # Concrete, non-abstract: defaults to False so every existing and
+    # future capability stays reachable exactly as before unless it
+    # explicitly opts in. A capability that sets this True (e.g.
+    # capabilities/tasks/TasksCapability) is refused by Orchestrator.handle()
+    # - its handle() is never even called - unless the request's
+    # RequestContext explicitly grants allow_computer_actions. See
+    # kernel/orchestrator/context.py and kernel/orchestrator/orchestrator.py.
+    requires_computer_actions: bool = False
+
     @property
     @abstractmethod
     def id(self) -> str:

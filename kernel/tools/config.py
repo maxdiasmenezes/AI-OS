@@ -1,18 +1,19 @@
 """
-Local machine configuration for kernel/tools/ (Milestone 33).
+Local machine configuration for kernel/tools/ (Milestone 33; repo_health
+added in Milestone 34).
 
 Loads kernel/config/tools.yaml - a gitignored, machine-local file holding
-the actual allowlists (approved directories, applications, and scripts)
-for this one machine. kernel/config/tools.example.yaml is the committed,
-safe placeholder a real tools.yaml is copied from; no real Windows path is
-ever tracked in git.
+the actual allowlists (approved directories, applications, scripts, and
+repositories) for this one machine. kernel/config/tools.example.yaml is
+the committed, safe placeholder a real tools.yaml is copied from; no real
+Windows path is ever tracked in git.
 
 Fails closed:
 - A *missing* file is not an error - it yields an entirely empty
   ToolsConfig, so every resource-scoped action (list_files,
-  open_application, run_registered_script) denies everything by having
-  nothing allowlisted. system_status needs no configuration at all and is
-  unaffected either way.
+  open_application, run_registered_script, repo_health) denies everything
+  by having nothing allowlisted. system_status needs no configuration at
+  all and is unaffected either way.
 - A *present but invalid* file (malformed YAML, a duplicate key - even one
   that only collides case-insensitively, a relative path where an
   absolute one is required, or any field this schema doesn't recognize)
@@ -20,7 +21,8 @@ Fails closed:
   never silently ignore it - see capabilities/tasks/capability.py.
 """
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -30,14 +32,63 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TOOLS_YAML_PATH = _PROJECT_ROOT / "kernel" / "config" / "tools.yaml"
 
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAIN_BRANCH = "main"
 
-_TOP_LEVEL_KEYS = {"list_files", "open_application", "run_registered_script"}
+_TOP_LEVEL_KEYS = {
+    "list_files",
+    "open_application",
+    "run_registered_script",
+    "repo_health",
+}
 _LIST_FILES_KEYS = {"approved_directories"}
 _OPEN_APPLICATION_KEYS = {"approved_applications"}
 _RUN_SCRIPT_KEYS = {"approved_scripts"}
+_REPO_HEALTH_KEYS = {"approved_repositories"}
 _APPLICATION_FIELDS = {"executable", "cwd"}
 _SCRIPT_REQUIRED_FIELDS = {"interpreter", "script_path", "cwd"}
 _SCRIPT_ALL_FIELDS = _SCRIPT_REQUIRED_FIELDS | {"timeout_seconds"}
+_REPO_REQUIRED_FIELDS = {"path"}
+_REPO_ALL_FIELDS = _REPO_REQUIRED_FIELDS | {"main_branch"}
+
+# A restrictive ASCII character allowlist alone is not enough: strings
+# made entirely of allowed characters can still form ref names with
+# special meaning to git (a leading "-" reads as an option, ".." is a
+# revision range, a ".lock" suffix collides with git's own lockfile
+# convention, "@{" starts a reflog/upstream shorthand, "@" alone means
+# "current branch", etc). is_valid_git_branch_name() rejects all of that
+# on top of the character allowlist. It is shared (not duplicated)
+# between this module's config-time validation of an admin-supplied
+# main_branch and kernel/tools/handlers/repo_health.py's own re-check of
+# that same value plus the live branch name `git` reports at runtime -
+# the rule set below is too easy to accidentally let drift if hand-copied
+# in two places.
+_GIT_REF_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def is_valid_git_branch_name(value) -> bool:
+    """True only for a conservative, safe-to-display git branch name.
+    Modeled on `git check-ref-format`'s real rules (restricted to
+    single-or-multi-component branch names - a leading/trailing slash or
+    empty component is always rejected, unlike some of git's own
+    hierarchical ref exceptions)."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    if not _GIT_REF_NAME_RE.match(value):
+        return False
+    # Redundant with the character allowlist today (neither "@" nor "\"
+    # nor whitespace/control characters are in it) - kept explicit as a
+    # safety net against the allowlist ever being loosened later.
+    if value == "@" or "@{" in value or "\\" in value:
+        return False
+    if value.startswith(("-", ".", "/")) or value.endswith(("/", ".")):
+        return False
+    if ".." in value or "//" in value:
+        return False
+    for component in value.split("/"):
+        if component.startswith(".") or component.endswith(".lock"):
+            return False
+    return True
 
 
 class ToolsConfigError(ValueError):
@@ -61,14 +112,24 @@ class ScriptSpec:
 
 
 @dataclass(frozen=True)
+class RepoSpec:
+    path: str
+    main_branch: str
+
+
+@dataclass(frozen=True)
 class ToolsConfig:
     approved_directories: dict
     approved_applications: dict
     approved_scripts: dict
+    approved_repositories: dict = field(default_factory=dict)
 
 
 EMPTY_TOOLS_CONFIG = ToolsConfig(
-    approved_directories={}, approved_applications={}, approved_scripts={}
+    approved_directories={},
+    approved_applications={},
+    approved_scripts={},
+    approved_repositories={},
 )
 
 
@@ -97,6 +158,12 @@ def _require_absolute_path(value, field_name: str) -> str:
         raise ToolsConfigError(f"{field_name} must be a non-empty string")
     if not Path(value).is_absolute():
         raise ToolsConfigError(f"{field_name} must be an absolute path, got: {value!r}")
+    return value
+
+
+def _require_git_ref_name(value, field_name: str) -> str:
+    if not is_valid_git_branch_name(value):
+        raise ToolsConfigError(f"{field_name} is not a valid git branch name: {value!r}")
     return value
 
 
@@ -209,6 +276,37 @@ def _parse_run_registered_script(section) -> dict:
     return result
 
 
+def _parse_repo_health(section) -> dict:
+    if not isinstance(section, dict):
+        raise ToolsConfigError("repo_health must be a mapping")
+    _reject_unknown_fields(set(section), _REPO_HEALTH_KEYS, "repo_health")
+
+    repos = section.get("approved_repositories", {})
+    if not isinstance(repos, dict):
+        raise ToolsConfigError("repo_health.approved_repositories must be a mapping")
+
+    result = {}
+    seen: dict = {}
+    for raw_key, spec in repos.items():
+        key = _casefolded_unique_key(raw_key, seen, "repo_health.approved_repositories")
+        if not isinstance(spec, dict):
+            raise ToolsConfigError(
+                f"repo_health.approved_repositories[{raw_key!r}] must be a mapping"
+            )
+        context = f"repo_health.approved_repositories[{raw_key!r}]"
+        _reject_unknown_fields(set(spec), _REPO_ALL_FIELDS, context)
+        missing = _REPO_REQUIRED_FIELDS - set(spec)
+        if missing:
+            raise ToolsConfigError(f"{context} missing required field(s): {sorted(missing)}")
+
+        main_branch = spec.get("main_branch", DEFAULT_MAIN_BRANCH)
+        result[key] = RepoSpec(
+            path=_require_absolute_path(spec["path"], f"{context}.path"),
+            main_branch=_require_git_ref_name(main_branch, f"{context}.main_branch"),
+        )
+    return result
+
+
 def load_tools_config(path: Path | None = None) -> ToolsConfig:
     """Load and validate local machine tool configuration. See module
     docstring for the fail-closed rules."""
@@ -247,5 +345,8 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
             _parse_run_registered_script(data["run_registered_script"])
             if "run_registered_script" in data
             else {}
+        ),
+        approved_repositories=(
+            _parse_repo_health(data["repo_health"]) if "repo_health" in data else {}
         ),
     )

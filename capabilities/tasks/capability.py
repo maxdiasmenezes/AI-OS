@@ -1,12 +1,13 @@
 """
-TasksCapability: Milestone 33's safe computer task execution capability.
+TasksCapability: Milestone 33's safe computer task execution capability
+(repo_health added in Milestone 34).
 
 Every command is handled deterministically - no model call is ever made
 here, matching the pattern WineCapability's Deterministic Cellar Lookup v1
 established (capabilities/wine/cellar_lookup.py). This capability never
 reads memory or the knowledge store either - system_status/list_files/
-open_application/run_registered_script are all stateless, one-shot
-actions.
+open_application/run_registered_script/repo_health are all stateless,
+one-shot actions.
 
 requires_computer_actions = True means Orchestrator refuses to call
 handle() at all unless the request's RequestContext explicitly grants
@@ -37,6 +38,7 @@ HELP_TEXT = (
     "/task files <directory>\n"
     "/task open <application>\n"
     "/task run <script>\n"
+    "/task repo <repository>\n"
     "/task confirm\n"
     "/task cancel\n"
     "/task help"

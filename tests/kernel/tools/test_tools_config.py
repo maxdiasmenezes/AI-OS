@@ -4,8 +4,10 @@ import pytest
 
 from kernel.tools.config import (
     ApplicationSpec,
+    RepoSpec,
     ScriptSpec,
     ToolsConfigError,
+    is_valid_git_branch_name,
     load_tools_config,
 )
 
@@ -22,6 +24,7 @@ def test_missing_file_yields_an_empty_config_rather_than_raising(tmp_path):
     assert config.approved_directories == {}
     assert config.approved_applications == {}
     assert config.approved_scripts == {}
+    assert config.approved_repositories == {}
 
 
 def test_empty_file_yields_an_empty_config(tmp_path):
@@ -239,3 +242,212 @@ def test_full_valid_configuration_parses_all_three_sections(tmp_path):
     assert config.approved_directories == {"documents": "C:/Users/Example/Documents"}
     assert "notepad" in config.approved_applications
     assert config.approved_scripts["backup"].timeout_seconds == 60.0
+
+
+def test_repo_health_missing_required_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      main_branch: main\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_repo_health_unsupported_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: C:/AI-OS\n"
+        "      extra_field: nope\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_repo_health_relative_path_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: relative/path\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+@pytest.mark.parametrize(
+    "bad_branch",
+    [
+        "",
+        "has space",
+        "weird\tchar",
+        "semi;colon",
+        "-main",
+        "/main",
+        "main/",
+        ".main",
+        "feature/.hidden",
+        "main.",
+        "feature.lock",
+        "feature/test.lock",
+        "main..old",
+        "feature//test",
+        "main@{1}",
+        "@",
+        "has space",
+        "has\tcontrol",
+    ],
+)
+def test_repo_health_invalid_main_branch_raises(tmp_path, bad_branch):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        f"      path: C:/AI-OS\n"
+        f"      main_branch: {bad_branch!r}\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+@pytest.mark.parametrize(
+    "valid_branch",
+    ["main", "trunk", "release/2026-08", "feature/repo_health", "version_2.1"],
+)
+def test_repo_health_valid_main_branch_names_parse(tmp_path, valid_branch):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: C:/AI-OS\n"
+        f"      main_branch: {valid_branch!r}\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_repositories["ai_os"].main_branch == valid_branch
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "",
+        None,
+        123,
+        "-main",
+        "/main",
+        "main/",
+        ".main",
+        "feature/.hidden",
+        "main.",
+        "feature.lock",
+        "feature/test.lock",
+        "main..old",
+        "feature//test",
+        "main@{1}",
+        "@",
+        "has space",
+        "has\tcontrol",
+        "back\\slash",
+    ],
+)
+def test_is_valid_git_branch_name_rejects(invalid_name):
+    assert is_valid_git_branch_name(invalid_name) is False
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    ["main", "trunk", "release/2026-08", "feature/repo_health", "version_2.1"],
+)
+def test_is_valid_git_branch_name_accepts(valid_name):
+    assert is_valid_git_branch_name(valid_name) is True
+
+
+def test_repo_health_duplicate_key_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    Ai_Os:\n"
+        "      path: C:/one\n"
+        "    ai_os:\n"
+        "      path: C:/two\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_valid_repo_health_section_parses_with_default_main_branch(tmp_path):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    Ai_Os:\n"
+        "      path: C:/AI-OS\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_repositories == {
+        "ai_os": RepoSpec(path="C:/AI-OS", main_branch="main")
+    }
+
+
+def test_valid_repo_health_section_parses_with_explicit_main_branch(tmp_path):
+    path = _write(
+        tmp_path,
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: C:/AI-OS\n"
+        "      main_branch: trunk\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_repositories["ai_os"].main_branch == "trunk"
+
+
+def test_full_valid_configuration_parses_all_four_sections(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "open_application:\n"
+        "  approved_applications:\n"
+        "    notepad:\n"
+        "      executable: C:/Windows/System32/notepad.exe\n"
+        "      cwd: C:/Windows/System32\n"
+        "run_registered_script:\n"
+        "  approved_scripts:\n"
+        "    backup:\n"
+        "      interpreter: C:/python.exe\n"
+        "      script_path: C:/AI-OS/scripts/backup.py\n"
+        "      cwd: C:/AI-OS\n"
+        "      timeout_seconds: 60\n"
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: C:/AI-OS\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_directories == {"documents": "C:/Users/Example/Documents"}
+    assert "notepad" in config.approved_applications
+    assert config.approved_scripts["backup"].timeout_seconds == 60.0
+    assert config.approved_repositories["ai_os"] == RepoSpec(path="C:/AI-OS", main_branch="main")

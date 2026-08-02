@@ -10,6 +10,7 @@ public surface.
 
 from kernel.tools.config import (
     ApplicationSpec,
+    RepoSpec,
     ScriptSpec,
     ToolsConfig,
     ToolsConfigError,
@@ -22,6 +23,7 @@ from kernel.tools.types import ActionRequest, ActionResult
 
 __all__ = [
     "ApplicationSpec",
+    "RepoSpec",
     "ScriptSpec",
     "ToolsConfig",
     "ToolsConfigError",

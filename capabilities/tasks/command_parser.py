@@ -1,8 +1,9 @@
 """
-Strict command grammar for the /task interface (Milestone 33). Every
-supported form is listed explicitly below - there is no natural-language
-matching, no fuzzy matching, and no partial-token matching. Anything that
-doesn't exactly match one of these forms is a parse error, not a guess.
+Strict command grammar for the /task interface (Milestone 33; `repo`
+added in Milestone 34). Every supported form is listed explicitly below -
+there is no natural-language matching, no fuzzy matching, and no
+partial-token matching. Anything that doesn't exactly match one of these
+forms is a parse error, not a guess.
 
 Supported forms ("/task" and the verb are matched case-insensitively; a
 resource key is casefolded so it matches kernel/config/tools.yaml's
@@ -12,6 +13,7 @@ casefolded keys - see kernel/tools/config.py):
     /task files <registered-directory-key>
     /task open <registered-application-key>
     /task run <registered-script-key>
+    /task repo <registered-repository-key>
     /task confirm
     /task cancel
     /task help
@@ -31,6 +33,7 @@ _ONE_ARG_VERBS = {
     "files": "list_files",
     "open": "open_application",
     "run": "run_registered_script",
+    "repo": "repo_health",
 }
 
 

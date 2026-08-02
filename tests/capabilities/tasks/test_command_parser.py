@@ -37,6 +37,7 @@ def test_bare_task_prefix_is_help():
         ("/task files documents", "list_files"),
         ("/task open notepad", "open_application"),
         ("/task run backup", "run_registered_script"),
+        ("/task repo ai_os", "repo_health"),
     ],
 )
 def test_recognized_one_argument_forms(prompt, expected_action):
@@ -78,8 +79,10 @@ def test_prompts_that_are_not_task_commands_return_a_parse_error_reason(prompt):
         "/task files",  # missing required argument
         "/task open",
         "/task run",
+        "/task repo",
         "/task files documents extra",
         "/task open notepad extra",
+        "/task repo ai_os extra",
     ],
 )
 def test_wrong_argument_count_is_rejected(prompt):

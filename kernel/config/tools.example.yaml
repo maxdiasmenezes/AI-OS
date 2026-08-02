@@ -1,5 +1,6 @@
 # Example configuration for kernel/tools/ (Milestone 33: Safe Computer Task
-# Execution). Copy this file to kernel/config/tools.yaml and replace every
+# Execution; repo_health added in Milestone 34: Safe Repository Health
+# Checks). Copy this file to kernel/config/tools.yaml and replace every
 # placeholder with real, absolute paths for this machine.
 #
 # kernel/config/tools.yaml is gitignored - it holds real local filesystem
@@ -19,6 +20,12 @@
 #   - A key the WhatsApp sender types (e.g. "documents", "notepad") is
 #     matched case-insensitively against these keys - the resolved path
 #     behind it is never sender-supplied.
+#   - repo_health.approved_repositories[*].path must be the repository's
+#     root directory (where .git lives), not any subdirectory of it - the
+#     handler rejects a configured path that resolves to anything other
+#     than `git rev-parse --show-toplevel`'s own answer.
+#   - repo_health.approved_repositories[*].main_branch is optional and
+#     defaults to "main"; if given, it must be a valid git branch name.
 
 list_files:
   approved_directories:
@@ -38,3 +45,9 @@ run_registered_script:
       script_path: "C:/REPLACE_ME/AI-OS/scripts/REPLACE_ME.py"
       cwd: "C:/REPLACE_ME/AI-OS"
       timeout_seconds: 30
+
+repo_health:
+  approved_repositories:
+    ai_os:
+      path: "C:/REPLACE_ME/AI-OS"
+      main_branch: "main"

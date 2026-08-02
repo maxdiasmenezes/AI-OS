@@ -1,8 +1,9 @@
 """Tests for capabilities/tasks/capability.py: TasksCapability."""
 
+import subprocess
 import sys
 
-from kernel.tools.config import ApplicationSpec, ToolsConfig, ToolsConfigError
+from kernel.tools.config import ApplicationSpec, RepoSpec, ToolsConfig, ToolsConfigError
 from kernel.tools.confirmation import ConfirmationStore
 
 from capabilities.tasks.capability import (
@@ -18,6 +19,24 @@ def _make_capability(tools_config=None, confirmation_store=None, ttl_seconds=120
     return TasksCapability(
         None, None, None, confirmation_store=confirmation_store, tools_config_loader=loader
     ), confirmation_store
+
+
+def _init_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), check=True, capture_output=True)
+    (path / "file.txt").write_text("content", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "first commit"], cwd=str(path), check=True, capture_output=True
+    )
+    return path
 
 
 def test_requires_computer_actions_is_true():
@@ -71,6 +90,32 @@ def test_files_with_registered_key_lists_contents(tmp_path):
     response = capability.handle("/task files documents")
 
     assert "a.txt" in response
+
+
+def test_repo_with_unregistered_key_is_rejected():
+    capability, _ = _make_capability(tools_config=ToolsConfig({}, {}, {}, {}))
+
+    response = capability.handle("/task repo ai_os")
+
+    assert "not registered" in response
+
+
+def test_repo_with_registered_key_executes_immediately_without_confirmation(tmp_path):
+    repo_path = _init_repo(tmp_path / "repo")
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={"ai_os": RepoSpec(path=str(repo_path), main_branch="main")},
+    )
+    capability, store = _make_capability(tools_config=config)
+
+    response = capability.handle("/task repo ai_os")
+
+    assert "Repository: ai_os" in response
+    assert "Branch: main" in response
+    pending, _ = store.consume()
+    assert pending is None  # repo_health is not sensitive - nothing was proposed
 
 
 def test_sensitive_action_is_proposed_not_executed_immediately(tmp_path):

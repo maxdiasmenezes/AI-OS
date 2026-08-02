@@ -47,9 +47,10 @@ to the kernel.
   wired into WineCapability's model-backed fallback for an optional personal
   wine profile and a read-only personal wine cellar inventory, and into its
   Deterministic Cellar Lookup v1 for the same read-only cellar inventory.
-  kernel/tools: implemented (Milestone 33) - the safe computer task
-  execution layer (allowlist-only actions, timeouts, confirmation,
-  audit), consumed by capabilities/tasks/TasksCapability.
+  kernel/tools: implemented (Milestone 33; repo_health added in
+  Milestone 34) - the safe computer task execution layer (allowlist-only
+  actions, timeouts, confirmation, audit), consumed by
+  capabilities/tasks/TasksCapability.
 ```
 
 ## Layers
@@ -334,16 +335,18 @@ tests for Content-Length edge cases `urllib` cannot express.
   end-to-end today; the other adapters are present in the codebase but not
   verified as the active path.
 - **tools** — reusable tools (actions, integrations, lookups) that
-  capabilities could invoke. Implemented (Milestone 33): the safe computer
-  task execution layer, transport-agnostic and consumed today only by
-  `capabilities/tasks/TasksCapability` — see Capabilities below for the
-  full command surface. `kernel/tools/types.py` defines `ActionRequest`
-  (an action name plus an optional symbolic `resource_key` — never a raw
-  path or argument list) and `ActionResult`. `kernel/tools/registry.py`'s
-  `ActionRegistry` is the fixed, non-configurable allowlist of exactly
-  four actions (`system_status`, `list_files`, `open_application`,
-  `run_registered_script`) and which two of them are sensitive
-  (`open_application`, `run_registered_script`); no fifth action is ever
+  capabilities could invoke. Implemented (Milestone 33; extended in
+  Milestone 34): the safe computer task execution layer, transport-agnostic
+  and consumed today only by `capabilities/tasks/TasksCapability` — see
+  Capabilities below for the full command surface. `kernel/tools/types.py`
+  defines `ActionRequest` (an action name plus an optional symbolic
+  `resource_key` — never a raw path or argument list) and `ActionResult`.
+  `kernel/tools/registry.py`'s `ActionRegistry` is the fixed,
+  non-configurable allowlist of exactly five actions (`system_status`,
+  `list_files`, `open_application`, `run_registered_script`,
+  `repo_health`) and which two of them are sensitive (`open_application`,
+  `run_registered_script`) — `repo_health` is read-only and, like
+  `system_status`/`list_files`, is not sensitive; no sixth action is ever
   reachable, no matter what a caller asks for.
   `kernel/tools/config.py`'s `load_tools_config()` reads the *machine-local,
   gitignored* `kernel/config/tools.yaml` (copied from the committed
@@ -358,8 +361,11 @@ tests for Content-Length edge cases `urllib` cannot express.
   `capabilities/tasks/capability.py` converts into a fixed, generic "task
   system unavailable" reply rather than ever treating the error as
   permission to proceed. Every path in `tools.yaml` (a directory, an
-  executable, a script's interpreter/path/cwd) must be absolute, and every
-  key is matched case-insensitively. `kernel/tools/executor.py`'s
+  executable, a script's interpreter/path/cwd, a repository's path) must be
+  absolute, and every key is matched case-insensitively.
+  `repo_health.approved_repositories[*].main_branch` is optional (defaults
+  to `"main"`) and, when given, must match a strict git-branch-name
+  pattern or the whole file fails to load. `kernel/tools/executor.py`'s
   `SafeTaskExecutor.execute()` is the single choke point every action
   passes through: it rejects an unknown action outright, calls the
   matched handler with the loaded `ToolsConfig`, converts any handler
@@ -392,19 +398,28 @@ tests for Content-Length edge cases `urllib` cannot express.
   `run_registered_script`) waits up to a per-script configured timeout
   and, on expiry, kills the *entire* process tree via `psutil` (every
   descendant the process spawned, not just the immediate child) before
-  reporting a `timed_out` result. The four handlers under
-  `kernel/tools/handlers/` each implement exactly one action:
-  `system_status.py` reads no configuration at all (CPU/memory via
-  `psutil`, disk via `shutil.disk_usage`, uptime from `psutil.boot_time()`,
-  and short, hardcoded-timeout HTTP reachability checks against a local
-  Ollama and a local ngrok API); `list_files.py` accepts only a registered
-  symbolic directory key, canonicalizes the configured root once, lists
-  its immediate (non-recursive) contents capped at 100 entries, and
+  reporting a `timed_out` result; `run_capturing_stdout()` (used only by
+  `repo_health`, Milestone 34) additionally captures the child's stdout —
+  never stderr — through a dedicated background reader thread that drains
+  the pipe continuously and discards anything past a caller-supplied byte
+  bound as it streams, so neither a chatty child nor one producing
+  megabytes of output can either block on a full pipe buffer or balloon
+  this process's memory; on timeout it kills the full process tree the
+  same way, then deterministically joins the reader thread and closes the
+  pipe before returning. The five handlers under `kernel/tools/handlers/`
+  each implement exactly one action: `system_status.py` reads no
+  configuration at all (CPU/memory via `psutil`, disk via
+  `shutil.disk_usage`, uptime from `psutil.boot_time()`, and short,
+  hardcoded-timeout HTTP reachability checks against a local Ollama and a
+  local ngrok API); `list_files.py` accepts only a registered symbolic
+  directory key, canonicalizes the configured root once, lists its
+  immediate (non-recursive) contents capped at 100 entries, and
   independently re-resolves every entry to exclude anything a symlink,
   junction, or other reparse point would make appear to live outside that
   canonical root; `open_application.py` and `run_registered_script.py`
   accept only a registered symbolic key — never a sender-supplied path,
-  executable, working directory, or (for scripts) argument of any kind.
+  executable, working directory, or (for scripts) argument of any kind;
+  `repo_health.py` — see Capabilities below for its full behavior.
 - **config** — settings that govern how the kernel and its components
   behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
   (active provider, provider settings, memory, knowledge, and log locations),
@@ -576,7 +591,8 @@ know what wine, travel, or strategy mean.
   (`tests/capabilities/wine/test_capability.py`) and one end-to-end
   orchestrator test (`tests/kernel/orchestrator/test_orchestrator.py`).
 
-**tasks** (Milestone 33) is the second implemented capability —
+**tasks** (Milestone 33; `repo` verb added in Milestone 34) is the second
+implemented capability —
 `capabilities/tasks/TasksCapability` — a small, explicitly allowlisted set
 of computer actions on this machine, reached only through a strict
 `/task ...` command grammar, never natural language and never a model
@@ -592,21 +608,22 @@ recall, no knowledge-store access, ever.
   gate completely, and knows nothing about phone numbers or any other
   interface-specific check.
 - **Command grammar** (`capabilities/tasks/command_parser.py`) — exactly
-  seven literal forms, matched case-insensitively on `/task` and the verb:
+  eight literal forms, matched case-insensitively on `/task` and the verb:
   `/task status`, `/task files <key>`, `/task open <key>`,
-  `/task run <key>`, `/task confirm`, `/task cancel`, `/task help`. Any
-  extra token, missing token, or unrecognized verb is a `ParseError` with
-  a stable, symbolic reason — never guessed at, never partially honored.
-  `<key>` is a registered symbolic name resolved through
-  `kernel/config/tools.yaml`, never a path.
+  `/task run <key>`, `/task repo <key>`, `/task confirm`, `/task cancel`,
+  `/task help`. Any extra token, missing token, or unrecognized verb is a
+  `ParseError` with a stable, symbolic reason — never guessed at, never
+  partially honored. `<key>` is a registered symbolic name resolved
+  through `kernel/config/tools.yaml`, never a path.
 - **Confirmation.** `open_application` and `run_registered_script` are
   sensitive (per `kernel/tools/registry.py`): the first matching command
   only calls `ConfirmationStore.propose()` and replies with a prompt to
   confirm — nothing executes yet. `/task confirm` within 2 minutes calls
   `consume()` and, if something unexpired was pending, executes it exactly
   once; `/task cancel` clears it explicitly; letting it sit past 2 minutes
-  reports as expired on the next `/task confirm`. `system_status` and
-  `list_files` are not sensitive and execute immediately.
+  reports as expired on the next `/task confirm`. `system_status`,
+  `list_files`, and `repo_health` are not sensitive and execute
+  immediately.
 - **Execution.** A non-sensitive (or just-confirmed) command becomes one
   `kernel.tools.ActionRequest`, run through a fresh
   `kernel.tools.SafeTaskExecutor`; the `ActionResult.message` is returned
@@ -618,10 +635,129 @@ recall, no knowledge-store access, ever.
   reply, audited as `failed`, never treated as permission to proceed.
   Every step (proposed, confirmed, executed, rejected, expired,
   cancelled, timed out, failed) is audited via `kernel.tools.audit`.
+  `repo_health` (`kernel/tools/handlers/repo_health.py`, Milestone 34)
+  reports, for one registered repository: the current branch (or
+  `detached`), clean/dirty working tree (from `git status --porcelain`,
+  used only to decide clean-vs-dirty — filenames are never relayed), the
+  latest commit's short hash and a sanitized one-line, control-character-
+  stripped, whitespace-normalized, 120-character-capped subject, whether
+  `HEAD` matches the configured local main branch's tip commit exactly
+  (compared as SHAs, independent of which branch is checked out — a
+  feature branch pointing at the same commit as main still reports
+  `yes`), and whether the local main branch matches `origin`'s main branch
+  on GitHub: `up to date`, `differs`, `remote branch unavailable`
+  (reachable but no matching ref), or `GitHub unreachable` (timeout,
+  nonzero exit, or a protocol/transport the policy below rejects). The
+  configured repository path must resolve to the worktree's actual root
+  (`git rev-parse --show-toplevel`) — a path that is merely a
+  subdirectory of a larger worktree is rejected.
+
+  Every git subprocess this handler runs — local or remote — carries a
+  fixed argv prefix (`--no-optional-locks`, `--no-pager`,
+  `--no-replace-objects`, `-c core.fsmonitor=false`) and a sanitized
+  environment (`_sanitized_git_env()`): starts from a full copy of this
+  process's own environment (`PATH` and everything else ordinary stays
+  available), then strips (case-insensitively) `GIT_CONFIG_PARAMETERS`,
+  `GIT_CONFIG_COUNT`, every `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` pair,
+  `GIT_EXEC_PATH`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+  `SSH_ASKPASS`, every repository/ref/object/index-redirection variable
+  (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+  `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+  `GIT_NAMESPACE`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
+  `GIT_CEILING_DIRECTORIES`, `GIT_REPLACE_REF_BASE`), and every transport-
+  security/tracing/stdio-redirection variable (`GIT_SSL_NO_VERIFY`,
+  `GIT_CURL_VERBOSE`, every `GIT_TRACE*` variable, `GIT_REDIRECT_STDIN`,
+  `GIT_REDIRECT_STDOUT`, `GIT_REDIRECT_STDERR`), before setting
+  `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, and
+  `GIT_CONFIG_GLOBAL=os.devnull` for **every** call — no system- or
+  machine-global git config is ever consulted, though a local call still
+  reads the approved repository's own *local* config where needed (e.g.
+  reading `remote.origin.url`), since `GIT_CEILING_DIRECTORIES` is
+  stripped, not set, at this layer. All of this is supplied on the
+  command line / in the process environment rather than left to any
+  config file, so nothing in the target repository's own `.git/config` —
+  or an inherited environment variable — can remove or override it: the
+  argv flags above are global git options, not config keys, and a
+  command-line `-c` always wins over repo config in git's own resolution
+  order. `--no-replace-objects` means a repository-configured replace ref
+  can never substitute a different object for the one actually reported.
+
+  The one network call (`git ls-remote`) never targets the symbolic
+  remote name `origin`, and the origin is accepted only when it validates
+  as a credential-free `github.com` HTTPS repository URL: the
+  repository's local `remote.origin.url` is read with a local, read-only
+  `git config --local --no-includes --get-all -z` lookup — NUL-delimited
+  so every configured value is positively enumerated, sidestepping
+  `--get`'s inconsistent behavior on a multi-valued key — required to be
+  exactly one non-empty, properly NUL-terminated value, and strictly
+  parsed (`_parse_github_origin()`) — `https` scheme only, hostname
+  `github.com` only (case-insensitively), no embedded username/password,
+  no explicit port, no query string or fragment, no control characters or
+  malformed percent-encoding, and a path shaped exactly like
+  `/<owner>/<repo>` or `/<owner>/<repo>.git` with both components
+  conservatively character-allowlisted. Anything else — absent,
+  multi-valued, non-github, or malformed — reports `GitHub unreachable`
+  without ever attempting a network connection, and no raw or normalized
+  value is ever put in the reply or the audit log. Only the resulting
+  normalized `https://github.com/<owner>/<repo>.git` is ever passed to
+  `ls-remote`, as one fixed argv element.
+
+  That call additionally runs from `_neutral_cwd()` — the real system
+  temp directory, never the approved repository and never a directory
+  created for this purpose, and only after verifying (via a real,
+  unmocked `git rev-parse --is-inside-work-tree` probe) that it is not
+  itself inside any git worktree — with its own controlled
+  `GIT_CEILING_DIRECTORIES` pinned to that same directory (on top of the
+  system/global isolation every call already gets), so the call is
+  isolated from repository, global, *and* system git configuration:
+  nothing configured anywhere on this machine — a rewritten URL via
+  `url.*.insteadOf`, an injected `http.extraHeader`, a `credential.helper`,
+  a `http.proxy` — can reach or influence it, because git never discovers
+  the approved repository's `.git/config` for this subprocess in the
+  first place. It also pins `-c protocol.allow=never -c
+  protocol.https.allow=always` (rejecting file, ssh, git://, ext, and any
+  custom remote helper outright — no test-only exception exists in
+  production code), `-c credential.helper= -c core.askPass= -c
+  http.extraHeader= -c http.proxy=` (empty values, which git treats as
+  "use none of this"), `-c http.sslVerify=true` (so nothing inherited can
+  disable TLS certificate verification for this call), strips any
+  inherited `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (any case) from its
+  environment, and sets `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=Never` —
+  run with a
+  fixed timeout and full process-tree termination like every other git
+  call here.
+
+  No repository path, remote URL, credential, prompt, or raw git output
+  ever reaches the reply or the audit log; a malformed or unvalidated
+  branch name/commit hash from `git` causes the whole report to fail
+  closed (`"That repository is not available."`) rather than being
+  partially relayed — branch names are validated with
+  `kernel/tools/config.py`'s `is_valid_git_branch_name()` (shared, not
+  duplicated, with that module's own load-time validation of an
+  admin-supplied `main_branch`; modeled on `git check-ref-format`'s real
+  rules — rejects a leading `-`/`.`/`/`, a trailing `/`/`.`, any `..`,
+  `//`, `@{`, a bare `@`, or a `.`-leading/`.lock`-suffixed path
+  component, on top of a restrictive ASCII character allowlist).
   Covered by `tests/capabilities/tasks/` (command parser, confirmation
   flow, config-failure handling) and `tests/kernel/tools/` (every
-  kernel/tools/ module and handler), plus dedicated
-  `RequestContext`/authorization-gate tests in
+  kernel/tools/ module and handler). `repo_health`'s own tests run every
+  local git check — including the origin-URL read (via a real repository
+  configured with `remote.origin.url` set twice, proving the multi-value
+  case is positively detected and rejected end to end, not just via
+  mocked output) and the neutral-directory work-tree probe — against
+  real, temporary local repositories; the `ls-remote` network call itself
+  is always injected by monkeypatching (matching/differing/missing SHA,
+  malformed output, timeout, nonzero exit), since production only ever
+  permits https and the suite must never depend on — or attempt — a real
+  connection. Dedicated tests also configure a real repository's local
+  `url.*.insteadOf`, `http.extraHeader`, `http.proxy`, and
+  `credential.helper`, and set inherited `GIT_TRACE`/`GIT_TRACE_CURL`
+  variables pointing at marker files, asserting none of it ever reaches
+  the recorded `ls-remote` argv/cwd/env or creates the marker file, that
+  proxy environment variables are stripped for that call, and that a
+  non-github or unreachable origin still leaves the local portion of the
+  report intact. No test ever contacts GitHub or any real network
+  service. Plus dedicated `RequestContext`/authorization-gate tests in
   `tests/kernel/orchestrator/test_orchestrator.py`.
 
 Each capability is meant to be a self-contained domain expert that uses
@@ -933,6 +1069,47 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `/task ...` command grammar and only when
   `interfaces/whatsapp/handler.py`'s trusted context is present. See
   Kernel and Capabilities above for the full detail.
+- Milestone 34 — Safe Repository Health Checks: a fifth `kernel/tools/`
+  action, `repo_health` (read-only, not sensitive — no confirmation step),
+  reachable via the new `/task repo <key>` verb under the same
+  `RequestContext`/`ActionRegistry`/`SafeTaskExecutor`/audit machinery
+  Milestone 33 established, with no changes to `interfaces/whatsapp/` or
+  the orchestrator gate. Adds `kernel/tools/config.py`'s
+  `repo_health.approved_repositories` section (an absolute repository
+  path plus an optional `main_branch`, defaulting to `"main"` and
+  validated by the shared `is_valid_git_branch_name()`) and
+  `kernel/tools/process_control.py`'s `run_capturing_stdout()` — stdout
+  capture bounded via a background reader thread that discards anything
+  past the byte limit as it streams (never buffers unboundedly first),
+  with the same timeout/process-tree-kill guarantees as
+  `run_with_timeout()`, stderr always discarded. Every git subprocess the
+  handler runs carries a fixed safety prefix (including
+  `--no-replace-objects`) and a sanitized environment that strips
+  git-injection/credential-redirection variables, every repository/ref/
+  object/index-redirection variable (`GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_CEILING_DIRECTORIES`, `GIT_REPLACE_REF_BASE`, etc.), and every
+  transport-security/tracing/stdio-redirection variable
+  (`GIT_SSL_NO_VERIFY`, every `GIT_TRACE*`, `GIT_REDIRECT_STDOUT`/
+  `STDERR`, etc.) regardless of what this process inherited, and sets
+  `GIT_CONFIG_NOSYSTEM=1`/`GIT_CONFIG_GLOBAL=os.devnull` for every call.
+  The one network call (`git ls-remote`) never targets the symbolic
+  remote name `origin`: the repository's local `remote.origin.url` is
+  read via `git config --local --no-includes --get-all -z` (positively
+  rejecting a multi-valued key, not just relying on `--get`'s
+  inconsistent behavior), strictly validated as a bare, credential-free
+  `github.com` HTTPS repository URL, and normalized to
+  `https://github.com/<owner>/<repo>.git` — only that fixed, normalized
+  URL (never "origin", never anything read as-is) is ever passed to
+  `ls-remote`, from a neutral, verified-non-worktree directory (the real
+  system temp directory, never the approved repository) with its own
+  controlled `GIT_CEILING_DIRECTORIES` pinned there, so the call is fully
+  isolated from repository, global, and system git configuration — no
+  `url.*.insteadOf` rewrite, injected `http.extraHeader`, `http.proxy`,
+  or `credential.helper` configured anywhere on this machine can reach or
+  influence it — with `protocol.allow=never` and only `https` re-allowed,
+  `http.sslVerify=true` forced, credential helpers/askpass disabled on
+  the command line, and any inherited proxy environment variable
+  stripped. See Kernel and Capabilities above for the full detail.
 
 **Planned / not yet implemented:**
 

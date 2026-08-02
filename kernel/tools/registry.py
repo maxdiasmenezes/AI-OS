@@ -1,18 +1,25 @@
 """
 ActionRegistry: the fixed allowlist of computer actions kernel/tools will
-ever execute. This list of four action names is not user- or
+ever execute. This list of five action names is not user- or
 machine-configurable - only which *resources* (directories, applications,
-scripts) each action may touch is configurable, via
+scripts, repositories) each action may touch is configurable, via
 kernel/config/tools.yaml (see kernel/tools/config.py). Nothing outside
-these four names is reachable through kernel/tools, no matter what a
+these five names is reachable through kernel/tools, no matter what a
 caller asks for.
 """
 
-from kernel.tools.handlers import list_files, open_application, run_registered_script, system_status
+from kernel.tools.handlers import (
+    list_files,
+    open_application,
+    repo_health,
+    run_registered_script,
+    system_status,
+)
 
 # Sensitive actions require an explicit confirmation step (see
 # kernel/tools/confirmation.py and capabilities/tasks/capability.py) before
-# they run. Read-only/informational actions do not.
+# they run. Read-only/informational actions do not - repo_health is
+# read-only (Milestone 34) and is deliberately not in this set.
 _SENSITIVE_ACTIONS = frozenset({"open_application", "run_registered_script"})
 
 _HANDLERS = {
@@ -20,6 +27,7 @@ _HANDLERS = {
     "list_files": list_files.run,
     "open_application": open_application.run,
     "run_registered_script": run_registered_script.run,
+    "repo_health": repo_health.run,
 }
 
 

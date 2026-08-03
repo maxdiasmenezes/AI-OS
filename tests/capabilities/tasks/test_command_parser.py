@@ -38,6 +38,7 @@ def test_bare_task_prefix_is_help():
         ("/task open notepad", "open_application"),
         ("/task run backup", "run_registered_script"),
         ("/task repo ai_os", "repo_health"),
+        ("/task backup ai_os", "repository_backup"),
     ],
 )
 def test_recognized_one_argument_forms(prompt, expected_action):
@@ -52,6 +53,12 @@ def test_resource_key_is_casefolded():
     result = parse_task_command("/task open Notepad")
 
     assert result.resource_key == "notepad"
+
+
+def test_backup_resource_key_is_casefolded():
+    result = parse_task_command("/task backup AI_OS")
+
+    assert result.resource_key == "ai_os"
 
 
 @pytest.mark.parametrize(
@@ -80,9 +87,13 @@ def test_prompts_that_are_not_task_commands_return_a_parse_error_reason(prompt):
         "/task open",
         "/task run",
         "/task repo",
+        "/task backup",
         "/task files documents extra",
         "/task open notepad extra",
         "/task repo ai_os extra",
+        "/task backup ai_os extra",
+        "/task backup ai_os --force",
+        "/task backup ai_os /tmp/somewhere",
     ],
 )
 def test_wrong_argument_count_is_rejected(prompt):

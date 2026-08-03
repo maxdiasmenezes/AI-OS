@@ -48,9 +48,9 @@ to the kernel.
   wine profile and a read-only personal wine cellar inventory, and into its
   Deterministic Cellar Lookup v1 for the same read-only cellar inventory.
   kernel/tools: implemented (Milestone 33; repo_health added in
-  Milestone 34) - the safe computer task execution layer (allowlist-only
-  actions, timeouts, confirmation, audit), consumed by
-  capabilities/tasks/TasksCapability.
+  Milestone 34; repository_backup added in Milestone 35) - the safe
+  computer task execution layer (allowlist-only actions, timeouts,
+  confirmation, audit), consumed by capabilities/tasks/TasksCapability.
 ```
 
 ## Layers
@@ -336,18 +336,26 @@ tests for Content-Length edge cases `urllib` cannot express.
   verified as the active path.
 - **tools** — reusable tools (actions, integrations, lookups) that
   capabilities could invoke. Implemented (Milestone 33; extended in
-  Milestone 34): the safe computer task execution layer, transport-agnostic
-  and consumed today only by `capabilities/tasks/TasksCapability` — see
-  Capabilities below for the full command surface. `kernel/tools/types.py`
-  defines `ActionRequest` (an action name plus an optional symbolic
-  `resource_key` — never a raw path or argument list) and `ActionResult`.
-  `kernel/tools/registry.py`'s `ActionRegistry` is the fixed,
-  non-configurable allowlist of exactly five actions (`system_status`,
-  `list_files`, `open_application`, `run_registered_script`,
-  `repo_health`) and which two of them are sensitive (`open_application`,
-  `run_registered_script`) — `repo_health` is read-only and, like
-  `system_status`/`list_files`, is not sensitive; no sixth action is ever
-  reachable, no matter what a caller asks for.
+  Milestone 34; extended again in Milestone 35): the safe computer task
+  execution layer, transport-agnostic and consumed today only by
+  `capabilities/tasks/TasksCapability` — see Capabilities below for the
+  full command surface. `kernel/tools/types.py` defines `ActionRequest`
+  (an action name plus an optional symbolic `resource_key` — never a raw
+  path or argument list) and `ActionResult`. `kernel/tools/registry.py`'s
+  `ActionRegistry` is the fixed, non-configurable allowlist of exactly
+  six actions (`system_status`, `list_files`, `open_application`,
+  `run_registered_script`, `repo_health`, `repository_backup`) and which
+  three of them are sensitive (`open_application`, `run_registered_script`,
+  `repository_backup`) — `repo_health` is read-only and, like
+  `system_status`/`list_files`, is not sensitive; `repository_backup`
+  writes a file, so it is sensitive; no seventh action is ever reachable,
+  no matter what a caller asks for. `kernel/tools/git_safety.py`
+  (Milestone 35) holds the local git-execution hardening shared by
+  `repo_health.py` and `repository_backup.py` — `GIT_SAFE_PREFIX` and
+  `sanitized_git_env()`, extracted out of `repo_health.py` (which
+  originally defined them) so the two handlers cannot silently drift
+  apart; `repo_health.py` re-exports both under its original private
+  names for backward compatibility with its own existing tests.
   `kernel/tools/config.py`'s `load_tools_config()` reads the *machine-local,
   gitignored* `kernel/config/tools.yaml` (copied from the committed
   `kernel/config/tools.example.yaml` placeholder) — the only place real
@@ -398,28 +406,62 @@ tests for Content-Length edge cases `urllib` cannot express.
   `run_registered_script`) waits up to a per-script configured timeout
   and, on expiry, kills the *entire* process tree via `psutil` (every
   descendant the process spawned, not just the immediate child) before
-  reporting a `timed_out` result; `run_capturing_stdout()` (used only by
-  `repo_health`, Milestone 34) additionally captures the child's stdout —
+  reporting a `timed_out` result; `run_capturing_stdout()` (used by
+  `repo_health`, Milestone 34, and by two of `repository_backup`'s three
+  git calls, Milestone 35) additionally captures the child's stdout —
   never stderr — through a dedicated background reader thread that drains
   the pipe continuously and discards anything past a caller-supplied byte
   bound as it streams, so neither a chatty child nor one producing
   megabytes of output can either block on a full pipe buffer or balloon
   this process's memory; on timeout it kills the full process tree the
   same way, then deterministically joins the reader thread and closes the
-  pipe before returning. The five handlers under `kernel/tools/handlers/`
-  each implement exactly one action: `system_status.py` reads no
-  configuration at all (CPU/memory via `psutil`, disk via
-  `shutil.disk_usage`, uptime from `psutil.boot_time()`, and short,
-  hardcoded-timeout HTTP reachability checks against a local Ollama and a
-  local ngrok API); `list_files.py` accepts only a registered symbolic
-  directory key, canonicalizes the configured root once, lists its
-  immediate (non-recursive) contents capped at 100 entries, and
-  independently re-resolves every entry to exclude anything a symlink,
-  junction, or other reparse point would make appear to live outside that
-  canonical root; `open_application.py` and `run_registered_script.py`
-  accept only a registered symbolic key — never a sender-supplied path,
-  executable, working directory, or (for scripts) argument of any kind;
-  `repo_health.py` — see Capabilities below for its full behavior.
+  pipe before returning. `run_streaming_stdout_to_file()` (Milestone 35,
+  used only by `repository_backup`'s bundle-creation call) instead
+  connects the child's stdout *directly* to an already-open, caller-owned
+  binary file object via `subprocess.Popen(..., stdout=output_file)` —
+  the payload is never read into this process at all, unlike
+  `run_capturing_stdout()`'s deliberately bounded in-memory capture; it
+  never writes to or closes that file object itself (the caller retains
+  full ownership — flushing, `fsync`, closing), enforces the same hard
+  timeout and full-process-tree kill on expiry, and returns only
+  success/timed_out/returncode, since there is no stdout to hand back by
+  design.
+
+  All three timeout branches (`run_with_timeout()`, `run_capturing_stdout()`,
+  `run_streaming_stdout_to_file()`) share one private helper,
+  `_terminate_and_reap()` (Milestone 35 correctness fix), which never
+  returns while the process is still alive: it calls `_kill_process_tree()`
+  (unchanged), then does a second, bounded `proc.wait()` through the
+  `subprocess` module itself (not just `psutil`) so `proc.returncode` is
+  actually set; if the process is still alive after that, it calls
+  `proc.kill()` directly as an independent fallback — tolerating
+  `ProcessLookupError`/`OSError` only when the process has, by that point,
+  already exited, never silently swallowing a real failure — followed by
+  an unbounded `proc.wait()` that blocks until the process is actually
+  reaped; finally it re-checks every descendant `_kill_process_tree()`
+  found via `psutil`, killing and waiting for any straggler still
+  reported as running. This replaced an earlier version of all three
+  functions' timeout branches that could return `timed_out=True` after
+  only a single best-effort kill-and-5-second-wait, silently swallowing a
+  second `TimeoutExpired` and returning regardless — a real risk for
+  `run_streaming_stdout_to_file()` specifically, since a still-alive child
+  could keep writing to the caller-owned partial-bundle file after the
+  helper claimed the timeout was handled. The six handlers under
+  `kernel/tools/handlers/` each implement
+  exactly one action: `system_status.py` reads no configuration at all
+  (CPU/memory via `psutil`, disk via `shutil.disk_usage`, uptime from
+  `psutil.boot_time()`, and short, hardcoded-timeout HTTP reachability
+  checks against a local Ollama and a local ngrok API); `list_files.py`
+  accepts only a registered symbolic directory key, canonicalizes the
+  configured root once, lists its immediate (non-recursive) contents
+  capped at 100 entries, and independently re-resolves every entry to
+  exclude anything a symlink, junction, or other reparse point would make
+  appear to live outside that canonical root; `open_application.py` and
+  `run_registered_script.py` accept only a registered symbolic key —
+  never a sender-supplied path, executable, working directory, or (for
+  scripts) argument of any kind; `repo_health.py` and
+  `repository_backup.py` — see Capabilities below for their full
+  behavior.
 - **config** — settings that govern how the kernel and its components
   behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
   (active provider, provider settings, memory, knowledge, and log locations),
@@ -591,8 +633,8 @@ know what wine, travel, or strategy mean.
   (`tests/capabilities/wine/test_capability.py`) and one end-to-end
   orchestrator test (`tests/kernel/orchestrator/test_orchestrator.py`).
 
-**tasks** (Milestone 33; `repo` verb added in Milestone 34) is the second
-implemented capability —
+**tasks** (Milestone 33; `repo` verb added in Milestone 34; `backup` verb
+added in Milestone 35) is the second implemented capability —
 `capabilities/tasks/TasksCapability` — a small, explicitly allowlisted set
 of computer actions on this machine, reached only through a strict
 `/task ...` command grammar, never natural language and never a model
@@ -608,17 +650,21 @@ recall, no knowledge-store access, ever.
   gate completely, and knows nothing about phone numbers or any other
   interface-specific check.
 - **Command grammar** (`capabilities/tasks/command_parser.py`) — exactly
-  eight literal forms, matched case-insensitively on `/task` and the verb:
+  nine literal forms, matched case-insensitively on `/task` and the verb:
   `/task status`, `/task files <key>`, `/task open <key>`,
-  `/task run <key>`, `/task repo <key>`, `/task confirm`, `/task cancel`,
-  `/task help`. Any extra token, missing token, or unrecognized verb is a
-  `ParseError` with a stable, symbolic reason — never guessed at, never
-  partially honored. `<key>` is a registered symbolic name resolved
-  through `kernel/config/tools.yaml`, never a path.
-- **Confirmation.** `open_application` and `run_registered_script` are
-  sensitive (per `kernel/tools/registry.py`): the first matching command
-  only calls `ConfirmationStore.propose()` and replies with a prompt to
-  confirm — nothing executes yet. `/task confirm` within 2 minutes calls
+  `/task run <key>`, `/task repo <key>`, `/task backup <key>`,
+  `/task confirm`, `/task cancel`, `/task help`. Any extra token, missing
+  token, or unrecognized verb is a `ParseError` with a stable, symbolic
+  reason — never guessed at, never partially honored. `<key>` is a
+  registered symbolic name resolved through `kernel/config/tools.yaml`,
+  never a path — `/task backup <key>` accepts only the symbolic
+  repository key, never a path, filename, git ref, option, or
+  destination.
+- **Confirmation.** `open_application`, `run_registered_script`, and
+  `repository_backup` (Milestone 35) are sensitive (per
+  `kernel/tools/registry.py`): the first matching command only calls
+  `ConfirmationStore.propose()` and replies with a prompt to confirm —
+  nothing executes yet. `/task confirm` within 2 minutes calls
   `consume()` and, if something unexpired was pending, executes it exactly
   once; `/task cancel` clears it explicitly; letting it sit past 2 minutes
   reports as expired on the next `/task confirm`. `system_status`,
@@ -759,6 +805,146 @@ recall, no knowledge-store access, ever.
   report intact. No test ever contacts GitHub or any real network
   service. Plus dedicated `RequestContext`/authorization-gate tests in
   `tests/kernel/orchestrator/test_orchestrator.py`.
+
+  `repository_backup` (`kernel/tools/handlers/repository_backup.py`,
+  Milestone 35) creates a verified, local-only Git bundle of one
+  registered repository's committed history in a preapproved local
+  destination directory — `/task backup <key>` accepts only the symbolic
+  repository key, sensitive like `open_application`/`run_registered_script`
+  above, so it is proposed and requires `/task confirm` before anything is
+  written. The repository path is looked up through the same
+  `repo_health.approved_repositories` entry `repo_health` uses — never
+  duplicated — while the destination directory comes from a new
+  `repository_backup.approved_backups[<key>].destination_directory`
+  section in `kernel/config/tools.yaml`, whose key must already exist as a
+  `repo_health.approved_repositories` key (cross-validated at config-load
+  time — `kernel/tools/config.py`'s `_parse_repository_backup()`) and must
+  additionally be filename-safe (`is_valid_backup_key()`: lowercase ASCII
+  letters/digits/`_`/`-` only, starting with a letter or digit, at most 64
+  characters — the key is used directly inside the generated backup
+  filename). At request time the handler independently canonicalizes both
+  the repository and destination paths (`Path.resolve(strict=True)`),
+  requires both to be existing directories, re-verifies the repository
+  path is the worktree's actual root (the same `rev-parse
+  --is-inside-work-tree` / `--show-toplevel` check `repo_health` performs),
+  and rejects the destination being inside the repository, the repository
+  being inside the destination, or the two being equal — comparing only
+  canonical (symlink/junction-resolved) paths throughout, so a reparse
+  point can never make either check pass falsely. Every git call this
+  handler makes is local-only — no fetch, pull, push, checkout, reset,
+  merge, commit, clone, remote, or network access of any kind — and reuses
+  `kernel/tools/git_safety.py`'s `GIT_SAFE_PREFIX` and
+  `sanitized_git_env()` (see kernel/tools above), extracted from
+  `repo_health.py` in this milestone specifically so the two handlers
+  share one hardening implementation rather than two that could drift
+  apart.
+
+  Ref-inclusion policy: `git bundle create - HEAD --branches --tags`.
+  Included: the current `HEAD` (so a detached-`HEAD` checkout is still
+  captured), every local branch (`refs/heads/*`), every tag
+  (`refs/tags/*`), and every committed object those refs require.
+  Excluded: `refs/remotes/*`, `refs/stash`, `refs/notes/*`,
+  `refs/replace/*` (also neutralized globally by `--no-replace-objects`),
+  any other custom ref, and — because a bundle can only ever contain
+  committed objects reachable from the refs it records — every current
+  uncommitted, untracked, and ignored file. A file that is untracked or
+  gitignored *right now* is absent for that reason; a file that was ever
+  actually committed to selected history is not additionally filtered by
+  filename — the handler inspects refs, never filenames, and the
+  user-facing reply is worded to reflect this precisely rather than
+  overclaiming.
+
+  The bundle is created by streaming, never buffering: `git bundle create
+  -` writes the complete bundle to *stdout*, which
+  `kernel/tools/process_control.py`'s new `run_streaming_stdout_to_file()`
+  connects directly to an already-open file descriptor this handler
+  creates with `os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+  os.O_BINARY, 0o600)` inside the canonical destination directory —
+  exclusive creation closes the time-of-check/time-of-use window a
+  generate-then-reopen sequence would leave open, since the path cannot
+  have been written to, replaced, or symlinked before this process's own
+  call atomically created it, and the bundle payload is never held in
+  this process's memory regardless of size. The `0o600` mode is enforced
+  directly by the OS on POSIX (owner read/write only); on Windows,
+  `os.open()`'s mode argument has no POSIX-permission-bit equivalent and
+  only affects the read-only attribute bit — actual access control comes
+  entirely from NTFS ACLs inherited from the destination directory, which
+  this handler never reads, sets, or otherwise modifies. Restricting who
+  can read the configured backup destination on Windows is a
+  machine-configuration concern outside this milestone. The generated
+  temporary name is `.{key}-{UTC timestamp}-{16-hex-character
+  secrets.token_hex(8) suffix}.partial`; the eventual final name shares
+  the exact same timestamp and suffix,
+  `{key}-{same timestamp}-{same suffix}.bundle` — a name collision on
+  creation retries with an entirely fresh timestamp and
+  suffix, bounded, never reusing a collided one. Immediately after bundle
+  creation completes, the handler records the partial file's `(st_dev,
+  st_ino, st_size)` identity via `os.stat(path, follow_symlinks=False)`,
+  requiring a regular file (never a symlink, junction/reparse point,
+  directory, or other special file) with a hard-link count of 1 directly
+  inside the canonical destination — then re-confirms that exact identity
+  is unchanged after `git bundle verify`, after streaming SHA-256/size
+  hashing (bounded chunked reads, the complete file never loaded into
+  memory at once), and immediately before finalization; any mismatch at
+  any checkpoint fails the whole operation closed. Finalization
+  (`kernel/tools/atomic_finalize.py`'s `atomic_finalize_no_replace()`)
+  never uses `os.replace()` and never relies on an informal "rename
+  doesn't overwrite" assumption: on Windows it uses `os.rename()`, whose
+  documented behavior is to raise `FileExistsError` if the destination
+  already exists; elsewhere it uses an atomic hard-link-to-final followed
+  by unlinking the source, the standard POSIX no-clobber-rename idiom. An
+  existing `.bundle` is never deleted, truncated, or overwritten under any
+  failure mode — including a final-name collision itself: rather than
+  regenerating a fresh suffix and retrying bundle creation, a collision at
+  finalization fails the whole attempt closed with the same generic
+  creation-failure reply as any other creation failure (never a dedicated
+  "already exists" message that might hint at the destination's
+  contents), removes only the current execution's own partial file, and
+  never touches the pre-existing final file it collided with — confirmed
+  end to end by `test_existing_completed_bundle_is_never_overwritten`
+  (`tests/kernel/tools/handlers/test_repository_backup.py`), which proves
+  the original bundle's bytes are unchanged after a forced collision.
+  Complex collision recovery (regenerating a new suffix and re-running
+  bundle creation) is deliberately out of scope. Every failure path
+  (registration, availability, creation, verification, hashing,
+  finalization, or timeout) removes only the one
+  temporary file this specific execution created — never a glob, never
+  another file in the destination, and never an existing completed
+  backup — and returns one of a small set of fixed, generic replies
+  containing no path, filename beyond the generated one, git output,
+  stderr, or traceback. On success, the reply names only the generated
+  filename, size, and SHA-256 digest — never the absolute destination
+  path:
+
+  ```
+  Repository backup created.
+  Repository: ai_os
+  File: ai_os-20260802T233800Z-a1b2c3d4e5f60718.bundle
+  Size: 12.4 MB
+  SHA-256: <64 lowercase hexadecimal characters>
+  Included: committed HEAD, local branches, tags, and required Git history
+  Not included: current uncommitted, untracked, or ignored files
+  ```
+
+  Restore, deletion, retention cleanup, cloud upload, encryption,
+  scheduling, and automatic backup rotation are all out of scope for this
+  milestone. Covered by `tests/kernel/tools/test_git_safety.py`,
+  `tests/kernel/tools/test_atomic_finalize.py`, the
+  `run_streaming_stdout_to_file()` additions in
+  `tests/kernel/tools/test_process_control.py`, and
+  `tests/kernel/tools/handlers/test_repository_backup.py` — the last runs
+  real, temporary local git repositories and destination directories
+  throughout (a committed `.env` proves the bundle is history-based, not
+  filename-filtered; an untracked `.env`, an ignored would-be
+  `tools.yaml`, and a real `git bundle list-heads` check that
+  `refs/remotes/*`/`refs/stash`/`refs/notes/*`/custom refs are never
+  advertised), never touches the real `kernel/config/tools.yaml` or a real
+  backup destination, and includes an explicit proof that `git bundle
+  create -` produces a valid bundle on the installed git version before
+  the handler relies on that form. `tests/capabilities/tasks/` covers
+  `/task backup <key>` proposing rather than executing immediately,
+  `/task confirm` executing it exactly once, `/task cancel` and
+  confirmation expiry both preventing execution.
 
 Each capability is meant to be a self-contained domain expert that uses
 kernel services (memory, knowledge, tools, models) to do its job. Capabilities

@@ -1,6 +1,7 @@
 # Example configuration for kernel/tools/ (Milestone 33: Safe Computer Task
 # Execution; repo_health added in Milestone 34: Safe Repository Health
-# Checks). Copy this file to kernel/config/tools.yaml and replace every
+# Checks; repository_backup added in Milestone 35: Safe Repository
+# Backups). Copy this file to kernel/config/tools.yaml and replace every
 # placeholder with real, absolute paths for this machine.
 #
 # kernel/config/tools.yaml is gitignored - it holds real local filesystem
@@ -26,6 +27,16 @@
 #     than `git rev-parse --show-toplevel`'s own answer.
 #   - repo_health.approved_repositories[*].main_branch is optional and
 #     defaults to "main"; if given, it must be a valid git branch name.
+#   - repository_backup.approved_backups[*] keys must already exist as a
+#     repo_health.approved_repositories key - the repository path is
+#     never duplicated here, only looked up by the same key.
+#   - repository_backup.approved_backups[*].destination_directory must be
+#     an absolute, pre-existing directory - never inside the repository
+#     it backs up, and never itself containing that repository.
+#   - Every repository_backup.approved_backups key must additionally be
+#     filename-safe: lowercase ASCII letters, digits, "_", and "-" only,
+#     starting with a letter or digit, at most 64 characters - it is used
+#     directly inside the generated backup filename.
 
 list_files:
   approved_directories:
@@ -51,3 +62,8 @@ repo_health:
     ai_os:
       path: "C:/REPLACE_ME/AI-OS"
       main_branch: "main"
+
+repository_backup:
+  approved_backups:
+    ai_os:
+      destination_directory: "D:/REPLACE_ME/AI-OS-Backups"

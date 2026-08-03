@@ -3,7 +3,7 @@
 import subprocess
 import sys
 
-from kernel.tools.config import ApplicationSpec, RepoSpec, ToolsConfig, ToolsConfigError
+from kernel.tools.config import ApplicationSpec, RepoBackupSpec, RepoSpec, ToolsConfig, ToolsConfigError
 from kernel.tools.confirmation import ConfirmationStore
 
 from capabilities.tasks.capability import (
@@ -217,6 +217,104 @@ def test_invalid_tools_config_produces_a_safe_generic_error_for_resource_actions
 
     assert response == "The task system is temporarily unavailable."
     assert "malformed" not in response
+
+
+def _backup_config(repo_path, dest_path):
+    return ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={"ai_os": RepoSpec(path=str(repo_path), main_branch="main")},
+        approved_backups={"ai_os": RepoBackupSpec(destination_directory=str(dest_path))},
+    )
+
+
+def test_backup_with_unregistered_key_is_rejected_on_confirm():
+    # repository_backup is sensitive, so - exactly like open_application -
+    # the propose step never validates the resource key; only executing
+    # the confirmed action does.
+    capability, _ = _make_capability(tools_config=ToolsConfig({}, {}, {}, {}, {}))
+
+    capability.handle("/task backup ai_os")
+    response = capability.handle("/task confirm")
+
+    assert "not registered" in response.lower()
+
+
+def test_backup_is_proposed_not_executed_immediately(tmp_path):
+    repo_path = _init_repo(tmp_path / "repo")
+    dest_path = tmp_path / "dest"
+    dest_path.mkdir()
+    config = _backup_config(repo_path, dest_path)
+    capability, store = _make_capability(tools_config=config)
+
+    response = capability.handle("/task backup ai_os")
+
+    assert "confirm" in response.lower()
+    pending, expired = store.consume()
+    assert expired is False
+    assert pending.action == "repository_backup"
+    assert pending.resource_key == "ai_os"
+    # Nothing was actually written yet.
+    assert list(dest_path.iterdir()) == []
+
+
+def test_backup_confirm_executes_the_pending_action_exactly_once(tmp_path):
+    repo_path = _init_repo(tmp_path / "repo")
+    dest_path = tmp_path / "dest"
+    dest_path.mkdir()
+    config = _backup_config(repo_path, dest_path)
+    capability, store = _make_capability(tools_config=config)
+
+    propose_response = capability.handle("/task backup ai_os")
+    assert "backup created" not in propose_response.lower()
+
+    confirm_response = capability.handle("/task confirm")
+    assert "backup created" in confirm_response.lower()
+    assert "ai_os" in confirm_response
+
+    created_files = list(dest_path.iterdir())
+    assert len(created_files) == 1
+    assert created_files[0].name.endswith(".bundle")
+
+    # A second confirm has nothing left to consume - proves the
+    # confirmation cannot be replayed, and no second bundle is written.
+    second_confirm_response = capability.handle("/task confirm")
+    assert "no pending action" in second_confirm_response.lower()
+    assert len(list(dest_path.iterdir())) == 1
+
+
+def test_backup_cancel_clears_pending_action(tmp_path):
+    repo_path = _init_repo(tmp_path / "repo")
+    dest_path = tmp_path / "dest"
+    dest_path.mkdir()
+    config = _backup_config(repo_path, dest_path)
+    capability, store = _make_capability(tools_config=config)
+
+    capability.handle("/task backup ai_os")
+    cancel_response = capability.handle("/task cancel")
+
+    assert "cancelled" in cancel_response.lower()
+    confirm_response = capability.handle("/task confirm")
+    assert "no pending action" in confirm_response.lower()
+    assert list(dest_path.iterdir()) == []
+
+
+def test_backup_confirm_with_expired_confirmation_says_expired_and_does_not_execute(tmp_path):
+    repo_path = _init_repo(tmp_path / "repo")
+    dest_path = tmp_path / "dest"
+    dest_path.mkdir()
+    config = _backup_config(repo_path, dest_path)
+    capability, store = _make_capability(tools_config=config, ttl_seconds=0.01)
+
+    capability.handle("/task backup ai_os")
+    import time
+
+    time.sleep(0.05)
+    response = capability.handle("/task confirm")
+
+    assert "expired" in response.lower()
+    assert list(dest_path.iterdir()) == []
 
 
 def test_status_is_unaffected_by_an_invalid_tools_config(deterministic_system_status):

@@ -148,6 +148,7 @@ def _make_handler_class(
 
         def do_POST(self) -> None:
             if urllib.parse.urlparse(self.path).path != _WEBHOOK_PATH:
+                self._drain_request_body()
                 self._respond_empty(404)
                 return
 
@@ -239,8 +240,58 @@ def _make_handler_class(
             self._handle_unsupported_method()
 
         def _handle_unsupported_method(self) -> None:
+            self._drain_request_body()
             parsed_path = urllib.parse.urlparse(self.path).path
             self._respond_empty(405 if parsed_path == _WEBHOOK_PATH else 404)
+
+        def _drain_request_body(self) -> None:
+            """Reads and discards any request body the client already
+            declared via Content-Length, bounded to max_body_bytes, before
+            this handler responds and the connection is torn down.
+
+            Every response path here that has already read the declared
+            body (successfully or not) is unaffected by this; this exists
+            for the early-return paths that respond without ever touching
+            the body at all (a POST/PUT/DELETE/PATCH to the wrong path, or
+            an unsupported method on /webhook). Leaving a body the client
+            already sent unread when the connection subsequently closes
+            has a real, reproducible failure mode: TCP sends a RST instead
+            of a clean FIN once a socket is closed with unread bytes still
+            sitting in its receive buffer, which the client observes as
+            ConnectionAbortedError/ConnectionResetError rather than
+            receiving the response that was actually sent - the race is
+            timing-dependent (worse under scheduler/thread contention),
+            not merely a test artifact, so this is a real production
+            correctness fix, not test-only cleanup.
+
+            Deliberately bounded to max_body_bytes (matching the size cap
+            already enforced for a normal /webhook POST) rather than
+            draining an arbitrary declared length - never reads more than
+            that regardless of what Content-Length claims, so this cannot
+            be used to force a large read. This is separate from, and does
+            not change, the deliberate choice in do_POST() to never read
+            an oversized declared body before responding 413 - that
+            early-reject-on-the-declared-length-alone behavior stays
+            exactly as it was.
+
+            Best effort only: a missing, non-integer, or non-positive
+            Content-Length, or any read error, is never allowed to prevent
+            the response that follows.
+            """
+
+            content_length_header = self.headers.get("Content-Length")
+            if content_length_header is None:
+                return
+            try:
+                content_length = int(content_length_header)
+            except ValueError:
+                return
+            if content_length <= 0:
+                return
+            try:
+                self.rfile.read(min(content_length, max_body_bytes))
+            except OSError:
+                pass
 
         def send_error(self, code, message=None, explain=None) -> None:
             # Never let http.server's default error page - which reflects

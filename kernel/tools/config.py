@@ -39,16 +39,20 @@ _TOP_LEVEL_KEYS = {
     "open_application",
     "run_registered_script",
     "repo_health",
+    "repository_backup",
 }
 _LIST_FILES_KEYS = {"approved_directories"}
 _OPEN_APPLICATION_KEYS = {"approved_applications"}
 _RUN_SCRIPT_KEYS = {"approved_scripts"}
 _REPO_HEALTH_KEYS = {"approved_repositories"}
+_REPOSITORY_BACKUP_KEYS = {"approved_backups"}
 _APPLICATION_FIELDS = {"executable", "cwd"}
 _SCRIPT_REQUIRED_FIELDS = {"interpreter", "script_path", "cwd"}
 _SCRIPT_ALL_FIELDS = _SCRIPT_REQUIRED_FIELDS | {"timeout_seconds"}
 _REPO_REQUIRED_FIELDS = {"path"}
 _REPO_ALL_FIELDS = _REPO_REQUIRED_FIELDS | {"main_branch"}
+_BACKUP_REQUIRED_FIELDS = {"destination_directory"}
+_BACKUP_ALL_FIELDS = _BACKUP_REQUIRED_FIELDS
 
 # A restrictive ASCII character allowlist alone is not enough: strings
 # made entirely of allowed characters can still form ref names with
@@ -63,6 +67,18 @@ _REPO_ALL_FIELDS = _REPO_REQUIRED_FIELDS | {"main_branch"}
 # the rule set below is too easy to accidentally let drift if hand-copied
 # in two places.
 _GIT_REF_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+# A repository_backup key is used verbatim (already casefolded) inside a
+# generated filename (see kernel/tools/handlers/repository_backup.py) -
+# never sender-supplied text, but still conservatively restricted so a
+# configured key can never itself become a path-separator, a leading-dot
+# hidden-file marker, or any other filename-special sequence. Deliberately
+# a plain ASCII lowercase/digit/underscore/hyphen allowlist with a first-
+# character restriction (no leading "-" or "_", which some tools would
+# otherwise misparse as an option or a hidden file) and a fixed length
+# bound - not an attempt to allow every technically-legal filename
+# character.
+_BACKUP_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def is_valid_git_branch_name(value) -> bool:
@@ -89,6 +105,19 @@ def is_valid_git_branch_name(value) -> bool:
         if component.startswith(".") or component.endswith(".lock"):
             return False
     return True
+
+
+def is_valid_backup_key(value) -> bool:
+    """True only for a key safe to embed directly in a generated backup
+    filename (see kernel/tools/handlers/repository_backup.py) - a
+    conservative ASCII lowercase/digit/underscore/hyphen allowlist, at
+    most 64 characters, that can never start with "-" or "_". Shared
+    (not duplicated) between this module's load-time validation of every
+    repository_backup.approved_backups key and repository_backup.py's own
+    redundant runtime re-check - the same defense-in-depth pattern
+    is_valid_git_branch_name() documents above."""
+
+    return isinstance(value, str) and bool(_BACKUP_KEY_RE.match(value))
 
 
 class ToolsConfigError(ValueError):
@@ -118,11 +147,22 @@ class RepoSpec:
 
 
 @dataclass(frozen=True)
+class RepoBackupSpec:
+    """destination_directory only - the repository path itself is never
+    duplicated here. repository_backup.py looks it up via the same key in
+    ToolsConfig.approved_repositories (RepoSpec.path), which
+    _parse_repository_backup() below has already confirmed exists."""
+
+    destination_directory: str
+
+
+@dataclass(frozen=True)
 class ToolsConfig:
     approved_directories: dict
     approved_applications: dict
     approved_scripts: dict
     approved_repositories: dict = field(default_factory=dict)
+    approved_backups: dict = field(default_factory=dict)
 
 
 EMPTY_TOOLS_CONFIG = ToolsConfig(
@@ -130,6 +170,7 @@ EMPTY_TOOLS_CONFIG = ToolsConfig(
     approved_applications={},
     approved_scripts={},
     approved_repositories={},
+    approved_backups={},
 )
 
 
@@ -307,6 +348,46 @@ def _parse_repo_health(section) -> dict:
     return result
 
 
+def _parse_repository_backup(section, known_repo_keys: set) -> dict:
+    if not isinstance(section, dict):
+        raise ToolsConfigError("repository_backup must be a mapping")
+    _reject_unknown_fields(set(section), _REPOSITORY_BACKUP_KEYS, "repository_backup")
+
+    backups = section.get("approved_backups", {})
+    if not isinstance(backups, dict):
+        raise ToolsConfigError("repository_backup.approved_backups must be a mapping")
+
+    result = {}
+    seen: dict = {}
+    for raw_key, spec in backups.items():
+        key = _casefolded_unique_key(raw_key, seen, "repository_backup.approved_backups")
+        if not is_valid_backup_key(key):
+            raise ToolsConfigError(
+                f"repository_backup.approved_backups key is not filename-safe: {raw_key!r}"
+            )
+        if key not in known_repo_keys:
+            raise ToolsConfigError(
+                f"repository_backup.approved_backups[{raw_key!r}] has no matching "
+                "repo_health.approved_repositories entry"
+            )
+        if not isinstance(spec, dict):
+            raise ToolsConfigError(
+                f"repository_backup.approved_backups[{raw_key!r}] must be a mapping"
+            )
+        context = f"repository_backup.approved_backups[{raw_key!r}]"
+        _reject_unknown_fields(set(spec), _BACKUP_ALL_FIELDS, context)
+        missing = _BACKUP_REQUIRED_FIELDS - set(spec)
+        if missing:
+            raise ToolsConfigError(f"{context} missing required field(s): {sorted(missing)}")
+
+        result[key] = RepoBackupSpec(
+            destination_directory=_require_absolute_path(
+                spec["destination_directory"], f"{context}.destination_directory"
+            ),
+        )
+    return result
+
+
 def load_tools_config(path: Path | None = None) -> ToolsConfig:
     """Load and validate local machine tool configuration. See module
     docstring for the fail-closed rules."""
@@ -332,6 +413,10 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
 
     _reject_unknown_fields(set(data), _TOP_LEVEL_KEYS, "tools configuration")
 
+    approved_repositories = (
+        _parse_repo_health(data["repo_health"]) if "repo_health" in data else {}
+    )
+
     return ToolsConfig(
         approved_directories=(
             _parse_list_files(data["list_files"]) if "list_files" in data else {}
@@ -346,7 +431,10 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
             if "run_registered_script" in data
             else {}
         ),
-        approved_repositories=(
-            _parse_repo_health(data["repo_health"]) if "repo_health" in data else {}
+        approved_repositories=approved_repositories,
+        approved_backups=(
+            _parse_repository_backup(data["repository_backup"], set(approved_repositories))
+            if "repository_backup" in data
+            else {}
         ),
     )

@@ -469,6 +469,102 @@ def test_put_on_a_different_path_is_not_405_and_reveals_nothing(running_server):
     assert body == b""
 
 
+# --- Request-body draining before an early-return response ---------------
+#
+# Regression coverage for a real connection-lifecycle defect: do_POST()'s
+# wrong-path branch used to respond 404 without ever reading the request
+# body the client had already sent. If the connection is then closed
+# while unread bytes are still sitting in the OS receive buffer, TCP
+# sends a RST instead of a clean FIN - the client sees
+# ConnectionAbortedError/ConnectionResetError instead of the response
+# that was actually sent. The race is timing-dependent (far more likely
+# under scheduler/thread contention from other work happening around the
+# same time), which is why it was intermittent rather than constant. The
+# fix is WebhookRequestHandler._drain_request_body() in
+# interfaces/whatsapp/server.py, called before every early-return response
+# that hasn't already consumed the body.
+
+
+def test_post_to_wrong_path_with_a_body_reliably_returns_404(running_server):
+    server, orchestrator, _ = running_server
+    body = json.dumps({"entry": []}).encode("utf-8")
+
+    for attempt in range(20):
+        request = urllib.request.Request(
+            _url(server, "/not-webhook"),
+            data=body,
+            headers={"X-Hub-Signature-256": _sign(body)},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(request, timeout=5)
+        assert exc_info.value.code == 404, f"attempt {attempt}"
+
+    assert orchestrator.received_prompts == []
+
+
+def test_post_to_wrong_path_with_a_body_via_raw_socket_gets_a_clean_404(running_server):
+    # A raw-socket-level proof, distinct from urllib's exception-based
+    # check above: confirms the connection itself tears down cleanly (a
+    # fully readable HTTP response, not a reset) when a POST body is sent
+    # to a path the server never reads that body for.
+    server, _, _ = running_server
+    host, port = server.server_address[0], server.server_address[1]
+    body = json.dumps({"entry": []}).encode("utf-8")
+
+    response = _raw_request(
+        host, port, "POST", "/not-webhook",
+        headers={
+            "Content-Length": str(len(body)),
+            "X-Hub-Signature-256": _sign(body),
+        },
+        body_bytes=body,
+    )
+
+    assert _status_code(response) == 404
+
+
+def test_wrong_path_post_succeeds_immediately_after_a_processed_webhook_request(running_server):
+    # The exact ordering that reproduced the race during investigation: a
+    # fully-processed, worker-queued webhook POST immediately followed by
+    # a wrong-path POST carrying a body, on the same live server.
+    server, orchestrator, _ = running_server
+    assert _post(server, _envelope("wamid.precede1", _AUTHORIZED_SENDER)) == 200
+
+    body = json.dumps({"entry": []}).encode("utf-8")
+    request = urllib.request.Request(
+        _url(server, "/not-webhook"),
+        data=body,
+        headers={"X-Hub-Signature-256": _sign(body)},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(request, timeout=5)
+    assert exc_info.value.code == 404
+
+
+def test_repeated_valid_then_wrong_path_post_sequence_succeeds(running_server):
+    # Repeats the exact problematic sequence (a processed webhook POST,
+    # then a wrong-path POST carrying a body) several times in a row on
+    # one server, to make a reintroduced race extremely likely to surface
+    # rather than relying on a single lucky pass.
+    server, orchestrator, _ = running_server
+    body = json.dumps({"entry": []}).encode("utf-8")
+
+    for i in range(10):
+        assert _post(server, _envelope(f"wamid.seq{i}", _AUTHORIZED_SENDER)) == 200
+
+        request = urllib.request.Request(
+            _url(server, "/not-webhook"),
+            data=body,
+            headers={"X-Hub-Signature-256": _sign(body)},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(request, timeout=5)
+        assert exc_info.value.code == 404, f"iteration {i}"
+
+
 # --- Authorization and dedup happen before queueing --------------------
 
 
@@ -748,6 +844,55 @@ def test_server_starts_and_stops_gracefully():
     thread.join(timeout=5)
 
     assert not thread.is_alive()
+
+
+def _start_server_for_lifecycle_test():
+    whatsapp_config = _make_whatsapp_config()
+    handler = MessageHandler(FakeOrchestrator(), RecordingClient())
+    server = WhatsAppServer(whatsapp_config, handler)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    return server, thread
+
+
+def test_two_sequential_server_instances_start_and_stop_cleanly_with_no_cross_talk():
+    server_a, thread_a = _start_server_for_lifecycle_test()
+    host_a, port_a = server_a.server_address[0], server_a.server_address[1]
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(f"http://{host_a}:{port_a}/nope", timeout=5)
+    assert exc_info.value.code == 404
+
+    server_a.stop()
+    thread_a.join(timeout=5)
+
+    # Shutdown leaves the server thread terminated...
+    assert not thread_a.is_alive()
+    # ...and the listening socket itself closed, not merely unresponsive.
+    assert server_a._httpd.socket.fileno() == -1
+
+    # Immediately after stop(), the prior instance's port refuses new
+    # connections - no subsequent request can reach it, since it is
+    # genuinely gone rather than just quiet.
+    with pytest.raises(OSError):
+        socket.create_connection((host_a, port_a), timeout=1)
+
+    # A second, fully independent server instance starts and stops
+    # cleanly too - proves no lingering thread, socket, or fixture state
+    # from the first instance interferes with the second.
+    server_b, thread_b = _start_server_for_lifecycle_test()
+    host_b, port_b = server_b.server_address[0], server_b.server_address[1]
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(f"http://{host_b}:{port_b}/nope", timeout=5)
+    assert exc_info.value.code == 404
+
+    server_b.stop()
+    thread_b.join(timeout=5)
+
+    assert not thread_b.is_alive()
+    assert server_b._httpd.socket.fileno() == -1
 
 
 def test_queued_tasks_ahead_of_the_sentinel_are_processed_before_shutdown_completes():

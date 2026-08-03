@@ -24,3 +24,26 @@ real profile or cellar data is committed to this repository.
 `scripts/wine_acceptance_check.py` reads both, but — like everything else in
 this directory — never writes to either. Normal runtime `KnowledgeStore`
 access remains strictly read-only end to end.
+
+## Local knowledge-base index (Milestone 36)
+
+`knowledge_index.sqlite3` — a local SQLite database (plus its WAL/
+shared-memory/journal sidecar files while a write is in progress) built
+and queried by `kernel/knowledge_base/`. Its location is not a separate
+setting: it is always `<knowledge.storage_dir>/knowledge_index.sqlite3`,
+i.e. this same directory, derived from the existing
+`knowledge.storage_dir` setting in `kernel/config/config.yaml`. It is
+**local and gitignored** (`storage/knowledge/*.sqlite3*`) — never
+committed, and never created automatically; this directory must already
+exist before `kernel/knowledge_base/db.py` will place the database file
+here.
+
+The database holds document and chunk metadata plus a SQLite FTS5
+lexical-search index for whatever local `.md`/`.txt` sources are approved
+in the separate, also-gitignored `kernel/config/knowledge_base.yaml`. It
+never stores absolute filesystem paths — only symbolic source keys and
+source-relative paths — and is built/queried entirely through
+`scripts/knowledge.py` (`status`/`ingest`/`search`), never automatically.
+See `kernel/knowledge_base/README.md` for the full design: this is
+lexical (keyword, BM25-ranked) search only, with no embeddings, no
+semantic/vector search, and no orchestrator/RAG integration yet.

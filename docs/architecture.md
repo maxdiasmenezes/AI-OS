@@ -51,6 +51,11 @@ to the kernel.
   Milestone 34; repository_backup added in Milestone 35) - the safe
   computer task execution layer (allowlist-only actions, timeouts,
   confirmation, audit), consumed by capabilities/tasks/TasksCapability.
+  kernel/knowledge_base: implemented (Milestone 36) - a separate, local-only
+  SQLite FTS5 lexical search/ingestion service over approved .md/.txt
+  sources, reachable only through scripts/knowledge.py (a human-invoked
+  CLI outside the runtime kernel); not wired into the orchestrator, any
+  capability, or kernel/knowledge above.
 ```
 
 ## Layers
@@ -325,7 +330,34 @@ tests for Content-Length edge cases `urllib` cannot express.
   consumer, reading an optional personal wine-preferences profile via
   `get()` and an optional, read-only personal cellar inventory via
   `list_records()` (see Capabilities below); there is still no write API,
-  search, embeddings, vector retrieval, or web access.
+  and no embeddings, vector retrieval, or web access. (Milestone 36 added a
+  separate, sibling lexical-search service — `kernel/knowledge_base/`,
+  below — rather than extending this contract; `get()`/`list_records()`
+  don't naturally express search or ranking.)
+- **knowledge_base** — a local-only, deterministic knowledge-base service
+  (Milestone 36), separate from `kernel/knowledge` above and not wired into
+  it, the orchestrator, or any capability. Ingests approved local `.md`/
+  `.txt` sources (looked up only by a symbolic key configured in the
+  gitignored, machine-local `kernel/config/knowledge_base.yaml` — a caller
+  never supplies a path), traverses them with symlink/junction/reparse-point
+  rejection and fixed safety limits (`kernel/knowledge_base/traversal.py`),
+  normalizes and deterministically chunks the text with SHA-256-derived
+  stable identifiers (`kernel/knowledge_base/chunking.py`), and stores
+  document/chunk metadata plus a SQLite FTS5 lexical index
+  (`kernel/knowledge_base/db.py`) at
+  `<knowledge.storage_dir>/knowledge_index.sqlite3` — reusing the same
+  `kernel/config/config.yaml` setting `JSONKnowledgeStore` already uses,
+  never a second storage-location setting. Ingestion
+  (`kernel/knowledge_base/ingest.py`) is atomic per source (one SQLite
+  transaction, WAL mode, diffed by content hash so unchanged files are
+  untouched); a failure of any kind rolls back completely, leaving the
+  prior generation searchable. `kernel/knowledge_base/search.py` is
+  read-only, never invokes a model or the network, and safely transforms
+  plain query text into a quoted-literal FTS5 `MATCH` expression so caller
+  input can never behave as an FTS operator. The only caller is
+  `scripts/knowledge.py` (`status`/`ingest`/`search`) — see Scripts and
+  tests below; there is no orchestrator/RAG integration, no embeddings, and
+  no semantic/vector search.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -1066,14 +1098,33 @@ provider — it is read-only test-double-driven verification layered on top
 of the existing wine stack. No real profile or cellar data is committed to
 this repository.
 
+A fourth script, `scripts/knowledge.py` (Milestone 36), is the sole
+operational interface to `kernel/knowledge_base/` (see Kernel above): a
+strict `argparse` CLI — `status [--source KEY]`, `ingest KEY`, and
+`search QUERY [--source KEY ...] [--limit N]` — invoked as
+`uv run python -m scripts.knowledge <command> ...`. No command accepts a
+filesystem path, a SQL fragment, or an FTS expression; `ingest`/`--source`
+only ever take a symbolic key already approved in
+`kernel/config/knowledge_base.yaml`. Every recognized failure prints one
+fixed, privacy-safe message and exits `1`; argument-grammar errors exit
+`2` (argparse's own default); success exits `0`, including a search with
+zero results. Like the wine scripts above, it is human-invoked and lives
+entirely outside the runtime kernel — never reached by the orchestrator,
+a capability, or a model.
+
 `tests/` holds test suites that verify kernel and capability behavior;
 today this covers `WineCapability` (`tests/capabilities/wine/test_capability.py`
 and `tests/capabilities/wine/test_cellar_lookup.py`), the importer
 (`tests/scripts/test_import_wine_cellar.py`), the quantity-update script
-(`tests/scripts/test_update_wine_cellar_quantity.py`), and the acceptance
-check (`tests/scripts/test_wine_acceptance_check.py`) — all four
-`tests/scripts/` suites use only synthetic, dynamically constructed fixtures
-under `tmp_path`; no real storage data is read or written by the test suite.
+(`tests/scripts/test_update_wine_cellar_quantity.py`), the acceptance
+check (`tests/scripts/test_wine_acceptance_check.py`), and — Milestone 36
+— `kernel/knowledge_base/` (`tests/kernel/knowledge_base/`, covering
+config, traversal, chunking, the database/schema/FTS5 layer, atomic
+ingestion, and search) plus its CLI
+(`tests/scripts/test_knowledge_cli.py`). Every one of these suites uses
+only synthetic, dynamically constructed fixtures under `tmp_path`; no real
+storage data or real local configuration is read or written by the test
+suite.
 
 ## Request flow
 
@@ -1242,6 +1293,59 @@ this flow — a single call to `handle()` is one full request/response cycle.
   default error page. No real network call in the test suite
   (`tests/interfaces/whatsapp/`), including raw-socket tests for HTTP
   edge cases `urllib` cannot express.
+- Local knowledge base (Milestone 36): `kernel/knowledge_base/` — a
+  local-only SQLite FTS5 lexical-search/ingestion service, separate from
+  `kernel/knowledge` and not wired into the orchestrator, any capability,
+  WhatsApp, memory, or a model. Approved sources are configured only in
+  the gitignored `kernel/config/knowledge_base.yaml` (symbolic key ->
+  absolute path + `recursive`, validated fail-closed by
+  `kernel/knowledge_base/config.py` with its own small, private
+  duplicate-key-safe YAML loader); the database always lives at
+  `<knowledge.storage_dir>/knowledge_index.sqlite3`, deriving its location
+  from the existing `kernel/config/config.yaml` setting rather than adding
+  a second one. Ingestion supports only `.md`/`.txt`, UTF-8 or UTF-8 with
+  BOM; traversal (`kernel/knowledge_base/traversal.py`) inspects a
+  configured root's original, unresolved identity via `lstat` before ever
+  resolving it, rejects any symlink/junction/reparse point/special file
+  encountered anywhere (root or candidate), enforces fixed limits (file
+  count, file size, total bytes, recursion depth, document/chunk counts —
+  never configurable), and reads each candidate race-resistantly
+  (fresh identity check immediately before opening, `O_NOFOLLOW` where
+  available, `fstat`-verified before and after reading). Any invalid file
+  fails the whole source's ingestion and rolls back — the prior generation
+  stays fully searchable; an empty source is a valid ingestion that
+  atomically removes previously indexed documents for that source.
+  Chunking (`kernel/knowledge_base/chunking.py`) is deterministic
+  (1,200-character chunks, 200-character overlap, paragraph-aware, no
+  model call), with every identifier a SHA-256 digest of trusted inputs
+  (content hash, a source+path-derived document key, chunk ordinal) —
+  never Python's process-randomized `hash()`. The SQLite schema
+  (`kernel/knowledge_base/db.py`) is version 1 (`schema_meta`, `sources`,
+  `documents` with a `source_key` foreign key and a case-normalized
+  `relative_path_key` for Windows-safe deduplication, `chunks`, and an
+  external-content `chunks_fts` FTS5 table kept in sync by insert/delete
+  triggers); FTS5 availability is verified at runtime via a temporary,
+  non-persistent schema object, never assumed. Ingestion
+  (`kernel/knowledge_base/ingest.py`) runs one `BEGIN IMMEDIATE`
+  transaction per source (WAL journal mode, `synchronous=NORMAL`, a busy
+  timeout mapped to a fixed "database locked" result), diffing against the
+  prior generation by content hash so unchanged documents are left
+  completely untouched. Search (`kernel/knowledge_base/search.py`) is
+  read-only (`PRAGMA query_only=ON`), never invokes a model or the
+  network, and transforms plain query text into a safe FTS5 `MATCH`
+  expression by extracting alphanumeric terms and quoting each as an
+  individual string literal joined with `AND` — caller-supplied quotes,
+  wildcards, `NEAR`/`OR`/`NOT`, or column filters can therefore never
+  behave as FTS5 operators, only as literal text; ranking uses SQLite's
+  built-in BM25 with deterministic tie-breaking, and excerpts come from a
+  bounded `snippet()`. The only caller is `scripts/knowledge.py` (`status`/
+  `ingest`/`search`), a strict, human-invoked CLI outside the runtime
+  kernel with stable exit codes (`0` success, `1` a recognized failure,
+  `2` a grammar error) and a small set of fixed, privacy-safe messages —
+  no path, SQL, database location, or traceback is ever exposed. See
+  `kernel/knowledge_base/README.md` for the full design. Explicitly out of
+  scope: embeddings, semantic/vector search, orchestrator/RAG integration,
+  and every other format beyond `.md`/`.txt`.
 
 - Milestone 33 — Safe Computer Task Execution: `kernel/orchestrator/context.py`'s
   `RequestContext` (default-deny `allow_computer_actions`) plus
@@ -1311,8 +1415,15 @@ this flow — a single call to `handle()` is one full request/response cycle.
   implemented — see Capabilities above — but only as exact, read-only
   lookups, never fuzzy matching, ranking, or writes); bottle-level
   purchase/ratings history beyond a cellar record's own fields; no search,
-  embeddings, or vector retrieval; no write API on `KnowledgeStore` itself,
-  and no autonomous or scheduled write path for the cellar.
+  embeddings, or vector retrieval over the cellar itself; no write API on
+  `KnowledgeStore` itself, and no autonomous or scheduled write path for
+  the cellar. (`kernel/knowledge_base/`, Milestone 36, is a separate,
+  unrelated lexical-search service over `.md`/`.txt` sources — see Kernel
+  above — and does not change any of this.)
+- Orchestrator/RAG integration reading from `kernel/knowledge_base/`
+  (Milestone 36); embeddings or semantic/vector search over that index;
+  automatic (non-CLI-triggered) ingestion, scheduled ingestion, file
+  watchers, or web/remote-URL ingestion; any format beyond `.md`/`.txt`.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

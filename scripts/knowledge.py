@@ -1,5 +1,7 @@
 """
-Local operational CLI for kernel/knowledge_base/ (Milestone 36).
+Local operational CLI for kernel/knowledge_base/ (Milestone 36; status
+refactored onto the shared core status API and shared error-message
+mapping in Milestone 37).
 
 Invoked as `uv run python -m scripts.knowledge <command> ...`, exactly
 like the existing wine-domain scripts in this directory: a human-invoked,
@@ -19,59 +21,29 @@ takes plain query text. Every recognized failure prints one fixed,
 privacy-safe message (never a path, SQL, or a traceback) and exits 1;
 argument-grammar errors exit 2 (argparse's own default); success exits 0,
 including a search with zero results.
+
+This module only ever imports from kernel/knowledge_base/ - never from
+capabilities/knowledge_commands/ (the in-chat command layer). Business
+logic flows from interfaces/capabilities into the core package, never the
+other way around.
 """
 
 import argparse
 import logging
 import sys
 
-from kernel.knowledge_base.config import load_knowledge_base_config
-from kernel.knowledge_base.db import open_reader_connection, resolve_database_path
 from kernel.knowledge_base.ingest import ingest_source
+from kernel.knowledge_base.messages import message_for_error
 from kernel.knowledge_base.search import DEFAULT_RESULT_LIMIT, MAX_RESULT_LIMIT
 from kernel.knowledge_base.search import search as knowledge_search
-from kernel.knowledge_base.types import (
-    DatabaseLockedError,
-    DatabaseUnavailableError,
-    FTS5UnavailableError,
-    IngestionFailedError,
-    InvalidQueryError,
-    InvalidSourceContentError,
-    InvalidSourceFilterError,
-    KnowledgeBaseError,
-    KnowledgeConfigError,
-    SchemaIncompatibleError,
-    SearchFailedError,
-    SourceLimitExceededError,
-    SourceUnavailableError,
-    UnknownSourceError,
-)
+from kernel.knowledge_base.status import get_status
+from kernel.knowledge_base.types import KnowledgeBaseError
 
 logger = logging.getLogger(__name__)
 
 EXIT_SUCCESS = 0
 EXIT_OPERATION_FAILED = 1
 EXIT_USAGE_ERROR = 2
-
-_ERROR_MESSAGES: dict[type, str] = {
-    UnknownSourceError: "Unknown knowledge source.",
-    SourceUnavailableError: "Knowledge source is not available.",
-    InvalidSourceContentError: "Knowledge source contains unsupported or invalid content.",
-    SourceLimitExceededError: "Knowledge source exceeds safety limits.",
-    DatabaseUnavailableError: "Knowledge database is unavailable.",
-    DatabaseLockedError: "Knowledge database is busy. Try again.",
-    SchemaIncompatibleError: "Knowledge database schema is incompatible.",
-    FTS5UnavailableError: "Knowledge search is unavailable on this system.",
-    IngestionFailedError: "Ingestion failed.",
-    InvalidQueryError: "Search query is invalid.",
-    InvalidSourceFilterError: "Unknown knowledge source in filter.",
-    SearchFailedError: "Search failed.",
-    KnowledgeConfigError: "Knowledge base configuration is unavailable.",
-}
-
-
-def _message_for(exc: KnowledgeBaseError) -> str:
-    return _ERROR_MESSAGES.get(type(exc), "Operation failed.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -109,72 +81,31 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _handle_status(args: argparse.Namespace) -> int:
+    source_keys = [args.source] if args.source is not None else None
+
     try:
-        config = load_knowledge_base_config()
-    except KnowledgeConfigError as exc:
-        print(_message_for(exc))
+        statuses = get_status(source_keys=source_keys)
+    except KnowledgeBaseError as exc:
+        print(message_for_error(exc))
         logger.warning("action=knowledge_status outcome=failed error_category=%s", type(exc).__name__)
         return EXIT_OPERATION_FAILED
 
-    if args.source is not None:
-        if args.source not in config.approved_sources:
-            print(_message_for(UnknownSourceError()))
-            logger.warning(
-                "action=knowledge_status source_key=%s outcome=failed error_category=unknown_source",
-                args.source,
-            )
-            return EXIT_OPERATION_FAILED
-        keys = [args.source]
-    else:
-        keys = sorted(config.approved_sources)
-
-    if not keys:
+    if not statuses:
         print("No knowledge sources are configured.")
         logger.info("action=knowledge_status outcome=succeeded source_count=0")
         return EXIT_SUCCESS
 
-    try:
-        db_path = resolve_database_path()
-    except KnowledgeBaseError as exc:
-        print(_message_for(exc))
-        logger.warning("action=knowledge_status outcome=failed error_category=%s", type(exc).__name__)
-        return EXIT_OPERATION_FAILED
-
-    statuses: dict[str, tuple | None] = {}
-    if db_path.exists():
-        try:
-            conn = open_reader_connection(db_path)
-        except KnowledgeBaseError as exc:
-            print(_message_for(exc))
-            logger.warning(
-                "action=knowledge_status outcome=failed error_category=%s", type(exc).__name__
-            )
-            return EXIT_OPERATION_FAILED
-        try:
-            for key in keys:
-                row = conn.execute(
-                    "SELECT generation, document_count, chunk_count, last_ingested_at "
-                    "FROM sources WHERE source_key = ?",
-                    (key,),
-                ).fetchone()
-                statuses[key] = row
-        finally:
-            conn.close()
-    else:
-        statuses = {key: None for key in keys}
-
-    for key in keys:
-        row = statuses.get(key)
-        if row is None:
-            print(f"{key}: not yet ingested")
+    for status in statuses:
+        if not status.ingested:
+            print(f"{status.source_key}: not yet ingested")
         else:
-            generation, document_count, chunk_count, last_ingested_at = row
             print(
-                f"{key}: {document_count} document(s), {chunk_count} chunk(s), "
-                f"generation {generation}, last ingested {last_ingested_at}"
+                f"{status.source_key}: {status.document_count} document(s), "
+                f"{status.chunk_count} chunk(s), generation {status.generation}, "
+                f"last ingested {status.last_ingested_at}"
             )
 
-    logger.info("action=knowledge_status outcome=succeeded source_count=%d", len(keys))
+    logger.info("action=knowledge_status outcome=succeeded source_count=%d", len(statuses))
     return EXIT_SUCCESS
 
 
@@ -182,7 +113,7 @@ def _handle_ingest(args: argparse.Namespace) -> int:
     try:
         result = ingest_source(args.source_key)
     except KnowledgeBaseError as exc:
-        print(_message_for(exc))
+        print(message_for_error(exc))
         logger.warning(
             "action=knowledge_ingest source_key=%s outcome=failed error_category=%s",
             args.source_key,
@@ -213,7 +144,7 @@ def _handle_search(args: argparse.Namespace) -> int:
     try:
         results = knowledge_search(args.query, source_keys=args.sources, limit=args.limit)
     except KnowledgeBaseError as exc:
-        print(_message_for(exc))
+        print(message_for_error(exc))
         logger.warning("action=knowledge_search outcome=failed error_category=%s", type(exc).__name__)
         return EXIT_OPERATION_FAILED
 

@@ -335,16 +335,15 @@ tests for Content-Length edge cases `urllib` cannot express.
   below — rather than extending this contract; `get()`/`list_records()`
   don't naturally express search or ranking.)
 - **knowledge_base** — a local-only, deterministic knowledge-base service
-  (Milestone 36), separate from `kernel/knowledge` above and not wired into
-  it, the orchestrator, or any capability. Ingests approved local `.md`/
-  `.txt` sources (looked up only by a symbolic key configured in the
-  gitignored, machine-local `kernel/config/knowledge_base.yaml` — a caller
-  never supplies a path), traverses them with symlink/junction/reparse-point
-  rejection and fixed safety limits (`kernel/knowledge_base/traversal.py`),
-  normalizes and deterministically chunks the text with SHA-256-derived
-  stable identifiers (`kernel/knowledge_base/chunking.py`), and stores
-  document/chunk metadata plus a SQLite FTS5 lexical index
-  (`kernel/knowledge_base/db.py`) at
+  (Milestone 36), separate from `kernel/knowledge` above. Ingests approved
+  local `.md`/`.txt` sources (looked up only by a symbolic key configured in
+  the gitignored, machine-local `kernel/config/knowledge_base.yaml` — a
+  caller never supplies a path), traverses them with symlink/junction/
+  reparse-point rejection and fixed safety limits
+  (`kernel/knowledge_base/traversal.py`), normalizes and deterministically
+  chunks the text with SHA-256-derived stable identifiers
+  (`kernel/knowledge_base/chunking.py`), and stores document/chunk metadata
+  plus a SQLite FTS5 lexical index (`kernel/knowledge_base/db.py`) at
   `<knowledge.storage_dir>/knowledge_index.sqlite3` — reusing the same
   `kernel/config/config.yaml` setting `JSONKnowledgeStore` already uses,
   never a second storage-location setting. Ingestion
@@ -354,10 +353,19 @@ tests for Content-Length edge cases `urllib` cannot express.
   prior generation searchable. `kernel/knowledge_base/search.py` is
   read-only, never invokes a model or the network, and safely transforms
   plain query text into a quoted-literal FTS5 `MATCH` expression so caller
-  input can never behave as an FTS operator. The only caller is
-  `scripts/knowledge.py` (`status`/`ingest`/`search`) — see Scripts and
-  tests below; there is no orchestrator/RAG integration, no embeddings, and
-  no semantic/vector search.
+  input can never behave as an FTS operator. `kernel/knowledge_base/
+  status.py` (`get_status()`, `SourceStatus`, Milestone 37) is the one
+  typed, read-only status query both callers below share — neither
+  duplicates its SQL. `kernel/knowledge_base/messages.py`
+  (`message_for_error()`, Milestone 37) is likewise the one place that maps
+  every error type to a fixed, privacy-safe message. There are exactly two
+  callers: `scripts/knowledge.py` (`status`/`ingest`/`search`, a
+  human-invoked offline CLI — see Scripts and tests below) and, as of
+  Milestone 37, `capabilities/knowledge_commands/` (the deterministic,
+  trusted-context-gated `/knowledge` command capability — see Capabilities
+  below). Neither the orchestrator nor this package itself calls a model or
+  the network; there is still no automatic RAG, no orchestrator-driven
+  retrieval, no embeddings, and no semantic/vector search.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -978,6 +986,86 @@ recall, no knowledge-store access, ever.
   `/task confirm` executing it exactly once, `/task cancel` and
   confirmation expiry both preventing execution.
 
+**knowledge** (Milestone 37) is the third implemented capability —
+`capabilities/knowledge_commands/KnowledgeCommandsCapability` (registered
+under the id `"knowledge"`) — a deterministic `/knowledge` command layer
+over the Milestone 36 local knowledge base (`kernel/knowledge_base/`
+above), reached only through a strict command grammar, never natural
+language and never a model fallback. Deliberately a separate package from
+`capabilities/knowledge/`, which remains reserved and unimplemented for a
+different, future, higher-level AI-employee capability. `handle()` is
+fully deterministic: no model call, no memory recall, no
+`kernel/knowledge` `KnowledgeStore` access, ever.
+
+- **Authorization.** `KnowledgeCommandsCapability.requires_computer_actions
+  = True`, identically to `TasksCapability` — `Orchestrator.handle()`
+  refuses to call `handle()` at all unless the request's `RequestContext`
+  grants `allow_computer_actions`. This applies uniformly to every verb,
+  including the read-only `status` and `search` — there is no per-verb
+  trust tier in this milestone. This capability performs no authorization
+  of its own.
+- **Command grammar**
+  (`capabilities/knowledge_commands/command_parser.py`) — a hand-rolled
+  tokenizer (not `argparse`, which remains reserved for the offline
+  `scripts/knowledge.py` CLI grammar): `/knowledge`, `/knowledge help`,
+  `/knowledge status [--source <key>]`,
+  `/knowledge search [--source <key>] [--limit <1-10>] -- <query text>`,
+  `/knowledge ingest <key>`, `/knowledge confirm`, `/knowledge cancel`.
+  `search` requires exactly one literal bare `--` delimiter; everything
+  after the first one is query text, never re-parsed as options even if it
+  contains `--`-shaped tokens. `<key>` must match the same conservative
+  shape `kernel/knowledge_base/config.py` uses
+  (`^[a-z0-9][a-z0-9_-]{0,63}$`) and is casefolded; a shape-valid but
+  unapproved key is still rejected downstream by the existing Milestone 36
+  allowlist, never by the parser itself. `--limit` is bounded to 1–10
+  (`MAX_INTERFACE_RESULT_LIMIT`) — tighter than `search()`'s own
+  service-level cap of 50. Any extra token, missing token, unknown or
+  duplicate option, missing option value, missing delimiter, blank query,
+  or malformed key is a `KnowledgeParseError` with a stable, symbolic
+  reason, surfaced as one fixed reply
+  (`Invalid knowledge command. Use /knowledge help.`) — never guessed at.
+- **Read-only execution.** `status` calls the new
+  `kernel/knowledge_base/status.py:get_status()`; `search` calls the
+  existing, unmodified `kernel/knowledge_base/search.py:search()`,
+  requesting at most 10 results. Neither requires confirmation. The raw
+  query text is passed only transiently through the parser and this call
+  stack — never logged, audited, or stored in pending confirmation state.
+- **Confirmation.** `ingest` is sensitive: the symbolic key is checked
+  against the current approved-source allowlist immediately (no source
+  pre-scan, no document-count disclosure) and, if approved, only
+  *proposed* — the reply names the source key and nothing else. `/knowledge
+  confirm` within 2 minutes calls the existing, unmodified
+  `kernel/knowledge_base/ingest.py:ingest_source()` exactly once;
+  `/knowledge cancel`, an expired confirmation, or a re-check at execute
+  time against a since-changed configuration all fail closed. The pending
+  action lives in `default_knowledge_confirmation_store` — a *separate*
+  `kernel.tools.confirmation.ConfirmationStore` instance from
+  `capabilities/tasks/TasksCapability`'s `default_store`, so the two
+  command families can never collide over the single-slot design
+  `kernel/tools/confirmation.py` describes.
+- **Output limits and privacy.** Fixed, interface-level limits in addition
+  to Milestone 36's own service-level ones: at most 10 results requested,
+  a 200-character excerpt, an 80-character path, and a 3,500-character
+  total reply, all truncated deterministically with a visible ellipsis;
+  when complete results don't all fit, whole results are dropped from the
+  end and a fixed notice is appended — never a partial result, never split
+  across multiple messages. Every recognized failure maps to one fixed
+  message by exception type via the shared
+  `kernel/knowledge_base/messages.py:message_for_error()` — never
+  `str(exc)`. Audit events reuse `kernel/tools/audit.py` (the same module
+  and log file `/task` uses) with only a fixed action name, the symbolic
+  source key when applicable, and a fixed outcome — never query text, an
+  excerpt, a path, SQL, an FTS expression, or an exception.
+- **Out of scope**, as for Milestone 36: automatic RAG, automatic
+  retrieval before a model call, prompt-context injection, embeddings,
+  semantic/vector search, model-generated summaries, path-based or
+  partial-source ingestion, scheduled or background ingestion, deletion
+  commands, document-content display. `search()`'s typed core API is the
+  same one a future, explicit RAG/retrieval integration could call —
+  nothing here forecloses that; it simply isn't wired to a model yet. The
+  offline `scripts/knowledge.py` CLI remains available and unaffected by
+  this capability's trust gating.
+
 Each capability is meant to be a self-contained domain expert that uses
 kernel services (memory, knowledge, tools, models) to do its job. Capabilities
 do not talk to interfaces directly, and they do not talk to each other
@@ -1338,14 +1426,20 @@ this flow — a single call to `handle()` is one full request/response cycle.
   wildcards, `NEAR`/`OR`/`NOT`, or column filters can therefore never
   behave as FTS5 operators, only as literal text; ranking uses SQLite's
   built-in BM25 with deterministic tie-breaking, and excerpts come from a
-  bounded `snippet()`. The only caller is `scripts/knowledge.py` (`status`/
-  `ingest`/`search`), a strict, human-invoked CLI outside the runtime
-  kernel with stable exit codes (`0` success, `1` a recognized failure,
-  `2` a grammar error) and a small set of fixed, privacy-safe messages —
-  no path, SQL, database location, or traceback is ever exposed. See
+  bounded `snippet()`. `scripts/knowledge.py` (`status`/`ingest`/`search`)
+  is a strict, human-invoked CLI outside the runtime kernel with stable
+  exit codes (`0` success, `1` a recognized failure, `2` a grammar error)
+  and a small set of fixed, privacy-safe messages — no path, SQL, database
+  location, or traceback is ever exposed. As of Milestone 37, this package
+  also has a second caller —
+  `capabilities/knowledge_commands/KnowledgeCommandsCapability`, a
+  deterministic, trusted-context-gated `/knowledge` command capability
+  (see Capabilities and Milestone 37 below) — both callers share the
+  package's typed `get_status()` and `message_for_error()` rather than
+  each reimplementing status SQL or an error-message mapping. See
   `kernel/knowledge_base/README.md` for the full design. Explicitly out of
-  scope: embeddings, semantic/vector search, orchestrator/RAG integration,
-  and every other format beyond `.md`/`.txt`.
+  scope: embeddings, semantic/vector search, automatic orchestrator/RAG
+  integration, and every other format beyond `.md`/`.txt`.
 
 - Milestone 33 — Safe Computer Task Execution: `kernel/orchestrator/context.py`'s
   `RequestContext` (default-deny `allow_computer_actions`) plus
@@ -1400,6 +1494,32 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `http.sslVerify=true` forced, credential helpers/askpass disabled on
   the command line, and any inherited proxy environment variable
   stripped. See Kernel and Capabilities above for the full detail.
+- Milestone 37 — Safe Explicit Knowledge Commands: a deterministic
+  `/knowledge` command layer over the Milestone 36 knowledge base, reached
+  only through the strict `/knowledge ...` command grammar and only when
+  `interfaces/whatsapp/handler.py`'s trusted context is present, matching
+  Milestone 33's authorization pattern exactly (`requires_computer_actions
+  = True`, uniformly across every verb, no per-verb trust tier). Adds
+  `kernel/knowledge_base/status.py` (`get_status()`, `SourceStatus`) and
+  `kernel/knowledge_base/messages.py` (`message_for_error()`) to the core
+  package — the former eliminates the SQL `scripts/knowledge.py`'s
+  `status` command used to run itself; the latter centralizes the fixed
+  error-message mapping so `scripts/knowledge.py` and the new
+  `capabilities/knowledge_commands/KnowledgeCommandsCapability` share one
+  copy instead of two. Ingestion remains sensitive (routed through a
+  *separate* `kernel.tools.confirmation.ConfirmationStore` instance from
+  `capabilities/tasks/TasksCapability`'s own, so the two command families'
+  single-slot pending state can never collide); status and search are
+  read-only and require no confirmation. Adds fixed, interface-level
+  output limits (at most 10 results, 200-character excerpts,
+  80-character paths, a 3,500-character total reply, deterministic
+  whole-result truncation with a fixed omission notice) on top of
+  Milestone 36's own service-level limits. No changes to
+  `interfaces/whatsapp/server.py`, the orchestrator's authorization gate,
+  or any Milestone 36 ingestion/search/traversal/chunking logic — this
+  milestone only adds a command-parsing and confirmation layer in front of
+  the existing, unmodified core functions. See Kernel and Capabilities
+  above for the full detail.
 
 **Planned / not yet implemented:**
 
@@ -1420,10 +1540,19 @@ this flow — a single call to `handle()` is one full request/response cycle.
   the cellar. (`kernel/knowledge_base/`, Milestone 36, is a separate,
   unrelated lexical-search service over `.md`/`.txt` sources — see Kernel
   above — and does not change any of this.)
-- Orchestrator/RAG integration reading from `kernel/knowledge_base/`
-  (Milestone 36); embeddings or semantic/vector search over that index;
-  automatic (non-CLI-triggered) ingestion, scheduled ingestion, file
-  watchers, or web/remote-URL ingestion; any format beyond `.md`/`.txt`.
+- Automatic RAG or orchestrator-driven retrieval from
+  `kernel/knowledge_base/` before a model call; prompt-context injection;
+  embeddings or semantic/vector search over that index; model-generated
+  summaries or metadata. (Milestone 37 added explicit, human-triggered
+  `/knowledge status`/`search`/`ingest` commands — see Capabilities and
+  Milestone 37 above — but nothing calls a model or retrieves
+  automatically; a future explicit RAG/retrieval integration could reuse
+  the same typed `search()` API these commands already call, but that
+  integration itself remains unimplemented.)
+- Automatic (non-command-triggered) ingestion, scheduled ingestion, file
+  watchers, web/remote-URL ingestion, deletion commands, document-content
+  display, path-based or partial-source ingestion, or any format beyond
+  `.md`/`.txt`.
 - Tools (`kernel/tools/`).
 - Additional capabilities (strategy, research, travel, life administration).
 - Multi-turn sessions, streaming, retries, and any autonomous or

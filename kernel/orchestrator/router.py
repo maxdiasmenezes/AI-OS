@@ -16,6 +16,14 @@ import re
 # that can appear mid-sentence.
 _TASK_COMMAND_PATTERN = re.compile(r"^/task(\s|$)", re.IGNORECASE)
 
+# Milestone 37: the strict "/knowledge" command prefix routes to the
+# "knowledge" capability, the same way "/task" routes to "tasks" above.
+# Anchored and followed by whitespace-or-end, so "/knowledgeable" or
+# "/knowledge" appearing mid-sentence never matches - only a leading
+# command token does. The full grammar is parsed deterministically inside
+# capabilities/knowledge_commands/command_parser.py, not here.
+_KNOWLEDGE_COMMAND_PATTERN = re.compile(r"^/knowledge(?:\s|$)", re.IGNORECASE)
+
 # Whole-word "wine" or "wines" mention - the original, broadest signal.
 _WINE_WORD_PATTERN = re.compile(r"\bwines?\b", re.IGNORECASE)
 
@@ -68,6 +76,8 @@ class CapabilityRouter:
 
         if _TASK_COMMAND_PATTERN.match(prompt.strip()):
             return "tasks"
+        if _KNOWLEDGE_COMMAND_PATTERN.match(prompt.strip()):
+            return "knowledge"
         if any(pattern.search(prompt) for pattern in _WINE_INTENT_PATTERNS):
             return "wine"
         return None

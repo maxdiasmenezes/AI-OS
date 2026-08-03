@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from capabilities.knowledge_commands.capability import KnowledgeCommandsCapability
 from capabilities.loader import CapabilityLoader
 from capabilities.wine.capability import WineCapability
 from kernel.capabilities import CapabilityRegistry
@@ -27,6 +28,20 @@ def loader(tmp_path):
     (tmp_path / "wine").mkdir()
     (tmp_path / "travel").mkdir()
     registry = CapabilityRegistry(capabilities_dir=tmp_path)
+    return CapabilityLoader(registry=registry)
+
+
+@pytest.fixture
+def knowledge_loader(tmp_path):
+    # A separate capabilities_dir root (not the shared tmp_path other
+    # fixtures/tests in this module use for unrelated purposes, e.g.
+    # test_load_wine_passes_knowledge_store_used_by_fallback's own
+    # tmp_path/"knowledge" JSONKnowledgeStore directory) so this fixture's
+    # fake "knowledge" capability directory can never collide with it.
+    capabilities_root = tmp_path / "fake_capabilities_root"
+    capabilities_root.mkdir()
+    (capabilities_root / "knowledge").mkdir()
+    registry = CapabilityRegistry(capabilities_dir=capabilities_root)
     return CapabilityLoader(registry=registry)
 
 
@@ -71,6 +86,36 @@ def test_load_discovered_capability_without_implementation_raises(
 def test_load_unknown_capability_raises(loader, fake_provider, memory_manager, knowledge_store):
     with pytest.raises(ValueError):
         loader.load("nonexistent", fake_provider, memory_manager, knowledge_store)
+
+
+def test_load_knowledge_returns_knowledge_commands_capability(
+    knowledge_loader, fake_provider, memory_manager, knowledge_store
+):
+    capability = knowledge_loader.load("knowledge", fake_provider, memory_manager, knowledge_store)
+    assert isinstance(capability, KnowledgeCommandsCapability)
+
+
+def test_load_knowledge_id_is_knowledge(knowledge_loader, fake_provider, memory_manager, knowledge_store):
+    assert (
+        knowledge_loader.load("knowledge", fake_provider, memory_manager, knowledge_store).id
+        == "knowledge"
+    )
+
+
+def test_load_knowledge_returns_distinct_instances(
+    knowledge_loader, fake_provider, memory_manager, knowledge_store
+):
+    first = knowledge_loader.load("knowledge", fake_provider, memory_manager, knowledge_store)
+    second = knowledge_loader.load("knowledge", fake_provider, memory_manager, knowledge_store)
+    assert first is not second
+
+
+def test_loader_registers_exactly_one_knowledge_capability_class():
+    from capabilities.loader import _CAPABILITY_CLASSES
+
+    assert _CAPABILITY_CLASSES["knowledge"] is KnowledgeCommandsCapability
+    knowledge_entries = [cls for cls in _CAPABILITY_CLASSES.values() if cls is KnowledgeCommandsCapability]
+    assert len(knowledge_entries) == 1
 
 
 def test_load_wine_passes_memory_manager_used_by_fallback(loader, memory_manager, knowledge_store):

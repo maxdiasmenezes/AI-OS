@@ -1073,3 +1073,100 @@ def test_real_tasks_capability_via_trusted_context_executes_status(
 
     assert response.text == deterministic_system_status
     assert fake_provider.received_prompts == []
+
+
+# --- Milestone 37: real KnowledgeCommandsCapability, end to end -----------
+
+
+def test_real_knowledge_capability_via_cli_style_call_is_denied_deterministically(
+    monkeypatch, tmp_path
+):
+    # End-to-end with the real router + real CapabilityLoader + real
+    # KnowledgeCommandsCapability: a CLI-style call (no context passed at
+    # all) must be denied before command_parser or kernel/knowledge_base
+    # is ever reached - identically to /task above.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle("/knowledge status")
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+    assert fake_provider.received_prompts == []
+
+
+def test_real_knowledge_capability_via_trusted_context_executes_status(monkeypatch, tmp_path):
+    # End-to-end with the real router + real CapabilityLoader + real
+    # KnowledgeCommandsCapability + the real kernel/knowledge_base status
+    # service: a trusted context reaches get_status(). The default
+    # knowledge_base.yaml path is redirected to a nonexistent tmp file,
+    # which load_knowledge_base_config() treats as zero approved sources
+    # (deny-all, not an error) - never touching the real, gitignored
+    # kernel/config/knowledge_base.yaml.
+    import kernel.knowledge_base.config as kb_config
+
+    monkeypatch.setattr(
+        kb_config, "DEFAULT_KNOWLEDGE_BASE_YAML_PATH", tmp_path / "knowledge_base.yaml"
+    )
+
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle(
+        "/knowledge status", context=RequestContext(allow_computer_actions=True, actor="whatsapp")
+    )
+
+    assert response.text == "No knowledge sources are configured."
+    assert fake_provider.received_prompts == []
+
+
+def test_denied_knowledge_command_never_reaches_core_status_service(monkeypatch, tmp_path):
+    # Denial happens in Orchestrator.handle() before the capability's
+    # handle() is even called - so the real get_status() (which would
+    # otherwise touch the real knowledge_base.yaml) must never run.
+    import kernel.knowledge_base.status as status_module
+
+    def explode(*args, **kwargs):
+        raise AssertionError("get_status must never be called for a denied request")
+
+    monkeypatch.setattr(status_module, "get_status", explode)
+
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle("/knowledge status")  # no context -> denied
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+
+
+def test_knowledge_and_task_routes_do_not_interfere_with_each_other(
+    monkeypatch, tmp_path, deterministic_system_status
+):
+    # A real end-to-end proof that routing "/task status" and
+    # "/knowledge status" through the same orchestrator/loader reaches
+    # two different capabilities, each with their own separate pending
+    # confirmation state (see capabilities/knowledge_commands/capability.py's
+    # default_knowledge_confirmation_store).
+    import kernel.knowledge_base.config as kb_config
+
+    monkeypatch.setattr(
+        kb_config, "DEFAULT_KNOWLEDGE_BASE_YAML_PATH", tmp_path / "knowledge_base.yaml"
+    )
+
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+    trusted_context = RequestContext(allow_computer_actions=True, actor="whatsapp")
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+
+    task_response = orchestrator.handle("/task status", context=trusted_context)
+    knowledge_response = orchestrator.handle("/knowledge status", context=trusted_context)
+
+    assert task_response.text == deterministic_system_status
+    assert knowledge_response.text == "No knowledge sources are configured."

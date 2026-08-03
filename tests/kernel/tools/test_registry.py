@@ -9,10 +9,11 @@ _ALL_ACTIONS = (
     "open_application",
     "run_registered_script",
     "repo_health",
+    "repository_backup",
 )
 
 
-def test_exactly_the_five_milestone_actions_are_known():
+def test_exactly_the_six_milestone_actions_are_known():
     registry = ActionRegistry()
 
     for action in _ALL_ACTIONS:
@@ -22,11 +23,12 @@ def test_exactly_the_five_milestone_actions_are_known():
     assert registry.is_known("") is False
 
 
-def test_open_application_and_run_registered_script_are_sensitive():
+def test_open_application_run_registered_script_and_repository_backup_are_sensitive():
     registry = ActionRegistry()
 
     assert registry.is_sensitive("open_application") is True
     assert registry.is_sensitive("run_registered_script") is True
+    assert registry.is_sensitive("repository_backup") is True
 
 
 def test_system_status_list_files_and_repo_health_are_not_sensitive():

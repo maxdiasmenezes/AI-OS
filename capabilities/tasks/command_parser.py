@@ -1,9 +1,9 @@
 """
 Strict command grammar for the /task interface (Milestone 33; `repo`
-added in Milestone 34). Every supported form is listed explicitly below -
-there is no natural-language matching, no fuzzy matching, and no
-partial-token matching. Anything that doesn't exactly match one of these
-forms is a parse error, not a guess.
+added in Milestone 34; `backup` added in Milestone 35). Every supported
+form is listed explicitly below - there is no natural-language matching,
+no fuzzy matching, and no partial-token matching. Anything that doesn't
+exactly match one of these forms is a parse error, not a guess.
 
 Supported forms ("/task" and the verb are matched case-insensitively; a
 resource key is casefolded so it matches kernel/config/tools.yaml's
@@ -14,12 +14,16 @@ casefolded keys - see kernel/tools/config.py):
     /task open <registered-application-key>
     /task run <registered-script-key>
     /task repo <registered-repository-key>
+    /task backup <registered-repository-key>
     /task confirm
     /task cancel
     /task help
 
 Any extra token, missing token, or unrecognized verb is a ParseError -
-never guessed at or partially honored.
+never guessed at or partially honored. `/task backup <key>` accepts only
+the symbolic repository key - never a path, filename, git ref, option, or
+destination - resolved the same way `/task repo <key>` is, through
+kernel/config/tools.yaml.
 """
 
 from dataclasses import dataclass
@@ -34,6 +38,7 @@ _ONE_ARG_VERBS = {
     "open": "open_application",
     "run": "run_registered_script",
     "repo": "repo_health",
+    "backup": "repository_backup",
 }
 
 

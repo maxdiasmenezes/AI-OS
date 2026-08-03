@@ -1,6 +1,7 @@
 """
 TasksCapability: Milestone 33's safe computer task execution capability
-(repo_health added in Milestone 34).
+(repo_health added in Milestone 34; repository_backup added in
+Milestone 35).
 
 Every command is handled deterministically - no model call is ever made
 here, matching the pattern WineCapability's Deterministic Cellar Lookup v1
@@ -39,6 +40,7 @@ HELP_TEXT = (
     "/task open <application>\n"
     "/task run <script>\n"
     "/task repo <repository>\n"
+    "/task backup <repository>\n"
     "/task confirm\n"
     "/task cancel\n"
     "/task help"

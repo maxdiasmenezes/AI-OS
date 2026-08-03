@@ -92,13 +92,14 @@ credential, prompt, or raw stderr/stdout is ever returned or logged - see
 kernel/tools/audit.py.
 """
 
-import os
 import re
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from kernel.tools.config import is_valid_git_branch_name
+from kernel.tools.git_safety import GIT_SAFE_PREFIX as _GIT_SAFE_PREFIX
+from kernel.tools.git_safety import sanitized_git_env as _sanitized_git_env
 from kernel.tools.process_control import run_capturing_stdout
 from kernel.tools.types import ActionRequest, ActionResult
 
@@ -114,20 +115,10 @@ _SHA_RE = re.compile(r"^[0-9a-f]{4,40}$")
 
 _DETACHED_HEAD_MARKER = "HEAD"
 
-# Fixed prefix for every git invocation this handler makes, local or
-# remote. Deliberately supplied as argv (not left to config files):
-# --no-optional-locks, --no-pager, --no-replace-objects, and
-# -c core.fsmonitor=false cannot be shadowed by anything in the target
-# repository's own .git/config. --no-replace-objects means a repository-
-# configured replace ref can never alter the commit history this handler
-# reads (rev-parse/log see the *real* objects, not a replacement).
-_GIT_SAFE_PREFIX = [
-    "git",
-    "--no-optional-locks",
-    "--no-pager",
-    "--no-replace-objects",
-    "-c", "core.fsmonitor=false",
-]
+# _GIT_SAFE_PREFIX is imported from kernel/tools/git_safety.py (extracted
+# in Milestone 35, reused by repository_backup.py) - see that module's
+# docstring for the rationale. Bound to this private name above for
+# backward compatibility with this module's own tests.
 
 # Only the network call (ls-remote) needs a transport at all, so only it
 # gets these: an HTTPS-only protocol allowlist (deny every protocol by
@@ -158,67 +149,10 @@ _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
 _MALFORMED_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _CONTROL_OR_WHITESPACE_RE = re.compile(r"[\x00-\x20\x7f]")
 
-# Environment variables that could inject additional git configuration,
-# redirect which credential/SSH/askpass program git runs, redirect
-# repository discovery/refs/index/object storage, disable transport
-# security, or leak transport detail via tracing/redirection - stripped
-# from every git subprocess's environment regardless of how they got set.
-_GIT_ENV_BLOCKLIST_EXACT = {
-    # config/credential injection
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_EXEC_PATH",
-    "GIT_ASKPASS",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "SSH_ASKPASS",
-    # repository/ref/object/index redirection
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_REPLACE_REF_BASE",
-    # transport security / tracing / stdio redirection
-    "GIT_SSL_NO_VERIFY",
-    "GIT_CURL_VERBOSE",
-    "GIT_REDIRECT_STDIN",
-    "GIT_REDIRECT_STDOUT",
-    "GIT_REDIRECT_STDERR",
-}
-_GIT_ENV_BLOCKLIST_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_TRACE")
-
-
-def _sanitized_git_env() -> dict:
-    """Starts from a full copy of this process's real environment - PATH
-    and every other ordinary variable stay available, never replaced with
-    a fabricated minimal mapping - then strips every variable in the
-    blocklist above (matched case-insensitively, since environment
-    variable names are case-insensitive on Windows) before layering on
-    the controlled values every git call needs: GIT_OPTIONAL_LOCKS=0, and
-    GIT_CONFIG_NOSYSTEM=1 / GIT_CONFIG_GLOBAL=os.devnull so no system- or
-    machine-global git config can ever influence any call this handler
-    makes, local or remote - the approved repository's own *local*
-    config remains readable where a local call needs it (e.g. reading
-    remote.origin.url), since GIT_CEILING_DIRECTORIES is stripped, not
-    set, here; only the remote call sets its own controlled value for
-    that on top of this result. Callers that need additional controlled
-    values (the remote call's GIT_TERMINAL_PROMPT / GCM_INTERACTIVE /
-    GIT_CEILING_DIRECTORIES) add them on top of this result."""
-
-    env = os.environ.copy()
-    for key in list(env):
-        upper_key = key.upper()
-        if upper_key in _GIT_ENV_BLOCKLIST_EXACT or upper_key.startswith(_GIT_ENV_BLOCKLIST_PREFIXES):
-            del env[key]
-    env["GIT_OPTIONAL_LOCKS"] = "0"
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    return env
+# _sanitized_git_env is imported from kernel/tools/git_safety.py
+# (extracted in Milestone 35) - see that module's docstring for the exact
+# blocklist and rationale. Bound to this private name above for backward
+# compatibility with this module's own tests.
 
 
 def _run_local_bytes(args: list[str], cwd: Path) -> bytes | None:

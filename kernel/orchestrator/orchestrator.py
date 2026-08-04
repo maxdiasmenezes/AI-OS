@@ -5,14 +5,18 @@ Given a config and a capability loader, wires up a model provider, a memory
 manager, a read-only knowledge store, and a capability router once; given a
 user prompt, routes it to a capability when the router matches one,
 otherwise falls back to the model provider. Either way, persists the
-exchange to memory, logs the interaction, and returns the response. No
-tools, no retries, no streaming - just routing plus the existing flow.
+exchange to memory and logs the interaction - unless the capability
+returned an EphemeralResult (see kernel/capabilities/base.py), in which
+case neither write happens for that one request; Milestone 38 introduced
+this for `/knowledge search` and `/knowledge ask`, which must never leave
+query/question text or model answers in memory or the interaction log.
+No tools, no retries, no streaming - just routing plus the existing flow.
 """
 
 import logging
 from typing import Callable, Protocol
 
-from kernel.capabilities.base import Capability
+from kernel.capabilities.base import Capability, EphemeralResult
 from kernel.config.config import Config
 from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.logger import log_interaction
@@ -88,6 +92,13 @@ class Orchestrator:
         if context is None:
             context = RequestContext()
 
+        # Set when a capability result is an EphemeralResult (Milestone
+        # 38) - the remember()/log_interaction() tail below is skipped for
+        # that one request only. Every other path (denial, ordinary str/
+        # ModelResponse capability results, model fallback) leaves this
+        # False, so persistence stays byte-identical to before Milestone 38.
+        skip_persistence = False
+
         capability_id = self._router.route(user_prompt)
         if capability_id is not None:
             capability = self._capability_loader(
@@ -123,7 +134,16 @@ class Orchestrator:
                 )
             else:
                 capability_result = capability.handle(user_prompt)
-                if isinstance(capability_result, ModelResponse):
+                if isinstance(capability_result, EphemeralResult):
+                    skip_persistence = True
+                    response = ModelResponse(
+                        text=str(capability_result),
+                        model=f"capability:{capability_id}",
+                        input_tokens=0,
+                        output_tokens=0,
+                        latency_seconds=0.0,
+                    )
+                elif isinstance(capability_result, ModelResponse):
                     response = capability_result
                 elif isinstance(capability_result, str):
                     response = ModelResponse(
@@ -142,8 +162,9 @@ class Orchestrator:
             augmented_prompt = build_prompt(user_prompt, self._memory)
             response = self._provider.send_prompt(augmented_prompt)
 
-        self._memory.remember("conversation", user_prompt, metadata={"role": "user"})
-        self._memory.remember("conversation", response.text, metadata={"role": "assistant"})
-        log_interaction(user_prompt, response, self._config.log_path)
+        if not skip_persistence:
+            self._memory.remember("conversation", user_prompt, metadata={"role": "user"})
+            self._memory.remember("conversation", response.text, metadata={"role": "assistant"})
+            log_interaction(user_prompt, response, self._config.log_path)
 
         return response

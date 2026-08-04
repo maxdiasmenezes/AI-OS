@@ -311,6 +311,27 @@ tests for Content-Length edge cases `urllib` cannot express.
   `interfaces/whatsapp/handler.py`, and only for a message that already
   passed WhatsApp's own exact-sender authorization — see Interfaces above
   and Capabilities below.
+
+  **Milestone 38 — `EphemeralResult` / non-persistent capability
+  results.** Normally, after a routed capability returns, `handle()`
+  unconditionally writes the prompt and the response to memory
+  (`remember("conversation", ...)`, twice — once per role) and to the
+  interaction log (`log_interaction()`). A capability can opt one specific
+  response out of *both* writes by returning `EphemeralResult`
+  (`kernel/capabilities/base.py`) instead of a plain `str` — a `str`
+  subclass, so every existing `capability.handle(prompt) == "..."`
+  comparison and `MessageHandler._extract_response_text()`'s
+  `isinstance(result, str)` branch keep working unchanged.
+  `Orchestrator.handle()` checks `isinstance(capability_result,
+  EphemeralResult)` before its plain-`str` check, wraps the text in the
+  usual `ModelResponse` the caller receives, but skips the remember/log
+  tail for that one request. This is request-scoped, not
+  capability-scoped: `capabilities/knowledge_commands/` returns it for
+  `/knowledge search` and `/knowledge ask` only (query/question text and,
+  for `ask`, a model-generated answer must never be persisted — see
+  Capabilities below); `/knowledge status`, `ingest`, `confirm`, and
+  `cancel` are unaffected, and so is every other capability, the
+  computer-action denial response, and ordinary model-fallback responses.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
@@ -361,11 +382,33 @@ tests for Content-Length edge cases `urllib` cannot express.
   every error type to a fixed, privacy-safe message. There are exactly two
   callers: `scripts/knowledge.py` (`status`/`ingest`/`search`, a
   human-invoked offline CLI — see Scripts and tests below) and, as of
-  Milestone 37, `capabilities/knowledge_commands/` (the deterministic,
-  trusted-context-gated `/knowledge` command capability — see Capabilities
-  below). Neither the orchestrator nor this package itself calls a model or
-  the network; there is still no automatic RAG, no orchestrator-driven
-  retrieval, no embeddings, and no semantic/vector search.
+  Milestone 37, `capabilities/knowledge_commands/` (the `/knowledge`
+  command capability — see Capabilities below). Neither the orchestrator
+  nor this package's own code calls a model or the network; there is
+  still no automatic RAG, no orchestrator-driven retrieval, no
+  embeddings, and no semantic/vector search.
+
+  **Milestone 38 additions**, for explicit knowledge-grounded answering
+  (`/knowledge ask`): `kernel/knowledge_base/query.py` factors the lexical
+  query mechanics `search()` already had (query validation, FTS5 literal
+  transformation, source-filter validation, limit validation, and
+  deterministic ranking tie-break order) out into one shared,
+  package-internal module, so `search.py` and the new
+  `kernel/knowledge_base/evidence.py` never duplicate them — `search.py`'s
+  public API and behavior are unchanged.
+  `evidence.py:retrieve_evidence()` is `search()`'s sibling: the same
+  single, read-only, parameterized, ranked query, selecting bounded full
+  chunk text instead of a short `snippet()` excerpt (at most 5 chunks,
+  1,500 characters each, 7,500 total), with no second, caller-controlled
+  chunk-ID lookup. `kernel/knowledge_base/answer.py` is pure — no I/O, no
+  model call, no network — and only prepares the one flat prompt string
+  (fixed instructions from `prompts/knowledge/ask_system.md` plus the
+  untrusted question/evidence as one JSON object between fixed marker
+  lines) and strictly parses/validates the model's structured response;
+  the model call itself is made by
+  `capabilities/knowledge_commands/KnowledgeCommandsCapability`, not by
+  this package. This package's own code therefore still never calls a
+  model or the network.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -986,50 +1029,106 @@ recall, no knowledge-store access, ever.
   `/task confirm` executing it exactly once, `/task cancel` and
   confirmation expiry both preventing execution.
 
-**knowledge** (Milestone 37) is the third implemented capability —
-`capabilities/knowledge_commands/KnowledgeCommandsCapability` (registered
-under the id `"knowledge"`) — a deterministic `/knowledge` command layer
-over the Milestone 36 local knowledge base (`kernel/knowledge_base/`
-above), reached only through a strict command grammar, never natural
-language and never a model fallback. Deliberately a separate package from
-`capabilities/knowledge/`, which remains reserved and unimplemented for a
-different, future, higher-level AI-employee capability. `handle()` is
-fully deterministic: no model call, no memory recall, no
-`kernel/knowledge` `KnowledgeStore` access, ever.
+**knowledge** (Milestone 37, extended in Milestone 38) is the third
+implemented capability — `capabilities/knowledge_commands/
+KnowledgeCommandsCapability` (registered under the id `"knowledge"`) — a
+`/knowledge` command layer over the Milestone 36 local knowledge base
+(`kernel/knowledge_base/` above), reached only through a strict command
+grammar, never natural language and never automatic. Deliberately a
+separate package from `capabilities/knowledge/`, which remains reserved
+and unimplemented for a different, future, higher-level AI-employee
+capability. **`handle()` is not fully model-free**: `status`, `search`,
+`ingest`, `confirm`, `cancel`, and `help` are fully deterministic — no
+model call, no memory recall, no `kernel/knowledge` `KnowledgeStore`
+access, ever — but Milestone 38's `ask` verb explicitly calls the
+already-injected model provider exactly once per request, to answer a
+question grounded only in retrieved local evidence. `ask` still never
+recalls memory or reads `KnowledgeStore`.
 
 - **Authorization.** `KnowledgeCommandsCapability.requires_computer_actions
   = True`, identically to `TasksCapability` — `Orchestrator.handle()`
   refuses to call `handle()` at all unless the request's `RequestContext`
   grants `allow_computer_actions`. This applies uniformly to every verb,
-  including the read-only `status` and `search` — there is no per-verb
-  trust tier in this milestone. This capability performs no authorization
-  of its own.
+  including the read-only `status`/`search` and the model-calling `ask` —
+  there is no per-verb trust tier. A denied request never parses,
+  retrieves evidence, opens the knowledge database, or calls the model.
+  This capability performs no authorization of its own.
 - **Command grammar**
   (`capabilities/knowledge_commands/command_parser.py`) — a hand-rolled
   tokenizer (not `argparse`, which remains reserved for the offline
   `scripts/knowledge.py` CLI grammar): `/knowledge`, `/knowledge help`,
   `/knowledge status [--source <key>]`,
   `/knowledge search [--source <key>] [--limit <1-10>] -- <query text>`,
+  `/knowledge ask [--source <key>] [--limit <1-5>] -- <question>`,
   `/knowledge ingest <key>`, `/knowledge confirm`, `/knowledge cancel`.
-  `search` requires exactly one literal bare `--` delimiter; everything
-  after the first one is query text, never re-parsed as options even if it
-  contains `--`-shaped tokens. `<key>` must match the same conservative
-  shape `kernel/knowledge_base/config.py` uses
-  (`^[a-z0-9][a-z0-9_-]{0,63}$`) and is casefolded; a shape-valid but
+  `search` and `ask` each require exactly one literal bare `--`
+  delimiter; everything after the first one is query/question text, never
+  re-parsed as options even if it contains `--`-shaped tokens. `<key>`
+  must match the same conservative shape `kernel/knowledge_base/config.py`
+  uses (`^[a-z0-9][a-z0-9_-]{0,63}$`) and is casefolded; a shape-valid but
   unapproved key is still rejected downstream by the existing Milestone 36
-  allowlist, never by the parser itself. `--limit` is bounded to 1–10
-  (`MAX_INTERFACE_RESULT_LIMIT`) — tighter than `search()`'s own
-  service-level cap of 50. Any extra token, missing token, unknown or
-  duplicate option, missing option value, missing delimiter, blank query,
-  or malformed key is a `KnowledgeParseError` with a stable, symbolic
+  allowlist, never by the parser itself. `search`'s `--limit` is bounded
+  to 1–10 (`MAX_INTERFACE_RESULT_LIMIT`) — tighter than `search()`'s own
+  service-level cap of 50. `ask`'s `--limit` is a separate 1–5
+  evidence-chunk count (`MAX_ASK_EVIDENCE_LIMIT`, default 3) and its
+  question text is bounded to 1–200 characters
+  (`MAX_QUESTION_CHARACTERS`, a literal deliberately duplicated from
+  `kernel/knowledge_base/query.py`'s `MAX_QUERY_CHARACTERS` rather than
+  imported, matching this module's existing no-dependency policy). Any
+  extra token, missing token, unknown or duplicate option, missing option
+  value, missing delimiter, blank query/question, an oversized question,
+  or a malformed key is a `KnowledgeParseError` with a stable, symbolic
   reason, surfaced as one fixed reply
   (`Invalid knowledge command. Use /knowledge help.`) — never guessed at.
-- **Read-only execution.** `status` calls the new
+- **Read-only execution.** `status` calls
   `kernel/knowledge_base/status.py:get_status()`; `search` calls the
   existing, unmodified `kernel/knowledge_base/search.py:search()`,
   requesting at most 10 results. Neither requires confirmation. The raw
   query text is passed only transiently through the parser and this call
-  stack — never logged, audited, or stored in pending confirmation state.
+  stack — never logged or audited — and, as of Milestone 38, `search`'s
+  result is returned as `EphemeralResult` (see Orchestrator below) so the
+  orchestrator does not persist it to memory or the interaction log
+  either.
+- **Grounded answering (`ask`, Milestone 38).** Retrieves bounded evidence
+  via `kernel/knowledge_base/evidence.py:retrieve_evidence()` — the same
+  lexical FTS5 mechanics `search()` uses, factored into
+  `kernel/knowledge_base/query.py` so both share one implementation of
+  query validation, source filtering, FTS literal transformation, and
+  ranking order — returning full (still bounded) chunk text instead of a
+  short excerpt: at most 5 chunks, 1,500 characters each, 7,500 total,
+  dropped whole (never partially) once the running total would exceed
+  budget. If no evidence is found, the model is never called. Otherwise
+  `kernel/knowledge_base/answer.py` (pure — no I/O, no model call)
+  assembles one flat prompt: fixed instructions from
+  `prompts/knowledge/ask_system.md`, then the untrusted question and
+  evidence as one `json.dumps(..., ensure_ascii=False)` object between
+  fixed marker lines — `json.dumps()` escapes every newline inside string
+  values, so the whole blob is always one line and retrieved evidence can
+  never produce a standalone line matching the closing marker, without
+  any zero-width-character or delimiter-mutation trick. The capability
+  calls its injected `ModelProvider.send_prompt()` exactly once and
+  strictly parses the required `{"answer", "used_citations",
+  "sufficient"}` JSON response: wrong shape, an invented or unsupplied
+  citation label, an inline/`used_citations` mismatch, or an empty answer
+  all fail closed to a fixed "unverifiable answer" reply, distinct from
+  the fixed "insufficient evidence" reply used when the model itself
+  reports `sufficient: false`. Citation labels (`S1`..`S5`) are assigned
+  by code in retrieval order, never by the model, and the appended
+  "Sources:" section is generated entirely from code-owned metadata
+  (symbolic source key, relative path, chunk ordinal — never a chunk ID,
+  a rank, or an absolute path). A provider exception (including a
+  request timeout — `kernel/models/ollama.py`'s fixed
+  `OLLAMA_REQUEST_TIMEOUT_SECONDS = 120`) is caught and mapped to one
+  fixed "service temporarily unavailable" reply; the raw exception never
+  reaches the reply, the audit record, memory, or the interaction log.
+  **Consent (v1):** the explicit `/knowledge ask` command is itself
+  sufficient consent — no second confirmation, nothing in
+  `PendingAction` — acceptable because the only implemented provider is
+  local Ollama; this must be revisited before a remote provider is ever
+  enabled for this operation, since `ModelProvider` has no
+  locality-detection contract and this milestone deliberately does not
+  add one. `ask`'s result, like `search`'s, is returned as
+  `EphemeralResult`.
 - **Confirmation.** `ingest` is sensitive: the symbolic key is checked
   against the current approved-source allowlist immediately (no source
   pre-scan, no document-count disclosure) and, if approved, only
@@ -1042,29 +1141,43 @@ fully deterministic: no model call, no memory recall, no
   `kernel.tools.confirmation.ConfirmationStore` instance from
   `capabilities/tasks/TasksCapability`'s `default_store`, so the two
   command families can never collide over the single-slot design
-  `kernel/tools/confirmation.py` describes.
+  `kernel/tools/confirmation.py` describes. `ask` does not use this store
+  at all (see consent, above).
 - **Output limits and privacy.** Fixed, interface-level limits in addition
   to Milestone 36's own service-level ones: at most 10 results requested,
   a 200-character excerpt, an 80-character path, and a 3,500-character
   total reply, all truncated deterministically with a visible ellipsis;
   when complete results don't all fit, whole results are dropped from the
   end and a fixed notice is appended — never a partial result, never split
-  across multiple messages. Every recognized failure maps to one fixed
-  message by exception type via the shared
-  `kernel/knowledge_base/messages.py:message_for_error()` — never
-  `str(exc)`. Audit events reuse `kernel/tools/audit.py` (the same module
-  and log file `/task` uses) with only a fixed action name, the symbolic
-  source key when applicable, and a fixed outcome — never query text, an
-  excerpt, a path, SQL, an FTS expression, or an exception.
-- **Out of scope**, as for Milestone 36: automatic RAG, automatic
-  retrieval before a model call, prompt-context injection, embeddings,
-  semantic/vector search, model-generated summaries, path-based or
-  partial-source ingestion, scheduled or background ingestion, deletion
-  commands, document-content display. `search()`'s typed core API is the
-  same one a future, explicit RAG/retrieval integration could call —
-  nothing here forecloses that; it simply isn't wired to a model yet. The
-  offline `scripts/knowledge.py` CLI remains available and unaffected by
-  this capability's trust gating.
+  across multiple messages. `ask`'s generated answer is bounded to 2,500
+  characters and at most 5 source entries are displayed, within the same
+  3,500-character reply budget; if a citation's `[S#]` token is still
+  present in the (possibly truncated) answer, its source entry is never
+  dropped to make room — the answer is reduced further instead, or the
+  fixed unverifiable-answer reply is returned. Every recognized failure
+  maps to one fixed message by exception type via the shared
+  `kernel/knowledge_base/messages.py:message_for_error()`, or, for `ask`'s
+  model-specific outcomes, one of a small set of additional fixed strings
+  — never `str(exc)`. Audit events reuse `kernel/tools/audit.py` (the
+  same module and log file `/task` uses) with only a fixed action name,
+  the symbolic source key when applicable, and a fixed outcome
+  (`executed`/`failed`/`rejected`) — never query/question text, evidence,
+  an excerpt, an answer, a path, SQL, an FTS expression, a prompt, a
+  provider response, or an exception.
+- **Out of scope**: automatic RAG, automatic or intent-detected retrieval
+  before a model call, prompt-context injection into ordinary prompts,
+  embeddings, semantic/vector search, hybrid retrieval, web search,
+  external connectors, model-generated summaries or ingestion metadata,
+  path-based or partial-source ingestion, scheduled or background
+  ingestion, deletion commands, document-content display, multi-turn
+  grounded conversation, answer caching, self-critique or citation-repair
+  model calls, streaming, remote-provider detection, per-provider consent
+  logic. `search()`'s and `retrieve_evidence()`'s typed core APIs are the
+  same ones a future, explicit semantic/embedding-based retrieval
+  integration could sit behind — nothing here forecloses that; `ask` is
+  explicit retrieval-augmented generation, never automatic. The offline
+  `scripts/knowledge.py` CLI remains available and unaffected by this
+  capability's trust gating.
 
 Each capability is meant to be a self-contained domain expert that uses
 kernel services (memory, knowledge, tools, models) to do its job. Capabilities
@@ -1520,6 +1633,34 @@ this flow — a single call to `handle()` is one full request/response cycle.
   milestone only adds a command-parsing and confirmation layer in front of
   the existing, unmodified core functions. See Kernel and Capabilities
   above for the full detail.
+- Milestone 38 — Safe Explicit Knowledge-Grounded Answers: adds
+  `/knowledge ask`, an explicit, single-shot, retrieval-grounded
+  question-answering verb on `KnowledgeCommandsCapability`, behind the
+  same `requires_computer_actions` trust gate as every other verb. Adds
+  `kernel/knowledge_base/query.py` (lexical query mechanics factored out
+  of `search.py` so `search.py` and the new `evidence.py` share one
+  implementation, with no change to `search.py`'s public API or
+  behavior), `kernel/knowledge_base/evidence.py` (`retrieve_evidence()` —
+  bounded full-chunk-text retrieval, sharing `search()`'s ranking and
+  validation), and `kernel/knowledge_base/answer.py` (pure prompt
+  construction from `prompts/knowledge/ask_system.md` plus a
+  `json.dumps(..., ensure_ascii=False)` untrusted-data block between fixed
+  marker lines, and strict structured-response parsing/citation
+  validation) — none of which invoke a model or the network themselves;
+  the capability makes the one model call. Adds `EphemeralResult`
+  (`kernel/capabilities/base.py`) and a matching `Orchestrator.handle()`
+  branch so a capability response can opt out of the
+  memory-write/interaction-log tail — used for `ask` (question, evidence,
+  and answer must never be persisted) and, correcting a Milestone 37 gap,
+  for `search` (query text and results were previously still reaching
+  that unconditional tail even though the capability itself never logged
+  or audited them). Adds a fixed `OLLAMA_REQUEST_TIMEOUT_SECONDS = 120` to
+  `kernel/models/ollama.py`'s `urlopen()` call, so a provider timeout is
+  possible to map to a fixed reply instead of hanging indefinitely.
+  Consent v1: the explicit `/knowledge ask` command is itself sufficient
+  consent, acceptable only because the sole implemented provider is local
+  Ollama — revisit before any remote provider is enabled for this
+  operation. See Kernel and Capabilities above for the full detail.
 
 **Planned / not yet implemented:**
 
@@ -1541,13 +1682,20 @@ this flow — a single call to `handle()` is one full request/response cycle.
   unrelated lexical-search service over `.md`/`.txt` sources — see Kernel
   above — and does not change any of this.)
 - Automatic RAG or orchestrator-driven retrieval from
-  `kernel/knowledge_base/` before a model call; prompt-context injection;
-  embeddings or semantic/vector search over that index; model-generated
-  summaries or metadata. (Milestone 37 added explicit, human-triggered
-  `/knowledge status`/`search`/`ingest` commands — see Capabilities and
-  Milestone 37 above — but nothing calls a model or retrieves
-  automatically; a future explicit RAG/retrieval integration could reuse
-  the same typed `search()` API these commands already call, but that
+  `kernel/knowledge_base/` before an *ordinary* model call; retrieval
+  triggered by natural-language intent detection; prompt-context injection
+  into ordinary prompts; embeddings or semantic/vector search over that
+  index; hybrid retrieval; model-generated summaries or metadata;
+  multi-turn grounded conversation; answer caching; self-critique or
+  citation-repair model calls. (Milestone 37 added explicit,
+  human-triggered `/knowledge status`/`search`/`ingest` commands, and
+  Milestone 38 added explicit, human-triggered `/knowledge ask` —
+  single-shot, lexical-retrieval-grounded answering behind the same
+  `requires_computer_actions` trust gate, calling the model exactly once
+  per request — see Capabilities above. Nothing calls a model or retrieves
+  automatically for an ordinary prompt; a future semantic/embedding-based
+  retrieval integration could reuse the same typed
+  `evidence.py:retrieve_evidence()` API `ask` already calls, but that
   integration itself remains unimplemented.)
 - Automatic (non-command-triggered) ingestion, scheduled ingestion, file
   watchers, web/remote-URL ingestion, deletion commands, document-content

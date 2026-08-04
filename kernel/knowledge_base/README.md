@@ -16,11 +16,18 @@ Distinct from `kernel/knowledge/` (the read-only `KnowledgeStore`
 ranking don't fit that contract, so this is a separate, sibling kernel
 package rather than a new `KnowledgeStore` implementation. Also distinct
 from `capabilities/knowledge/`, an unrelated, still-unimplemented
-capability stub. Nothing in this package is wired into the orchestrator,
-a capability, WhatsApp, memory, or a model - the only caller is
-`scripts/knowledge.py`, a human-invoked, offline CLI (see that script and
-`scripts/README.md`). A future orchestrator/RAG integration that reads
-from this index is explicitly not part of this milestone.
+capability stub reserved for a future, different AI-employee capability
+(not to be confused with `capabilities/knowledge_commands/` below).
+Nothing in this package ever calls a model or the network. There are two
+callers: `scripts/knowledge.py`, a human-invoked, offline CLI (see that
+script and `scripts/README.md`), and, as of Milestone 37,
+`capabilities/knowledge_commands/KnowledgeCommandsCapability` - a
+deterministic `/knowledge` command capability reachable only through
+`interfaces/whatsapp/` with the orchestrator's existing
+`requires_computer_actions` trust gate (see that package's README and
+`docs/architecture.md`). An *automatic* orchestrator/RAG integration that
+reads from this index before a model call is still explicitly out of
+scope - see below.
 
 ## Configuration
 
@@ -190,13 +197,23 @@ the database path, SQL, or a full document - only `source_key`,
 `relative_path`, `chunk_ordinal`, a bounded `excerpt`, `rank`, and
 `chunk_id`.
 
-## Operational interface
+## Operational interfaces
 
 `scripts/knowledge.py` (see `scripts/README.md`) - `status`, `ingest
-<source_key>`, and `search "<query>"` - is the only way to reach this
-package today. It is a human-invoked, offline CLI outside the runtime
-kernel, exactly like the existing wine-domain scripts; it is never called
-by the orchestrator, a capability, or a model.
+<source_key>`, and `search "<query>"` - is a human-invoked, offline CLI
+outside the runtime kernel, exactly like the existing wine-domain
+scripts; it is never called by the orchestrator, a capability, or a
+model.
+
+As of Milestone 37, `capabilities/knowledge_commands/
+KnowledgeCommandsCapability` is a second caller, reachable through the
+orchestrator via a strict `/knowledge ...` command grammar (see that
+package's README). It calls this package's `get_status()`, `search()`,
+and `ingest_source()` unmodified - no SQL or business logic is duplicated
+there. It is gated by the same `requires_computer_actions` trust
+mechanism `capabilities/tasks/TasksCapability` uses, so today it is only
+reachable via `interfaces/whatsapp/`'s trusted context; it still never
+calls a model itself.
 
 ## Logging and privacy
 
@@ -205,9 +222,11 @@ outcome, document/chunk counts, elapsed time, and a fixed error category.
 Document content, query text, excerpts, absolute paths, the database
 path, SQL, exception text, and tracebacks are never logged, in any mode -
 there is no debug flag that relaxes this. Every user-facing error is one
-of a small set of fixed, privacy-safe messages (see `types.py`'s error
-classes and `scripts/knowledge.py`); callers must select a message by
-exception type, never by relaying `str(exc)`.
+of a small set of fixed, privacy-safe messages, centralized in
+`messages.py`'s `message_for_error()` (keyed by exception type, never by
+relaying `str(exc)`) - both `scripts/knowledge.py` and
+`capabilities/knowledge_commands/` select their reply text through that
+one shared mapping rather than each keeping their own copy.
 
 ## Explicitly out of scope (Milestone 36)
 

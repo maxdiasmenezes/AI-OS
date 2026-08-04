@@ -8,9 +8,11 @@ know how sources are configured, traversed, chunked, stored, or searched.
 This is deliberately separate from kernel/knowledge/ (the read-only
 KnowledgeStore get()/list_records() contract used by capabilities such as
 WineCapability) - search and ranking do not fit that contract, and this
-package is not wired into it. Nothing here is reached by the orchestrator,
-a capability, WhatsApp, memory, or a model; the only caller is
-scripts/knowledge.py.
+package is not wired into it. Nothing here ever calls a model or the
+network. Callers: scripts/knowledge.py (a human-invoked, offline CLI) and,
+as of Milestone 37, capabilities/knowledge_commands/ (the deterministic,
+trusted-context-gated `/knowledge` command capability) - both call into
+this package, never the other way around.
 """
 
 from kernel.knowledge_base.config import (
@@ -19,7 +21,13 @@ from kernel.knowledge_base.config import (
     load_knowledge_base_config,
 )
 from kernel.knowledge_base.ingest import ingest_source
-from kernel.knowledge_base.search import search
+from kernel.knowledge_base.messages import GENERIC_FAILURE_MESSAGE, message_for_error
+from kernel.knowledge_base.search import (
+    DEFAULT_RESULT_LIMIT,
+    MAX_RESULT_LIMIT,
+    search,
+)
+from kernel.knowledge_base.status import get_status
 from kernel.knowledge_base.types import (
     DatabaseLockedError,
     DatabaseUnavailableError,
@@ -35,6 +43,7 @@ from kernel.knowledge_base.types import (
     SchemaIncompatibleError,
     SearchFailedError,
     SourceLimitExceededError,
+    SourceStatus,
     SourceUnavailableError,
     UnknownSourceError,
 )
@@ -45,8 +54,14 @@ __all__ = [
     "load_knowledge_base_config",
     "ingest_source",
     "search",
+    "get_status",
+    "DEFAULT_RESULT_LIMIT",
+    "MAX_RESULT_LIMIT",
+    "message_for_error",
+    "GENERIC_FAILURE_MESSAGE",
     "IngestResult",
     "KnowledgeSearchResult",
+    "SourceStatus",
     "KnowledgeBaseError",
     "KnowledgeConfigError",
     "UnknownSourceError",

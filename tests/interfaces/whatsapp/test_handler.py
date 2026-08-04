@@ -171,6 +171,32 @@ def test_text_task_is_handled_with_a_trusted_computer_actions_context():
     assert context.actor == "whatsapp"
 
 
+def test_knowledge_command_text_task_also_receives_the_trusted_context():
+    # Milestone 37: classify_message()/MessageHandler are fully generic -
+    # a "/knowledge ..." message is just another TextTask, so it reaches
+    # the same _TRUSTED_CONTEXT any other text does. No knowledge-specific
+    # wiring exists (or is needed) in this module.
+    orchestrator = FakeOrchestrator("status: ok")
+    client = RecordingClient()
+    handler = MessageHandler(orchestrator, client)
+
+    message = IncomingMessage(
+        message_id="wamid.2",
+        sender=SENDER,
+        phone_number_id=PHONE_NUMBER_ID,
+        message_type="text",
+        text="/knowledge status",
+    )
+    task = classify_message(message)
+    handler.handle_task(task)
+
+    assert isinstance(task, TextTask)
+    assert orchestrator.received_prompts == ["/knowledge status"]
+    context = orchestrator.received_contexts[0]
+    assert context.allow_computer_actions is True
+    assert context.actor == "whatsapp"
+
+
 def test_fixed_reply_task_never_calls_orchestrator_so_no_context_is_built():
     orchestrator = FakeOrchestrator("should not be reached")
     client = RecordingClient()

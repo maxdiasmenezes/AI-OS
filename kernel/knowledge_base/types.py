@@ -123,3 +123,21 @@ class KnowledgeSearchResult:
     excerpt: str
     rank: float
     chunk_id: str
+
+
+@dataclass(frozen=True)
+class SourceStatus:
+    """One approved source's ingestion status - see
+    kernel/knowledge_base/status.py. No path, no database location, no
+    internal row id - only aggregate counts and the symbolic key. A
+    source that has never been ingested reports ingested=False with
+    generation/document_count/chunk_count all 0 and last_ingested_at
+    None; a successfully ingested (even empty) source reports
+    ingested=True with generation >= 1."""
+
+    source_key: str
+    ingested: bool
+    generation: int
+    document_count: int
+    chunk_count: int
+    last_ingested_at: str | None

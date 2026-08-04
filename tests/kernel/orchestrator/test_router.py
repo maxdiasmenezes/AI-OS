@@ -160,3 +160,43 @@ def test_bottle_opener_still_does_not_route():
 def test_visit_a_winery_still_does_not_route():
     router = CapabilityRouter()
     assert router.route("Let's visit a winery.") is None
+
+
+# --- Milestone 37: "/knowledge" command prefix -----------------------------
+
+
+def test_knowledge_command_routes_to_knowledge():
+    router = CapabilityRouter()
+    assert router.route("/knowledge status") == "knowledge"
+
+
+def test_bare_knowledge_command_routes_to_knowledge():
+    router = CapabilityRouter()
+    assert router.route("/knowledge") == "knowledge"
+
+
+def test_knowledge_command_matching_is_case_insensitive():
+    router = CapabilityRouter()
+    assert router.route("/Knowledge status") == "knowledge"
+    assert router.route("/KNOWLEDGE search -- backup") == "knowledge"
+
+
+def test_knowledgeable_does_not_route_to_knowledge():
+    router = CapabilityRouter()
+    assert router.route("/knowledgeable status") is None
+
+
+def test_knowledge_embedded_mid_sentence_does_not_route():
+    router = CapabilityRouter()
+    assert router.route("Please check /knowledge status for me") is None
+
+
+def test_knowledge_command_not_confused_with_task_command():
+    router = CapabilityRouter()
+    assert router.route("/task status") == "tasks"
+    assert router.route("/knowledge status") == "knowledge"
+
+
+def test_knowledge_command_does_not_affect_wine_routing():
+    router = CapabilityRouter()
+    assert router.route("What wine goes with steak?") == "wine"

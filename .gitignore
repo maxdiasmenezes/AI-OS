@@ -58,3 +58,16 @@ storage/knowledge/*.json
 # absolute filesystem/application paths for this one machine. See
 # kernel/config/tools.example.yaml for the committed placeholder.
 kernel/config/tools.yaml
+
+# Milestone 36: local machine-specific approved knowledge sources - real
+# absolute filesystem paths for this one machine. See
+# kernel/config/knowledge_base.example.yaml for the committed placeholder.
+kernel/config/knowledge_base.yaml
+
+# Milestone 36: the local SQLite knowledge index (database file plus its
+# WAL/shared-memory/journal sidecar files) - machine-local derived data,
+# never committed.
+storage/knowledge/*.sqlite3
+storage/knowledge/*.sqlite3-wal
+storage/knowledge/*.sqlite3-shm
+storage/knowledge/*.sqlite3-journal

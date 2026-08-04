@@ -1,0 +1,32 @@
+# Committed placeholder for kernel/config/knowledge_base.yaml (Milestone
+# 36; see kernel/knowledge_base/config.py for the loader and every
+# validation rule enforced against the real file).
+#
+# Copy this file to kernel/config/knowledge_base.yaml (gitignored) and
+# replace every placeholder path with a real, absolute path on this one
+# machine. Never commit the real file.
+#
+# Rules enforced by kernel/knowledge_base/config.py:
+#   - approved_sources is the only top-level field.
+#   - Each source key must match ^[a-z0-9][a-z0-9_-]{0,63}$ and be unique
+#     even after case-folding.
+#   - Each source entry accepts exactly two fields: `path` (a string,
+#     required, must be an absolute path) and `recursive` (a boolean,
+#     required).
+#   - Duplicate YAML keys (including ones that only collide
+#     case-insensitively) are rejected.
+#   - A missing kernel/config/knowledge_base.yaml file is not an error -
+#     it is treated as zero approved sources (deny-all).
+#   - Parsing this file never touches the filesystem paths it names -
+#     that only happens when a source is actually ingested or searched.
+#
+# The knowledge index database itself is not configured here: its
+# location is always derived from the existing knowledge.storage_dir
+# setting in kernel/config/config.yaml (file name knowledge_index.sqlite3),
+# so this milestone never introduces a second, duplicate storage-location
+# setting.
+
+approved_sources:
+  ai_os_docs:
+    path: "C:/REPLACE_ME/AI-OS/docs"
+    recursive: true

@@ -212,8 +212,53 @@ package's README). It calls this package's `get_status()`, `search()`,
 and `ingest_source()` unmodified - no SQL or business logic is duplicated
 there. It is gated by the same `requires_computer_actions` trust
 mechanism `capabilities/tasks/TasksCapability` uses, so today it is only
-reachable via `interfaces/whatsapp/`'s trusted context; it still never
-calls a model itself.
+reachable via `interfaces/whatsapp/`'s trusted context.
+
+As of Milestone 38, that capability's `ask` verb is the one deliberate
+exception to "this package never calls a model": `retrieve_evidence()`
+(`kernel/knowledge_base/evidence.py`) is still a purely local, read-only
+lexical query - it never calls a model or the network, exactly like
+`search()` - but the capability then passes its result to
+`kernel/knowledge_base/answer.py`'s pure prompt-construction and
+response-parsing helpers and makes exactly one call to its own injected
+model provider. This package's own code still never invokes a model or
+the network anywhere; `answer.py` only prepares data for, and parses data
+from, a call the *capability* makes.
+
+## Evidence retrieval and grounded answering (Milestone 38)
+
+`kernel/knowledge_base/query.py` factors out the lexical-query mechanics
+`search()` and `retrieve_evidence()` both need - query validation, FTS5
+literal transformation, source-filter validation, limit validation, and
+the deterministic ranking tie-break order - so there is exactly one
+implementation of each, not two that could quietly drift apart.
+
+`retrieve_evidence(question, source_keys=None, limit=3, *, config=None,
+db_path=None)` (`kernel/knowledge_base/evidence.py`) is `search()`'s
+sibling for `/knowledge ask`: the same single, read-only, parameterized,
+ranked query, selecting full (still bounded) chunk text instead of a
+short `snippet()` excerpt. There is no second, caller-controlled chunk-ID
+lookup - full text comes from the same ranked query already scoped to the
+request, so there is nothing for a second retrieval step to do. Fixed
+limits: at most 5 evidence chunks (default 3), at most 1,500 characters
+per chunk (chunking already caps a real chunk smaller, at 1,200), at most
+7,500 characters of evidence total - a chunk that would push the running
+total over budget is dropped whole, in rank order, never included
+partially.
+
+`kernel/knowledge_base/answer.py` is pure (no I/O, no model call, no
+network): it assembles the one flat prompt string sent to the model
+provider - fixed instructions from `prompts/knowledge/ask_system.md`,
+followed by the untrusted question and evidence as one
+`json.dumps(..., ensure_ascii=False)` object between fixed marker lines -
+and strictly parses/validates the model's required
+`{"answer", "used_citations", "sufficient"}` JSON response. Citation
+labels (`S1`..`S5`) are assigned by code, in retrieval order, never by the
+model; any malformed, inconsistent, or unverifiable response (wrong
+shape, invented or missing citations, inline/`used_citations` mismatch,
+an empty answer) is rejected, never partially trusted. See
+`capabilities/knowledge_commands/README.md` for the full `/knowledge ask`
+command, consent policy, and fixed-reply behavior.
 
 ## Logging and privacy
 

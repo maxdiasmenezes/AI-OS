@@ -846,3 +846,44 @@ def test_capability_module_imports_nothing_from_scripts_knowledge():
         assert "requests" not in imported_names
         assert "socket" not in imported_names
         assert "subprocess" not in imported_names
+
+
+# --- Milestone 38: search returns EphemeralResult -------------------------
+
+
+def test_search_result_is_ephemeral():
+    from kernel.capabilities.base import EphemeralResult
+
+    capability, _ = _make_capability(search_fn=_RecordingFn(result=[]))
+    response = capability.handle("/knowledge search -- backup")
+
+    assert isinstance(response, EphemeralResult)
+    assert response == "No results found."
+
+
+def test_search_error_result_is_ephemeral():
+    from kernel.capabilities.base import EphemeralResult
+
+    fake_search = _RecordingFn(error=DatabaseUnavailableError("knowledge database is unavailable"))
+    capability, _ = _make_capability(search_fn=fake_search)
+
+    response = capability.handle("/knowledge search -- backup")
+
+    assert isinstance(response, EphemeralResult)
+    assert response == "Knowledge database is unavailable."
+
+
+def test_status_ingest_confirm_cancel_help_remain_plain_str():
+    from kernel.capabilities.base import EphemeralResult
+
+    capability, _ = _make_capability(status_fn=_RecordingFn(result=[]))
+    assert type(capability.handle("/knowledge status")) is str
+    assert type(capability.handle("/knowledge help")) is str
+    assert type(capability.handle("/knowledge cancel")) is str
+
+    ingest_capability, _ = _make_capability(
+        config=_config({"ai_os_docs": "x"}), ingest_fn=_RecordingFn()
+    )
+    propose_response = ingest_capability.handle("/knowledge ingest ai_os_docs")
+    assert type(propose_response) is str
+    assert not isinstance(propose_response, EphemeralResult)

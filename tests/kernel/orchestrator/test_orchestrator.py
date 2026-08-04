@@ -8,7 +8,7 @@ import pytest
 
 from capabilities.loader import CapabilityLoader
 from capabilities.wine.capability import WineCapability
-from kernel.capabilities.base import Capability
+from kernel.capabilities.base import Capability, EphemeralResult
 from kernel.config.config import Config
 from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.memory import MemoryEntry, MemoryManager
@@ -86,6 +86,25 @@ class FakeTrustedCapability(Capability):
     def handle(self, prompt: str) -> str:
         self.received_prompts.append(prompt)
         return self._response_text
+
+
+class FakeEphemeralCapability(Capability):
+    """A capability that returns EphemeralResult - proving the orchestrator
+    can skip the remember/log tail for a specific response without any
+    other change to its behavior."""
+
+    def __init__(self, capability_id: str, response_text: str):
+        self._id = capability_id
+        self._response_text = response_text
+        self.received_prompts: list[str] = []
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    def handle(self, prompt: str) -> EphemeralResult:
+        self.received_prompts.append(prompt)
+        return EphemeralResult(self._response_text)
 
 
 class FakeBadCapability(Capability):
@@ -1170,3 +1189,197 @@ def test_knowledge_and_task_routes_do_not_interfere_with_each_other(
 
     assert task_response.text == deterministic_system_status
     assert knowledge_response.text == "No knowledge sources are configured."
+
+
+# --- Milestone 38: EphemeralResult (non-persistent capability results) -----
+
+
+def test_ephemeral_result_is_string_compatible():
+    result = EphemeralResult("hello")
+    assert result == "hello"
+    assert isinstance(result, str)
+
+
+def test_ephemeral_capability_response_not_remembered(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeEphemeralCapability("knowledge", "ephemeral answer")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("/knowledge ask -- secret question")
+
+    memory = MemoryManager(config.memory_settings)
+    assert memory.recall("conversation") == []
+
+
+def test_ephemeral_capability_response_not_logged(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeEphemeralCapability("knowledge", "ephemeral answer")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("/knowledge ask -- secret question")
+
+    assert not config.log_path.exists()
+
+
+def test_ephemeral_capability_still_returns_correct_response_text(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeEphemeralCapability("knowledge", "ephemeral answer")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("/knowledge ask -- secret question")
+
+    assert response.text == "ephemeral answer"
+    assert response.model == "capability:knowledge"
+
+
+def test_ordinary_str_capability_result_still_persisted(monkeypatch, tmp_path):
+    # Not an EphemeralResult - a plain str - must keep being remembered and
+    # logged exactly as before Milestone 38.
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    fake_capability = FakeCapability("wine", "an ordinary plain-str response")
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("What wine goes with steak?")
+
+    memory = MemoryManager(config.memory_settings)
+    assert len(memory.recall("conversation")) == 2
+    assert config.log_path.exists()
+
+
+def test_ordinary_model_response_capability_result_still_persisted(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    capability_response = ModelResponse(
+        text="a model-backed response", model="real-model", input_tokens=1, output_tokens=1, latency_seconds=0.1
+    )
+    fake_capability = FakeModelBackedCapability("wine", capability_response)
+    loader = Mock(return_value=fake_capability)
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("What's a good wine region to explore?")
+
+    memory = MemoryManager(config.memory_settings)
+    assert len(memory.recall("conversation")) == 2
+    assert config.log_path.exists()
+
+
+def test_computer_action_denial_response_still_persisted_when_ephemeral_capability_would_be_denied(
+    monkeypatch, tmp_path
+):
+    # A denied request never calls handle() at all, so it can never return
+    # EphemeralResult - the denial response keeps its existing persistence
+    # behavior unconditionally.
+    class FakeTrustedEphemeralCapability(Capability):
+        requires_computer_actions = True
+
+        def __init__(self, capability_id: str):
+            self._id = capability_id
+
+        @property
+        def id(self) -> str:
+            return self._id
+
+        def handle(self, prompt: str) -> EphemeralResult:
+            raise AssertionError("handle() must never be called for a denied request")
+
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response())
+    loader = Mock(return_value=FakeTrustedEphemeralCapability("knowledge"))
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    response = orchestrator.handle("/knowledge ask -- question")  # no context -> denied
+
+    assert response.text == COMPUTER_ACTIONS_DENIED_TEXT
+    memory = MemoryManager(config.memory_settings)
+    assert len(memory.recall("conversation")) == 2
+    assert config.log_path.exists()
+
+
+def test_ordinary_model_fallback_unaffected_by_ephemeral_mechanism(monkeypatch, tmp_path):
+    config = _make_config(tmp_path)
+    fixed_response = _fake_response("it's sunny tomorrow")
+    fake_provider = FakeModelProvider(fixed_response)
+    loader = Mock()
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, loader)
+    orchestrator.handle("What's the weather tomorrow?")
+
+    memory = MemoryManager(config.memory_settings)
+    assert len(memory.recall("conversation")) == 2
+    assert config.log_path.exists()
+
+
+# --- Milestone 38: real /knowledge search and /knowledge ask are non-persistent ---
+
+
+def test_real_knowledge_search_via_trusted_context_is_not_persisted(monkeypatch, tmp_path):
+    # End-to-end with the real router + real CapabilityLoader + real
+    # KnowledgeCommandsCapability: only the capability's own search_fn
+    # reference is replaced (never touching the real knowledge database),
+    # proving the *orchestrator's* persistence tail is skipped for the
+    # real, unmodified /knowledge search execution path.
+    import kernel.knowledge_base.config as kb_config
+
+    monkeypatch.setattr(
+        kb_config, "DEFAULT_KNOWLEDGE_BASE_YAML_PATH", tmp_path / "knowledge_base.yaml"
+    )
+    monkeypatch.setattr(
+        "capabilities.knowledge_commands.capability.kb_search", lambda *a, **k: []
+    )
+
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+    trusted_context = RequestContext(allow_computer_actions=True, actor="whatsapp")
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle(
+        "/knowledge search -- a-very-specific-secret-query-token", context=trusted_context
+    )
+
+    assert response.text == "No results found."
+    assert fake_provider.received_prompts == []  # search never calls a model
+
+    memory = MemoryManager(config.memory_settings)
+    assert memory.recall("conversation") == []
+    assert not config.log_path.exists()
+
+
+def test_real_knowledge_ask_via_trusted_context_is_not_persisted(monkeypatch, tmp_path):
+    # Same shape as the search proof above, but for /knowledge ask: the
+    # capability's evidence_fn reference is replaced with an empty result
+    # so no model call happens and no real database is touched, while
+    # everything else (router, loader, capability, orchestrator) is real.
+    import kernel.knowledge_base.config as kb_config
+
+    monkeypatch.setattr(
+        kb_config, "DEFAULT_KNOWLEDGE_BASE_YAML_PATH", tmp_path / "knowledge_base.yaml"
+    )
+    monkeypatch.setattr(
+        "capabilities.knowledge_commands.capability.retrieve_evidence", lambda *a, **k: []
+    )
+
+    config = _make_config(tmp_path)
+    fake_provider = FakeModelProvider(_fake_response("should not be used"))
+    real_loader = CapabilityLoader()
+    trusted_context = RequestContext(allow_computer_actions=True, actor="whatsapp")
+
+    orchestrator = _make_orchestrator(monkeypatch, config, fake_provider, real_loader.load)
+    response = orchestrator.handle(
+        "/knowledge ask -- a-very-specific-secret-question-token", context=trusted_context
+    )
+
+    assert response.text == "No relevant local knowledge was found for that question."
+    assert fake_provider.received_prompts == []  # no evidence -> model never called
+
+    memory = MemoryManager(config.memory_settings)
+    assert memory.recall("conversation") == []
+    assert not config.log_path.exists()

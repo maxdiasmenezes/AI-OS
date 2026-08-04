@@ -19,27 +19,43 @@ kernel/config/knowledge_base.yaml's approved_sources keys):
     /knowledge search --limit <1-10> -- <query text>
     /knowledge search --source <source-key> --limit <1-10> -- <query text>
     /knowledge search --limit <1-10> --source <source-key> -- <query text>
+    /knowledge ask -- <question>
+    /knowledge ask --source <source-key> -- <question>
+    /knowledge ask --limit <1-5> -- <question>
+    /knowledge ask --source <source-key> --limit <1-5> -- <question>
+    /knowledge ask --limit <1-5> --source <source-key> -- <question>
     /knowledge ingest <source-key>
     /knowledge confirm
     /knowledge cancel
 
-`search` requires exactly one literal bare `--` token separating options
-from query text; everything after the first bare `--` is query text, not
-command syntax - it is never re-parsed for further options, even if it
-itself contains tokens that look like `--source` or another `--`.
-`--source`/`--limit` may each appear at most once and in either order.
-A source key must match kernel/knowledge_base/config.py's own
-_SOURCE_KEY_RE shape (^[a-z0-9][a-z0-9_-]{0,63}$) - this is a shape check
-only; whether it is currently *approved* is decided later, downstream, by
-the existing Milestone 36 allowlist (config.approved_sources), never by
-this module. A `--limit` value must be an unsigned integer from 1 through
-10 (MAX_INTERFACE_RESULT_LIMIT) - this is the interface-level cap, tighter
-than kernel/knowledge_base/search.py's own service-level cap of 50.
+`search` and `ask` each require exactly one literal bare `--` token
+separating options from query/question text; everything after the first
+bare `--` is query/question text, not command syntax - it is never
+re-parsed for further options, even if it itself contains tokens that look
+like `--source` or another `--`. `--source`/`--limit` may each appear at
+most once and in either order. A source key must match
+kernel/knowledge_base/config.py's own _SOURCE_KEY_RE shape
+(^[a-z0-9][a-z0-9_-]{0,63}$) - this is a shape check only; whether it is
+currently *approved* is decided later, downstream, by the existing
+Milestone 36 allowlist (config.approved_sources), never by this module.
+`search`'s `--limit` value must be an unsigned integer from 1 through 10
+(MAX_INTERFACE_RESULT_LIMIT) - this is the interface-level cap, tighter
+than kernel/knowledge_base/search.py's own service-level cap of 50. `ask`'s
+`--limit` value (an evidence-chunk count, a distinct concept from search's
+result count, deliberately not sharing a range) must be an unsigned
+integer from 1 through 5 (MAX_ASK_EVIDENCE_LIMIT); its question text must
+be from 1 through 200 characters (MAX_QUESTION_CHARACTERS) after the same
+whitespace-run normalization every command's tokens already get - this
+mirrors kernel/knowledge_base/query.py's MAX_QUERY_CHARACTERS as a
+deliberately duplicated literal (not an import), matching this module's
+existing policy of having no dependency on kernel/knowledge_base/ for pure
+grammar validation (see the source-key shape regex below for the same
+policy already in effect).
 
-Query text preserves every user-supplied Unicode letter and punctuation
-character exactly; only whitespace *runs* between tokens are normalized
-to a single ASCII space (an artifact of token-based splitting, not
-content mutation).
+Query/question text preserves every user-supplied Unicode letter and
+punctuation character exactly; only whitespace *runs* between tokens are
+normalized to a single ASCII space (an artifact of token-based splitting,
+not content mutation).
 """
 
 import re
@@ -50,6 +66,13 @@ KNOWLEDGE_PREFIX = "/knowledge"
 MIN_INTERFACE_RESULT_LIMIT = 1
 MAX_INTERFACE_RESULT_LIMIT = 10
 
+MIN_ASK_EVIDENCE_LIMIT = 1
+MAX_ASK_EVIDENCE_LIMIT = 5
+
+# Deliberately duplicated from kernel/knowledge_base/query.py's
+# MAX_QUERY_CHARACTERS rather than imported - see module docstring.
+MAX_QUESTION_CHARACTERS = 200
+
 # Same conservative shape kernel/knowledge_base/config.py's own
 # _SOURCE_KEY_RE uses - duplicated rather than imported so this module has
 # no dependency on kernel/knowledge_base/ for pure grammar validation;
@@ -58,12 +81,12 @@ MAX_INTERFACE_RESULT_LIMIT = 10
 _SOURCE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _LIMIT_RE = re.compile(r"^[0-9]+$")
 
-_KNOWN_VERBS = frozenset({"help", "status", "search", "ingest", "confirm", "cancel"})
+_KNOWN_VERBS = frozenset({"help", "status", "search", "ask", "ingest", "confirm", "cancel"})
 
 
 @dataclass(frozen=True)
 class ParsedKnowledgeCommand:
-    verb: str  # "help" | "status" | "search" | "ingest" | "confirm" | "cancel"
+    verb: str  # "help" | "status" | "search" | "ask" | "ingest" | "confirm" | "cancel"
     source_key: str | None = None
     limit: int | None = None
     query: str | None = None
@@ -166,6 +189,43 @@ def _parse_search(args: list[str]):
     return ParsedKnowledgeCommand("search", source_key=source_key, limit=limit, query=query)
 
 
+def _parse_ask(args: list[str]):
+    if not args:
+        return KnowledgeParseError("missing_delimiter")
+
+    options, remaining, error = _scan_options(args, frozenset({"--source", "--limit"}))
+    if error is not None:
+        return error
+
+    if not remaining or remaining[0] != "--":
+        return KnowledgeParseError("missing_delimiter")
+
+    question_tokens = remaining[1:]
+    if not question_tokens:
+        return KnowledgeParseError("blank_question")
+    question = " ".join(question_tokens)
+    if len(question) > MAX_QUESTION_CHARACTERS:
+        return KnowledgeParseError("oversized_question")
+
+    source_key = None
+    if "--source" in options:
+        source_key = options["--source"].casefold()
+        if not _is_valid_source_key_shape(source_key):
+            return KnowledgeParseError("invalid_source_key")
+
+    limit = None
+    if "--limit" in options:
+        raw_limit = options["--limit"]
+        if not _LIMIT_RE.match(raw_limit):
+            return KnowledgeParseError("invalid_limit")
+        parsed_limit = int(raw_limit)
+        if parsed_limit < MIN_ASK_EVIDENCE_LIMIT or parsed_limit > MAX_ASK_EVIDENCE_LIMIT:
+            return KnowledgeParseError("invalid_limit")
+        limit = parsed_limit
+
+    return ParsedKnowledgeCommand("ask", source_key=source_key, limit=limit, query=question)
+
+
 def parse_knowledge_command(prompt: str):
     """Parse one /knowledge command. Returns ParsedKnowledgeCommand on
     success or KnowledgeParseError on any malformed input - never raises,
@@ -194,4 +254,6 @@ def parse_knowledge_command(prompt: str):
         return _parse_status(args)
     if verb == "ingest":
         return _parse_ingest(args)
+    if verb == "ask":
+        return _parse_ask(args)
     return _parse_search(args)

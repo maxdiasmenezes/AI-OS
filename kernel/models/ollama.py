@@ -11,6 +11,16 @@ import urllib.request
 
 from kernel.models.base import ModelProvider, ModelResponse
 
+# Milestone 38: a fixed, code-level request timeout - not user-configurable,
+# not a per-command option. Without this, a hung or unreachable Ollama
+# server would hang urlopen() indefinitely, which made a bounded "model
+# timed out" response impossible for /knowledge ask. Passed straight to
+# urlopen(); on expiry or connection failure, urlopen() raises (e.g.
+# socket.timeout / urllib.error.URLError) - this module does not catch or
+# retry that, callers (e.g. capabilities/knowledge_commands/) are
+# responsible for mapping such an exception to a fixed, privacy-safe reply.
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 120
+
 
 class OllamaProvider(ModelProvider):
     """Sends prompts to a local Ollama server."""
@@ -42,7 +52,7 @@ class OllamaProvider(ModelProvider):
         )
 
         start = time.monotonic()
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read())
         latency_seconds = time.monotonic() - start
 

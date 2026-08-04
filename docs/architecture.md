@@ -396,7 +396,7 @@ tests for Content-Length edge cases `urllib` cannot express.
   package-internal module, so `search.py` and the new
   `kernel/knowledge_base/evidence.py` never duplicate them — `search.py`'s
   public API and behavior are unchanged.
-  `evidence.py:retrieve_evidence()` is `search()`'s sibling: the same
+  `evidence.py:retrieve_evidence()` is `search()`'s sibling: one
   single, read-only, parameterized, ranked query, selecting bounded full
   chunk text instead of a short `snippet()` excerpt (at most 5 chunks,
   1,500 characters each, 7,500 total), with no second, caller-controlled
@@ -409,6 +409,41 @@ tests for Content-Length edge cases `urllib` cannot express.
   `capabilities/knowledge_commands/KnowledgeCommandsCapability`, not by
   this package. This package's own code therefore still never calls a
   model or the network.
+
+  **Milestone 38.1 — ask-only natural-question matching.** Milestone 38's
+  `retrieve_evidence()` originally called the same strict, all-terms-`AND`
+  `build_match_expression()` `search()` uses, which made an ordinary
+  natural question ("How does the repository backup feature work?")
+  retrieve nothing: no chunk contains every generic framing word alongside
+  the real content terms. `search()` and `build_match_expression()` are
+  unchanged by this fix — `/knowledge search` still requires every
+  extracted term. `query.py` gained one additive, package-internal helper,
+  `extract_query_terms()` (validation, NFC normalization, tokenization,
+  case-insensitive dedup, the 20-term cap), factored out of
+  `build_match_expression()` — `build_match_expression()` is now a thin
+  wrapper over that helper, with no change to its own output.
+  `evidence.py` gained its own private, ask-only MATCH-expression builder
+  (`_build_evidence_match_expression()`): it
+  removes terms found in a small, fixed, code-owned generic-term set
+  (English and Portuguese interrogatives, articles, auxiliary verbs,
+  pronouns, function words, and negation words — never applied to
+  `search()`), returning `None` (and skipping the database entirely) if
+  nothing useful remains, and otherwise builds one deterministic
+  minimum-match FTS5 expression: one useful term stands alone; two require
+  both (identical in shape to `build_match_expression()`'s two-term output,
+  preserving Milestone 38's exact `"repository backup"` behavior); three or
+  more require any two, expressed as every two-term `AND` combination,
+  `OR`'d together, in original term order — bounded at "20 choose 2" = 190
+  pair clauses. The minimum-match rule is enforced by FTS5's own tokenizer,
+  not a second Python-side tokenization of chunk text, so it can never
+  disagree with the index on accents, Unicode normalization, or punctuation
+  boundaries. This is still exactly one read-only, parameterized SQL
+  query — no candidate-then-filter step, no fallback ladder, no
+  document-frequency query, no embeddings, no model-based query rewriting.
+  Lexical retrieval still does not stem (`backup`/`backups` are distinct
+  tokens), understand synonyms, translate, or understand negation
+  semantically; the complete original question, negation included, still
+  reaches the unchanged Milestone 38 grounded-answer prompt.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented

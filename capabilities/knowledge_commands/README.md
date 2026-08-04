@@ -110,10 +110,16 @@ confirmation state, and is garbage-collected with the request once
 ## Grounded answering (`ask`, Milestone 38)
 
 `ask` retrieves bounded local evidence via
-`kernel/knowledge_base/evidence.py:retrieve_evidence` (the same lexical
-FTS5 mechanics as `search`, sharing `kernel/knowledge_base/query.py`, but
-returning full bounded chunk text instead of a short excerpt - up to 5
-chunks, 1,500 characters each, 7,500 characters total) and, if any
+`kernel/knowledge_base/evidence.py:retrieve_evidence` (returning full
+bounded chunk text instead of a short excerpt - up to 5 chunks, 1,500
+characters each, 7,500 characters total). As of Milestone 38.1,
+`retrieve_evidence` shares `kernel/knowledge_base/query.py`'s validation
+and term-extraction with `search`, but builds its own ask-only,
+minimum-term FTS5 MATCH expression rather than `search`'s strict
+all-terms-AND one, so an ordinary natural question ("How does the
+repository backup feature work?") can still retrieve relevant evidence -
+see `kernel/knowledge_base/README.md` for the exact matching rule. This
+is still exactly one read-only, parameterized SQL query, and if any
 evidence was found, makes exactly one call to the model provider already
 injected by `CapabilityLoader`. The prompt is built by
 `kernel/knowledge_base/answer.py`: fixed instructions from

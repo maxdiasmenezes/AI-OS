@@ -188,23 +188,11 @@ responsibility:
   memory reachable through this interface — the orchestrator's own and
   every capability's — stays isolated from the CLI or any other interface
   sharing the same underlying storage.
-- **server** (`server.py`) — the composition root, the HTTP layer, *and*
-  the one place authorization and deduplication happen. `build_orchestrator
-  (config, capability_loader)` constructs the real `MemoryManager`, wraps
-  it in `FixedNamespaceMemory`, and constructs `Orchestrator(config,
-  capability_loader=capability_loader, memory_manager=scoped_memory)` —
-  the exact same `scoped_memory` object reaches the orchestrator's own
-  recall/remember calls and every capability, since nothing about the
-  seam copies or wraps it further. `build_server()` wires this together
-  with `WhatsAppClient` and a `MessageHandler` (which itself holds no
-  dedup cache or allow-list — see handler above) into a `WhatsAppServer`.
-  The server itself is `http.server.ThreadingHTTPServer`, bound to
-  `whatsapp_config.host` (validated loopback-only by `config.py` — never
-  bindable to a public or LAN address), since exposing it directly would
-  put the raw Cloud API access token and an unauthenticated webhook path
-  straight on the network; a real deployment terminates TLS and exposes
-  it publicly through a separate reverse proxy or tunnel, which this
-  repository does not provide. Exactly two operations exist -
+- **server** (`server.py`) — the HTTP layer and the one place
+  authorization and deduplication happen; see WhatsApp Server Lifecycle
+  below for how it starts, is composed, and shuts down. `MessageHandler`
+  itself holds no dedup cache or allow-list — see handler above. Exactly
+  two operations exist -
   `GET /webhook` and `POST /webhook`; every other path is `404`, and
   `PUT`/`DELETE`/`PATCH`/`HEAD`/`OPTIONS` on `/webhook` are `405` (the
   same methods elsewhere are `404` or `405`) — `send_error()` is
@@ -245,18 +233,40 @@ responsibility:
   escapes `MessageHandler`'s own handling is caught and logged only as a
   generic `worker_error` category, with no traceback or exception detail,
   and the worker moves on to the next task), and calls `task_done()` on
-  every item including the shutdown sentinel. `WhatsAppServer.stop()`
-  shuts the HTTP server down, then enqueues the shutdown sentinel *after*
-  whatever is already queued (so already-queued tasks are drained before
-  the worker sees it) and joins the worker with a bounded timeout, for a
-  graceful exit with no in-flight or already-queued message abandoned
-  mid-processing.
+  every item including the shutdown sentinel.
 
 Covered by an automated pytest suite (`tests/interfaces/whatsapp/`, one
 file per module) that makes no real network call — `WhatsAppClient` tests
 inject a fake `urlopen`; server tests exercise the real HTTP server only
 over loopback on an OS-assigned ephemeral port, including a few raw-socket
 tests for Content-Length edge cases `urllib` cannot express.
+
+#### WhatsApp Server Lifecycle
+
+The WhatsApp interface starts as its own process, `python -m
+interfaces.whatsapp.server`, independent of the CLI's `kernel/main.py`.
+`server.py`'s `build_orchestrator(config, capability_loader)` constructs
+the real `MemoryManager`, wraps it in `FixedNamespaceMemory`, and builds
+an `Orchestrator`; `build_server()` wires that together with
+`WhatsAppClient` and a `MessageHandler` into a `WhatsAppServer`.
+`server.py` owns this composition and the server's full lifecycle —
+startup, request dispatch, and shutdown — with no separate lifecycle
+manager.
+
+The server itself is `http.server.ThreadingHTTPServer`, bound to
+`whatsapp_config.host` (validated loopback-only by `config.py` — never
+bindable to a public or LAN address, since exposing it directly would put
+the raw Cloud API access token and an unauthenticated webhook path
+straight on the network; a real deployment terminates TLS and exposes it
+publicly through a separate reverse proxy or tunnel, which this
+repository does not provide). An IPv6 loopback host (`::1`) binds through
+a dedicated `AF_INET6` server variant rather than being silently
+mishandled by an IPv4-only socket. `WhatsAppServer.stop()` shuts the HTTP
+server down, then enqueues a shutdown sentinel *after* whatever is
+already queued — so already-queued tasks are drained before the worker
+sees it — and joins the background worker thread with a bounded timeout,
+for a graceful exit with no in-flight or already-queued message
+abandoned mid-processing.
 
 ### Kernel
 
@@ -312,26 +322,12 @@ tests for Content-Length edge cases `urllib` cannot express.
   passed WhatsApp's own exact-sender authorization — see Interfaces above
   and Capabilities below.
 
-  **Milestone 38 — `EphemeralResult` / non-persistent capability
-  results.** Normally, after a routed capability returns, `handle()`
+  Normally, after a routed capability returns, `handle()`
   unconditionally writes the prompt and the response to memory
   (`remember("conversation", ...)`, twice — once per role) and to the
-  interaction log (`log_interaction()`). A capability can opt one specific
-  response out of *both* writes by returning `EphemeralResult`
-  (`kernel/capabilities/base.py`) instead of a plain `str` — a `str`
-  subclass, so every existing `capability.handle(prompt) == "..."`
-  comparison and `MessageHandler._extract_response_text()`'s
-  `isinstance(result, str)` branch keep working unchanged.
-  `Orchestrator.handle()` checks `isinstance(capability_result,
-  EphemeralResult)` before its plain-`str` check, wraps the text in the
-  usual `ModelResponse` the caller receives, but skips the remember/log
-  tail for that one request. This is request-scoped, not
-  capability-scoped: `capabilities/knowledge_commands/` returns it for
-  `/knowledge search` and `/knowledge ask` only (query/question text and,
-  for `ask`, a model-generated answer must never be persisted — see
-  Capabilities below); `/knowledge status`, `ingest`, `confirm`, and
-  `cancel` are unaffected, and so is every other capability, the
-  computer-action denial response, and ordinary model-fallback responses.
+  interaction log (`log_interaction()`). See Ephemeral Knowledge Results
+  and Privacy below for `EphemeralResult` (Milestone 38), the mechanism a
+  capability uses to opt one specific response out of that tail.
 - **memory** — conversation history persisted across requests. Implemented:
   `MemoryManager` (`kernel/memory/manager.py`) backed by a JSONL file per
   namespace (`kernel/memory/jsonl.py`), stored under the directory configured
@@ -367,14 +363,9 @@ tests for Content-Length edge cases `urllib` cannot express.
   plus a SQLite FTS5 lexical index (`kernel/knowledge_base/db.py`) at
   `<knowledge.storage_dir>/knowledge_index.sqlite3` — reusing the same
   `kernel/config/config.yaml` setting `JSONKnowledgeStore` already uses,
-  never a second storage-location setting. Ingestion
-  (`kernel/knowledge_base/ingest.py`) is atomic per source (one SQLite
-  transaction, WAL mode, diffed by content hash so unchanged files are
-  untouched); a failure of any kind rolls back completely, leaving the
-  prior generation searchable. `kernel/knowledge_base/search.py` is
-  read-only, never invokes a model or the network, and safely transforms
-  plain query text into a quoted-literal FTS5 `MATCH` expression so caller
-  input can never behave as an FTS operator. `kernel/knowledge_base/
+  never a second storage-location setting. See Knowledge Ingestion and
+  Knowledge Search below for how ingestion and search actually behave.
+  `kernel/knowledge_base/
   status.py` (`get_status()`, `SourceStatus`, Milestone 37) is the one
   typed, read-only status query both callers below share — neither
   duplicates its SQL. `kernel/knowledge_base/messages.py`
@@ -388,62 +379,15 @@ tests for Content-Length edge cases `urllib` cannot express.
   still no automatic RAG, no orchestrator-driven retrieval, no
   embeddings, and no semantic/vector search.
 
-  **Milestone 38 additions**, for explicit knowledge-grounded answering
-  (`/knowledge ask`): `kernel/knowledge_base/query.py` factors the lexical
+  `kernel/knowledge_base/query.py` factors the lexical
   query mechanics `search()` already had (query validation, FTS5 literal
   transformation, source-filter validation, limit validation, and
   deterministic ranking tie-break order) out into one shared,
-  package-internal module, so `search.py` and the new
+  package-internal module, so `search.py` and
   `kernel/knowledge_base/evidence.py` never duplicate them — `search.py`'s
-  public API and behavior are unchanged.
-  `evidence.py:retrieve_evidence()` is `search()`'s sibling: one
-  single, read-only, parameterized, ranked query, selecting bounded full
-  chunk text instead of a short `snippet()` excerpt (at most 5 chunks,
-  1,500 characters each, 7,500 total), with no second, caller-controlled
-  chunk-ID lookup. `kernel/knowledge_base/answer.py` is pure — no I/O, no
-  model call, no network — and only prepares the one flat prompt string
-  (fixed instructions from `prompts/knowledge/ask_system.md` plus the
-  untrusted question/evidence as one JSON object between fixed marker
-  lines) and strictly parses/validates the model's structured response;
-  the model call itself is made by
-  `capabilities/knowledge_commands/KnowledgeCommandsCapability`, not by
-  this package. This package's own code therefore still never calls a
-  model or the network.
-
-  **Milestone 38.1 — ask-only natural-question matching.** Milestone 38's
-  `retrieve_evidence()` originally called the same strict, all-terms-`AND`
-  `build_match_expression()` `search()` uses, which made an ordinary
-  natural question ("How does the repository backup feature work?")
-  retrieve nothing: no chunk contains every generic framing word alongside
-  the real content terms. `search()` and `build_match_expression()` are
-  unchanged by this fix — `/knowledge search` still requires every
-  extracted term. `query.py` gained one additive, package-internal helper,
-  `extract_query_terms()` (validation, NFC normalization, tokenization,
-  case-insensitive dedup, the 20-term cap), factored out of
-  `build_match_expression()` — `build_match_expression()` is now a thin
-  wrapper over that helper, with no change to its own output.
-  `evidence.py` gained its own private, ask-only MATCH-expression builder
-  (`_build_evidence_match_expression()`): it
-  removes terms found in a small, fixed, code-owned generic-term set
-  (English and Portuguese interrogatives, articles, auxiliary verbs,
-  pronouns, function words, and negation words — never applied to
-  `search()`), returning `None` (and skipping the database entirely) if
-  nothing useful remains, and otherwise builds one deterministic
-  minimum-match FTS5 expression: one useful term stands alone; two require
-  both (identical in shape to `build_match_expression()`'s two-term output,
-  preserving Milestone 38's exact `"repository backup"` behavior); three or
-  more require any two, expressed as every two-term `AND` combination,
-  `OR`'d together, in original term order — bounded at "20 choose 2" = 190
-  pair clauses. The minimum-match rule is enforced by FTS5's own tokenizer,
-  not a second Python-side tokenization of chunk text, so it can never
-  disagree with the index on accents, Unicode normalization, or punctuation
-  boundaries. This is still exactly one read-only, parameterized SQL
-  query — no candidate-then-filter step, no fallback ladder, no
-  document-frequency query, no embeddings, no model-based query rewriting.
-  Lexical retrieval still does not stem (`backup`/`backups` are distinct
-  tokens), understand synonyms, translate, or understand negation
-  semantically; the complete original question, negation included, still
-  reaches the unchanged Milestone 38 grounded-answer prompt.
+  public API and behavior are unchanged. See Ask-Specific Minimum-Term
+  Matching and Grounded Knowledge Answers below for `evidence.py` and
+  `answer.py`.
 - **models** — the abstraction layer over language models, so capabilities
   and the orchestrator do not depend on a specific model provider directly.
   The `ModelProvider` contract and a `get_provider()` factory are implemented
@@ -506,16 +450,8 @@ tests for Content-Length edge cases `urllib` cannot express.
   secret, token, phone number, message body, traceback, or resolved
   private filesystem path; a write failure there is caught and logged
   only as a generic category, never raised.
-  `kernel/tools/confirmation.py`'s `ConfirmationStore` is a single-slot,
-  TTL-bound (2 minutes), thread-safe, in-process store for the two
-  sensitive actions: `propose()` registers a pending action,
-  `consume()` atomically reads and clears it in one step — before the
-  caller ever acts on the result — so a confirmation can never be replayed
-  even if execution afterward fails, and separately reports whether what
-  it found (if anything) had expired. It's a *process-wide* singleton
-  (`default_store`), deliberately not an attribute on any capability
-  instance, because `CapabilityLoader` constructs a brand new capability
-  object on every single request. `kernel/tools/process_control.py` is
+  See Task Confirmation Storage below for `kernel/tools/confirmation.py`'s
+  `ConfirmationStore`. `kernel/tools/process_control.py` is
   the only place a real OS process is spawned, always
   `subprocess.Popen(argv, cwd=cwd, shell=False, ...)` with a list-form
   `argv` sourced entirely from `tools.yaml`: `launch_detached()` (used by
@@ -578,8 +514,8 @@ tests for Content-Length edge cases `urllib` cannot express.
   `run_registered_script.py` accept only a registered symbolic key —
   never a sender-supplied path, executable, working directory, or (for
   scripts) argument of any kind; `repo_health.py` and
-  `repository_backup.py` — see Capabilities below for their full
-  behavior.
+  `repository_backup.py` — see Repository Health Checks and Repository
+  Backup below for their full behavior.
 - **config** — settings that govern how the kernel and its components
   behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
   (active provider, provider settings, memory, knowledge, and log locations),
@@ -587,6 +523,101 @@ tests for Content-Length edge cases `urllib` cannot express.
   is resolved to an absolute `Path` the same way `log_path` is — relative to
   the repository root — so `JSONKnowledgeStore` can be constructed directly
   from it without any further path handling.
+
+#### Task Confirmation Storage
+
+Pending task confirmations are stored in `kernel/tools/confirmation.py`'s
+`ConfirmationStore`: a single-slot, TTL-bound (2 minutes), thread-safe,
+in-process store — not a file or database, so a server restart clears
+whatever was pending rather than persisting it. `propose()` registers one
+pending action; `consume()` atomically reads and clears it in one step,
+before the caller acts on the result, so a confirmation can never be
+replayed even if execution afterward fails, and separately reports
+whether what it found had expired. It is a process-wide singleton
+(`default_store`), not an attribute on any capability instance, since
+`CapabilityLoader` constructs a new capability object on every request.
+`capabilities/tasks/TasksCapability` proposes into this store for
+`/task backup <key>`, `/task open <key>`, and `/task run <key>`;
+`/task confirm` and `/task cancel` consume or clear it — see Repository
+Backup below for the specific confirmation this store enforces before a
+backup is created.
+
+#### Knowledge Ingestion
+
+Ingestion (`kernel/knowledge_base/ingest.py:ingest_source()`) reads one
+approved local source by symbolic key — never a caller-supplied path —
+traverses it with symlink/junction/reparse-point rejection and fixed
+safety limits (`kernel/knowledge_base/traversal.py`), then normalizes and
+deterministically chunks each file's text with SHA-256-derived stable
+identifiers (`kernel/knowledge_base/chunking.py`). The whole source
+ingests inside one `BEGIN IMMEDIATE` SQLite transaction, diffed against
+the prior generation by content hash so unchanged documents are left
+completely untouched; any failure — an invalid file, a safety-limit
+violation, an unexpected database error — rolls the whole transaction
+back, leaving the prior generation searchable. An empty source is a
+valid ingestion that atomically removes any previously indexed documents
+for that source.
+
+#### Knowledge Search
+
+`kernel/knowledge_base/search.py:search()` is read-only end to end and
+never invokes a model or the network. It transforms plain query text
+into a safe FTS5 `MATCH` expression: every extracted alphanumeric term
+becomes an individually quoted string literal, joined with `AND`, so
+caller-supplied quotes, wildcards, `NEAR`/`OR`/`NOT`, or column filters
+can never behave as FTS5 operators, only as literal text. Ranking uses
+SQLite's built-in BM25 with deterministic tie-breaking, and results carry
+a bounded `snippet()` excerpt rather than full chunk text. This strict
+all-terms-`AND` matching is unchanged by Ask-Specific Minimum-Term
+Matching below — `/knowledge search` still requires every extracted
+term to be present.
+
+#### Historical Natural-Question Retrieval Limitation
+
+Before Milestone 38.1, `retrieve_evidence()` reused `search()`'s strict,
+all-terms-`AND` `build_match_expression()`. This made an ordinary
+natural question — for example, "How does the repository backup feature
+work?" — retrieve nothing: no chunk contained every generic framing word
+("how", "does", "the", "feature", "work") alongside the real content
+terms. This paragraph describes retrieval history, not how the
+repository backup feature itself behaves — see Repository Backup below
+for that. `search()` and `build_match_expression()` were not changed by
+the fix that followed, and are still exactly the same today.
+
+#### Ask-Specific Minimum-Term Matching
+
+Natural-question evidence retrieval for `/knowledge ask` uses ask-specific
+minimum-term matching: `retrieve_evidence()` (`kernel/knowledge_base/
+evidence.py`) builds its own MATCH expression, used only by `/knowledge
+ask`. Generic framing, interrogative, auxiliary, pronoun, and negation
+terms are removed from the extracted terms first (English and
+Portuguese); if nothing useful remains, `[]` is returned immediately,
+without opening a database connection. The remaining useful terms
+combine by a deterministic minimum-match rule performed entirely by
+FTS5's own tokenizer: one useful term stands alone; two useful terms
+require both; three or more useful terms require any two of them,
+expressed as every two-term `AND` combination `OR`'d together.
+`/knowledge search` remains strict all-term matching, unaffected by this
+rule. This remains exactly one read-only, parameterized SQL query,
+selecting bounded full chunk text (at most 5 chunks, 1,500 characters
+each, 7,500 total) instead of a short `snippet()` excerpt, ranked by the
+same BM25 and tie-break order `search()` uses.
+
+#### Ephemeral Knowledge Results and Privacy
+
+A capability can opt one response out of the orchestrator's normal
+memory-write and interaction-log tail by returning `EphemeralResult`
+(`kernel/capabilities/base.py`) instead of a plain `str` — a `str`
+subclass, so every existing `isinstance(result, str)` check keeps
+working unchanged. `Orchestrator.handle()` checks for `EphemeralResult`
+before its plain-`str` check, still wraps the text in the usual
+`ModelResponse`, but skips writing the prompt and response to memory and
+to `storage/logs/interactions.jsonl` for that one request.
+`capabilities/knowledge_commands/` returns it for `/knowledge search`
+and `/knowledge ask` only, since query/question text and any
+model-generated answer must never be persisted; `/knowledge status`,
+`ingest`, `confirm`, and `cancel` are unaffected, and so is every other
+capability.
 
 The kernel is domain-agnostic. It knows how to run a capability; it does not
 know what wine, travel, or strategy mean.
@@ -787,7 +818,8 @@ recall, no knowledge-store access, ever.
   once; `/task cancel` clears it explicitly; letting it sit past 2 minutes
   reports as expired on the next `/task confirm`. `system_status`,
   `list_files`, and `repo_health` are not sensitive and execute
-  immediately.
+  immediately. See Task Confirmation Storage above for how this pending
+  state is actually stored.
 - **Execution.** A non-sensitive (or just-confirmed) command becomes one
   `kernel.tools.ActionRequest`, run through a fresh
   `kernel.tools.SafeTaskExecutor`; the `ActionResult.message` is returned
@@ -798,136 +830,30 @@ recall, no knowledge-store access, ever.
   and a `ToolsConfigError` becomes a fixed "task system unavailable"
   reply, audited as `failed`, never treated as permission to proceed.
   Every step (proposed, confirmed, executed, rejected, expired,
-  cancelled, timed out, failed) is audited via `kernel.tools.audit`.
-  `repo_health` (`kernel/tools/handlers/repo_health.py`, Milestone 34)
-  reports, for one registered repository: the current branch (or
-  `detached`), clean/dirty working tree (from `git status --porcelain`,
-  used only to decide clean-vs-dirty — filenames are never relayed), the
-  latest commit's short hash and a sanitized one-line, control-character-
-  stripped, whitespace-normalized, 120-character-capped subject, whether
-  `HEAD` matches the configured local main branch's tip commit exactly
-  (compared as SHAs, independent of which branch is checked out — a
-  feature branch pointing at the same commit as main still reports
-  `yes`), and whether the local main branch matches `origin`'s main branch
-  on GitHub: `up to date`, `differs`, `remote branch unavailable`
-  (reachable but no matching ref), or `GitHub unreachable` (timeout,
-  nonzero exit, or a protocol/transport the policy below rejects). The
-  configured repository path must resolve to the worktree's actual root
-  (`git rev-parse --show-toplevel`) — a path that is merely a
-  subdirectory of a larger worktree is rejected.
+  cancelled, timed out, failed) is audited via `kernel.tools.audit`. See
+  Repository Backup and Repository Health Checks below for the full
+  `repository_backup` and `repo_health` handler behavior.
 
-  Every git subprocess this handler runs — local or remote — carries a
-  fixed argv prefix (`--no-optional-locks`, `--no-pager`,
-  `--no-replace-objects`, `-c core.fsmonitor=false`) and a sanitized
-  environment (`_sanitized_git_env()`): starts from a full copy of this
-  process's own environment (`PATH` and everything else ordinary stays
-  available), then strips (case-insensitively) `GIT_CONFIG_PARAMETERS`,
-  `GIT_CONFIG_COUNT`, every `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` pair,
-  `GIT_EXEC_PATH`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
-  `SSH_ASKPASS`, every repository/ref/object/index-redirection variable
-  (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
-  `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-  `GIT_NAMESPACE`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
-  `GIT_CEILING_DIRECTORIES`, `GIT_REPLACE_REF_BASE`), and every transport-
-  security/tracing/stdio-redirection variable (`GIT_SSL_NO_VERIFY`,
-  `GIT_CURL_VERBOSE`, every `GIT_TRACE*` variable, `GIT_REDIRECT_STDIN`,
-  `GIT_REDIRECT_STDOUT`, `GIT_REDIRECT_STDERR`), before setting
-  `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, and
-  `GIT_CONFIG_GLOBAL=os.devnull` for **every** call — no system- or
-  machine-global git config is ever consulted, though a local call still
-  reads the approved repository's own *local* config where needed (e.g.
-  reading `remote.origin.url`), since `GIT_CEILING_DIRECTORIES` is
-  stripped, not set, at this layer. All of this is supplied on the
-  command line / in the process environment rather than left to any
-  config file, so nothing in the target repository's own `.git/config` —
-  or an inherited environment variable — can remove or override it: the
-  argv flags above are global git options, not config keys, and a
-  command-line `-c` always wins over repo config in git's own resolution
-  order. `--no-replace-objects` means a repository-configured replace ref
-  can never substitute a different object for the one actually reported.
+#### Repository Backup
 
-  The one network call (`git ls-remote`) never targets the symbolic
-  remote name `origin`, and the origin is accepted only when it validates
-  as a credential-free `github.com` HTTPS repository URL: the
-  repository's local `remote.origin.url` is read with a local, read-only
-  `git config --local --no-includes --get-all -z` lookup — NUL-delimited
-  so every configured value is positively enumerated, sidestepping
-  `--get`'s inconsistent behavior on a multi-valued key — required to be
-  exactly one non-empty, properly NUL-terminated value, and strictly
-  parsed (`_parse_github_origin()`) — `https` scheme only, hostname
-  `github.com` only (case-insensitively), no embedded username/password,
-  no explicit port, no query string or fragment, no control characters or
-  malformed percent-encoding, and a path shaped exactly like
-  `/<owner>/<repo>` or `/<owner>/<repo>.git` with both components
-  conservatively character-allowlisted. Anything else — absent,
-  multi-valued, non-github, or malformed — reports `GitHub unreachable`
-  without ever attempting a network connection, and no raw or normalized
-  value is ever put in the reply or the audit log. Only the resulting
-  normalized `https://github.com/<owner>/<repo>.git` is ever passed to
-  `ls-remote`, as one fixed argv element.
+`repository_backup` (`kernel/tools/handlers/repository_backup.py`)
+creates a verified, local-only Git bundle of one registered repository's
+committed history in a preapproved local destination directory, reached
+through `/task backup <key>`. It is sensitive, so it only proposes the
+action first — explicit confirmation (`/task confirm`) within 2 minutes
+is required before anything is written (see Task Confirmation Storage
+above). Before creating a backup, the handler runs repository safety
+checks: it independently canonicalizes both paths, re-verifies the
+repository path is the worktree's actual root, and rejects the
+destination being inside the repository, the repository being inside the
+destination, or the two being equal. The bundle is streamed directly to
+an exclusively created file, then verified with `git bundle verify` and
+re-hashed (SHA-256) before an atomic, no-overwrite finalize; an existing
+`.bundle` file is never deleted, truncated, or overwritten. On success
+the reply names only the generated filename, size, and SHA-256 digest —
+never the destination path.
 
-  That call additionally runs from `_neutral_cwd()` — the real system
-  temp directory, never the approved repository and never a directory
-  created for this purpose, and only after verifying (via a real,
-  unmocked `git rev-parse --is-inside-work-tree` probe) that it is not
-  itself inside any git worktree — with its own controlled
-  `GIT_CEILING_DIRECTORIES` pinned to that same directory (on top of the
-  system/global isolation every call already gets), so the call is
-  isolated from repository, global, *and* system git configuration:
-  nothing configured anywhere on this machine — a rewritten URL via
-  `url.*.insteadOf`, an injected `http.extraHeader`, a `credential.helper`,
-  a `http.proxy` — can reach or influence it, because git never discovers
-  the approved repository's `.git/config` for this subprocess in the
-  first place. It also pins `-c protocol.allow=never -c
-  protocol.https.allow=always` (rejecting file, ssh, git://, ext, and any
-  custom remote helper outright — no test-only exception exists in
-  production code), `-c credential.helper= -c core.askPass= -c
-  http.extraHeader= -c http.proxy=` (empty values, which git treats as
-  "use none of this"), `-c http.sslVerify=true` (so nothing inherited can
-  disable TLS certificate verification for this call), strips any
-  inherited `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (any case) from its
-  environment, and sets `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=Never` —
-  run with a
-  fixed timeout and full process-tree termination like every other git
-  call here.
-
-  No repository path, remote URL, credential, prompt, or raw git output
-  ever reaches the reply or the audit log; a malformed or unvalidated
-  branch name/commit hash from `git` causes the whole report to fail
-  closed (`"That repository is not available."`) rather than being
-  partially relayed — branch names are validated with
-  `kernel/tools/config.py`'s `is_valid_git_branch_name()` (shared, not
-  duplicated, with that module's own load-time validation of an
-  admin-supplied `main_branch`; modeled on `git check-ref-format`'s real
-  rules — rejects a leading `-`/`.`/`/`, a trailing `/`/`.`, any `..`,
-  `//`, `@{`, a bare `@`, or a `.`-leading/`.lock`-suffixed path
-  component, on top of a restrictive ASCII character allowlist).
-  Covered by `tests/capabilities/tasks/` (command parser, confirmation
-  flow, config-failure handling) and `tests/kernel/tools/` (every
-  kernel/tools/ module and handler). `repo_health`'s own tests run every
-  local git check — including the origin-URL read (via a real repository
-  configured with `remote.origin.url` set twice, proving the multi-value
-  case is positively detected and rejected end to end, not just via
-  mocked output) and the neutral-directory work-tree probe — against
-  real, temporary local repositories; the `ls-remote` network call itself
-  is always injected by monkeypatching (matching/differing/missing SHA,
-  malformed output, timeout, nonzero exit), since production only ever
-  permits https and the suite must never depend on — or attempt — a real
-  connection. Dedicated tests also configure a real repository's local
-  `url.*.insteadOf`, `http.extraHeader`, `http.proxy`, and
-  `credential.helper`, and set inherited `GIT_TRACE`/`GIT_TRACE_CURL`
-  variables pointing at marker files, asserting none of it ever reaches
-  the recorded `ls-remote` argv/cwd/env or creates the marker file, that
-  proxy environment variables are stripped for that call, and that a
-  non-github or unreachable origin still leaves the local portion of the
-  report intact. No test ever contacts GitHub or any real network
-  service. Plus dedicated `RequestContext`/authorization-gate tests in
-  `tests/kernel/orchestrator/test_orchestrator.py`.
-
-  `repository_backup` (`kernel/tools/handlers/repository_backup.py`,
-  Milestone 35) creates a verified, local-only Git bundle of one
-  registered repository's committed history in a preapproved local
-  destination directory — `/task backup <key>` accepts only the symbolic
+`/task backup <key>` accepts only the symbolic
   repository key, sensitive like `open_application`/`run_registered_script`
   above, so it is proposed and requires `/task confirm` before anything is
   written. The repository path is looked up through the same
@@ -957,112 +883,253 @@ recall, no knowledge-store access, ever.
   share one hardening implementation rather than two that could drift
   apart.
 
-  Ref-inclusion policy: `git bundle create - HEAD --branches --tags`.
-  Included: the current `HEAD` (so a detached-`HEAD` checkout is still
-  captured), every local branch (`refs/heads/*`), every tag
-  (`refs/tags/*`), and every committed object those refs require.
-  Excluded: `refs/remotes/*`, `refs/stash`, `refs/notes/*`,
-  `refs/replace/*` (also neutralized globally by `--no-replace-objects`),
-  any other custom ref, and — because a bundle can only ever contain
-  committed objects reachable from the refs it records — every current
-  uncommitted, untracked, and ignored file. A file that is untracked or
-  gitignored *right now* is absent for that reason; a file that was ever
-  actually committed to selected history is not additionally filtered by
-  filename — the handler inspects refs, never filenames, and the
-  user-facing reply is worded to reflect this precisely rather than
-  overclaiming.
+Ref-inclusion policy: `git bundle create - HEAD --branches --tags`.
+Included: the current `HEAD` (so a detached-`HEAD` checkout is still
+captured), every local branch (`refs/heads/*`), every tag
+(`refs/tags/*`), and every committed object those refs require.
+Excluded: `refs/remotes/*`, `refs/stash`, `refs/notes/*`,
+`refs/replace/*` (also neutralized globally by `--no-replace-objects`),
+any other custom ref, and — because a bundle can only ever contain
+committed objects reachable from the refs it records — every current
+uncommitted, untracked, and ignored file. A file that is untracked or
+gitignored *right now* is absent for that reason; a file that was ever
+actually committed to selected history is not additionally filtered by
+filename — the handler inspects refs, never filenames, and the
+user-facing reply is worded to reflect this precisely rather than
+overclaiming.
 
-  The bundle is created by streaming, never buffering: `git bundle create
-  -` writes the complete bundle to *stdout*, which
-  `kernel/tools/process_control.py`'s new `run_streaming_stdout_to_file()`
-  connects directly to an already-open file descriptor this handler
-  creates with `os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
-  os.O_BINARY, 0o600)` inside the canonical destination directory —
-  exclusive creation closes the time-of-check/time-of-use window a
-  generate-then-reopen sequence would leave open, since the path cannot
-  have been written to, replaced, or symlinked before this process's own
-  call atomically created it, and the bundle payload is never held in
-  this process's memory regardless of size. The `0o600` mode is enforced
-  directly by the OS on POSIX (owner read/write only); on Windows,
-  `os.open()`'s mode argument has no POSIX-permission-bit equivalent and
-  only affects the read-only attribute bit — actual access control comes
-  entirely from NTFS ACLs inherited from the destination directory, which
-  this handler never reads, sets, or otherwise modifies. Restricting who
-  can read the configured backup destination on Windows is a
-  machine-configuration concern outside this milestone. The generated
-  temporary name is `.{key}-{UTC timestamp}-{16-hex-character
-  secrets.token_hex(8) suffix}.partial`; the eventual final name shares
-  the exact same timestamp and suffix,
-  `{key}-{same timestamp}-{same suffix}.bundle` — a name collision on
-  creation retries with an entirely fresh timestamp and
-  suffix, bounded, never reusing a collided one. Immediately after bundle
-  creation completes, the handler records the partial file's `(st_dev,
-  st_ino, st_size)` identity via `os.stat(path, follow_symlinks=False)`,
-  requiring a regular file (never a symlink, junction/reparse point,
-  directory, or other special file) with a hard-link count of 1 directly
-  inside the canonical destination — then re-confirms that exact identity
-  is unchanged after `git bundle verify`, after streaming SHA-256/size
-  hashing (bounded chunked reads, the complete file never loaded into
-  memory at once), and immediately before finalization; any mismatch at
-  any checkpoint fails the whole operation closed. Finalization
-  (`kernel/tools/atomic_finalize.py`'s `atomic_finalize_no_replace()`)
-  never uses `os.replace()` and never relies on an informal "rename
-  doesn't overwrite" assumption: on Windows it uses `os.rename()`, whose
-  documented behavior is to raise `FileExistsError` if the destination
-  already exists; elsewhere it uses an atomic hard-link-to-final followed
-  by unlinking the source, the standard POSIX no-clobber-rename idiom. An
-  existing `.bundle` is never deleted, truncated, or overwritten under any
-  failure mode — including a final-name collision itself: rather than
-  regenerating a fresh suffix and retrying bundle creation, a collision at
-  finalization fails the whole attempt closed with the same generic
-  creation-failure reply as any other creation failure (never a dedicated
-  "already exists" message that might hint at the destination's
-  contents), removes only the current execution's own partial file, and
-  never touches the pre-existing final file it collided with — confirmed
-  end to end by `test_existing_completed_bundle_is_never_overwritten`
-  (`tests/kernel/tools/handlers/test_repository_backup.py`), which proves
-  the original bundle's bytes are unchanged after a forced collision.
-  Complex collision recovery (regenerating a new suffix and re-running
-  bundle creation) is deliberately out of scope. Every failure path
-  (registration, availability, creation, verification, hashing,
-  finalization, or timeout) removes only the one
-  temporary file this specific execution created — never a glob, never
-  another file in the destination, and never an existing completed
-  backup — and returns one of a small set of fixed, generic replies
-  containing no path, filename beyond the generated one, git output,
-  stderr, or traceback. On success, the reply names only the generated
-  filename, size, and SHA-256 digest — never the absolute destination
-  path:
+The bundle is created by streaming, never buffering: `git bundle create
+-` writes the complete bundle to *stdout*, which
+`kernel/tools/process_control.py`'s `run_streaming_stdout_to_file()`
+connects directly to an already-open file descriptor this handler
+creates with `os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+os.O_BINARY, 0o600)` inside the canonical destination directory —
+exclusive creation closes the time-of-check/time-of-use window a
+generate-then-reopen sequence would leave open, since the path cannot
+have been written to, replaced, or symlinked before this process's own
+call atomically created it, and the bundle payload is never held in
+this process's memory regardless of size. The `0o600` mode is enforced
+directly by the OS on POSIX (owner read/write only); on Windows,
+`os.open()`'s mode argument has no POSIX-permission-bit equivalent and
+only affects the read-only attribute bit — actual access control comes
+entirely from NTFS ACLs inherited from the destination directory, which
+this handler never reads, sets, or otherwise modifies. Restricting who
+can read the configured backup destination on Windows is a
+machine-configuration concern outside this milestone. The generated
+temporary name is `.{key}-{UTC timestamp}-{16-hex-character
+secrets.token_hex(8) suffix}.partial`; the eventual final name shares
+the exact same timestamp and suffix,
+`{key}-{same timestamp}-{same suffix}.bundle` — a name collision on
+creation retries with an entirely fresh timestamp and
+suffix, bounded, never reusing a collided one. Immediately after bundle
+creation completes, the handler records the partial file's `(st_dev,
+st_ino, st_size)` identity via `os.stat(path, follow_symlinks=False)`,
+requiring a regular file (never a symlink, junction/reparse point,
+directory, or other special file) with a hard-link count of 1 directly
+inside the canonical destination — then re-confirms that exact identity
+is unchanged after `git bundle verify`, after streaming SHA-256/size
+hashing (bounded chunked reads, the complete file never loaded into
+memory at once), and immediately before finalization; any mismatch at
+any checkpoint fails the whole operation closed. Finalization
+(`kernel/tools/atomic_finalize.py`'s `atomic_finalize_no_replace()`)
+never uses `os.replace()` and never relies on an informal "rename
+doesn't overwrite" assumption: on Windows it uses `os.rename()`, whose
+documented behavior is to raise `FileExistsError` if the destination
+already exists; elsewhere it uses an atomic hard-link-to-final followed
+by unlinking the source, the standard POSIX no-clobber-rename idiom. An
+existing `.bundle` is never deleted, truncated, or overwritten under any
+failure mode — including a final-name collision itself: rather than
+regenerating a fresh suffix and retrying bundle creation, a collision at
+finalization fails the whole attempt closed with the same generic
+creation-failure reply as any other creation failure (never a dedicated
+"already exists" message that might hint at the destination's
+contents), removes only the current execution's own partial file, and
+never touches the pre-existing final file it collided with — confirmed
+end to end by `test_existing_completed_bundle_is_never_overwritten`
+(`tests/kernel/tools/handlers/test_repository_backup.py`), which proves
+the original bundle's bytes are unchanged after a forced collision.
+Complex collision recovery (regenerating a new suffix and re-running
+bundle creation) is deliberately out of scope. Every failure path
+(registration, availability, creation, verification, hashing,
+finalization, or timeout) removes only the one
+temporary file this specific execution created — never a glob, never
+another file in the destination, and never an existing completed
+backup — and returns one of a small set of fixed, generic replies
+containing no path, filename beyond the generated one, git output,
+stderr, or traceback. On success, the reply names only the generated
+filename, size, and SHA-256 digest — never the absolute destination
+path:
 
-  ```
-  Repository backup created.
-  Repository: ai_os
-  File: ai_os-20260802T233800Z-a1b2c3d4e5f60718.bundle
-  Size: 12.4 MB
-  SHA-256: <64 lowercase hexadecimal characters>
-  Included: committed HEAD, local branches, tags, and required Git history
-  Not included: current uncommitted, untracked, or ignored files
-  ```
+```
+Repository backup created.
+Repository: ai_os
+File: ai_os-20260802T233800Z-a1b2c3d4e5f60718.bundle
+Size: 12.4 MB
+SHA-256: <64 lowercase hexadecimal characters>
+Included: committed HEAD, local branches, tags, and required Git history
+Not included: current uncommitted, untracked, or ignored files
+```
 
-  Restore, deletion, retention cleanup, cloud upload, encryption,
-  scheduling, and automatic backup rotation are all out of scope for this
-  milestone. Covered by `tests/kernel/tools/test_git_safety.py`,
-  `tests/kernel/tools/test_atomic_finalize.py`, the
-  `run_streaming_stdout_to_file()` additions in
-  `tests/kernel/tools/test_process_control.py`, and
-  `tests/kernel/tools/handlers/test_repository_backup.py` — the last runs
-  real, temporary local git repositories and destination directories
-  throughout (a committed `.env` proves the bundle is history-based, not
-  filename-filtered; an untracked `.env`, an ignored would-be
-  `tools.yaml`, and a real `git bundle list-heads` check that
-  `refs/remotes/*`/`refs/stash`/`refs/notes/*`/custom refs are never
-  advertised), never touches the real `kernel/config/tools.yaml` or a real
-  backup destination, and includes an explicit proof that `git bundle
-  create -` produces a valid bundle on the installed git version before
-  the handler relies on that form. `tests/capabilities/tasks/` covers
-  `/task backup <key>` proposing rather than executing immediately,
-  `/task confirm` executing it exactly once, `/task cancel` and
-  confirmation expiry both preventing execution.
+Restore, deletion, retention cleanup, cloud upload, encryption,
+scheduling, and automatic backup rotation are all out of scope for this
+milestone. Covered by `tests/kernel/tools/test_git_safety.py`,
+`tests/kernel/tools/test_atomic_finalize.py`, the
+`run_streaming_stdout_to_file()` additions in
+`tests/kernel/tools/test_process_control.py`, and
+`tests/kernel/tools/handlers/test_repository_backup.py` — the last runs
+real, temporary local git repositories and destination directories
+throughout (a committed `.env` proves the bundle is history-based, not
+filename-filtered; an untracked `.env`, an ignored would-be
+`tools.yaml`, and a real `git bundle list-heads` check that
+`refs/remotes/*`/`refs/stash`/`refs/notes/*`/custom refs are never
+advertised), never touches the real `kernel/config/tools.yaml` or a real
+backup destination, and includes an explicit proof that `git bundle
+create -` produces a valid bundle on the installed git version before
+the handler relies on that form. `tests/capabilities/tasks/` covers
+`/task backup <key>` proposing rather than executing immediately,
+`/task confirm` executing it exactly once, `/task cancel` and
+confirmation expiry both preventing execution.
+
+#### Repository Health Checks
+
+`repo_health` (`kernel/tools/handlers/repo_health.py`) is a read-only
+status/sync check for one registered repository, reached through
+`/task repo <key>`; unlike backup, it is not sensitive and executes
+immediately, with no confirmation required. Repository health checks
+report the current branch (or `detached`), whether the working tree is
+clean or dirty (from `git status --porcelain`, used only to decide
+clean-versus-dirty), the latest commit's short hash and a sanitized
+subject line, whether `HEAD` matches the configured local main branch's
+tip commit exactly, and whether the local main branch matches GitHub's:
+`up to date`, `differs`, `remote branch unavailable`, or `GitHub
+unreachable`. Every git subprocess runs local-only except one
+deliberately isolated, read-only `git ls-remote` call against a strictly
+validated `github.com` origin.
+
+`repo_health`
+  reports, for one registered repository: the current branch (or
+  `detached`), clean/dirty working tree (from `git status --porcelain`,
+  used only to decide clean-vs-dirty — filenames are never relayed), the
+  latest commit's short hash and a sanitized one-line, control-character-
+  stripped, whitespace-normalized, 120-character-capped subject, whether
+  `HEAD` matches the configured local main branch's tip commit exactly
+  (compared as SHAs, independent of which branch is checked out — a
+  feature branch pointing at the same commit as main still reports
+  `yes`), and whether the local main branch matches `origin`'s main branch
+  on GitHub: `up to date`, `differs`, `remote branch unavailable`
+  (reachable but no matching ref), or `GitHub unreachable` (timeout,
+  nonzero exit, or a protocol/transport the policy below rejects). The
+  configured repository path must resolve to the worktree's actual root
+  (`git rev-parse --show-toplevel`) — a path that is merely a
+  subdirectory of a larger worktree is rejected.
+
+Every git subprocess this handler runs — local or remote — carries a
+fixed argv prefix (`--no-optional-locks`, `--no-pager`,
+`--no-replace-objects`, `-c core.fsmonitor=false`) and a sanitized
+environment (`_sanitized_git_env()`): starts from a full copy of this
+process's own environment (`PATH` and everything else ordinary stays
+available), then strips (case-insensitively) `GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`, every `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` pair,
+`GIT_EXEC_PATH`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+`SSH_ASKPASS`, every repository/ref/object/index-redirection variable
+(`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_NAMESPACE`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`,
+`GIT_CEILING_DIRECTORIES`, `GIT_REPLACE_REF_BASE`), and every transport-
+security/tracing/stdio-redirection variable (`GIT_SSL_NO_VERIFY`,
+`GIT_CURL_VERBOSE`, every `GIT_TRACE*` variable, `GIT_REDIRECT_STDIN`,
+`GIT_REDIRECT_STDOUT`, `GIT_REDIRECT_STDERR`), before setting
+`GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, and
+`GIT_CONFIG_GLOBAL=os.devnull` for **every** call — no system- or
+machine-global git config is ever consulted, though a local call still
+reads the approved repository's own *local* config where needed (e.g.
+reading `remote.origin.url`), since `GIT_CEILING_DIRECTORIES` is
+stripped, not set, at this layer. All of this is supplied on the
+command line / in the process environment rather than left to any
+config file, so nothing in the target repository's own `.git/config` —
+or an inherited environment variable — can remove or override it: the
+argv flags above are global git options, not config keys, and a
+command-line `-c` always wins over repo config in git's own resolution
+order. `--no-replace-objects` means a repository-configured replace ref
+can never substitute a different object for the one actually reported.
+
+The one network call (`git ls-remote`) never targets the symbolic
+remote name `origin`, and the origin is accepted only when it validates
+as a credential-free `github.com` HTTPS repository URL: the
+repository's local `remote.origin.url` is read with a local, read-only
+`git config --local --no-includes --get-all -z` lookup — NUL-delimited
+so every configured value is positively enumerated, sidestepping
+`--get`'s inconsistent behavior on a multi-valued key — required to be
+exactly one non-empty, properly NUL-terminated value, and strictly
+parsed (`_parse_github_origin()`) — `https` scheme only, hostname
+`github.com` only (case-insensitively), no embedded username/password,
+no explicit port, no query string or fragment, no control characters or
+malformed percent-encoding, and a path shaped exactly like
+`/<owner>/<repo>` or `/<owner>/<repo>.git` with both components
+conservatively character-allowlisted. Anything else — absent,
+multi-valued, non-github, or malformed — reports `GitHub unreachable`
+without ever attempting a network connection, and no raw or normalized
+value is ever put in the reply or the audit log. Only the resulting
+normalized `https://github.com/<owner>/<repo>.git` is ever passed to
+`ls-remote`, as one fixed argv element.
+
+That call additionally runs from `_neutral_cwd()` — the real system
+temp directory, never the approved repository and never a directory
+created for this purpose, and only after verifying (via a real,
+unmocked `git rev-parse --is-inside-work-tree` probe) that it is not
+itself inside any git worktree — with its own controlled
+`GIT_CEILING_DIRECTORIES` pinned to that same directory (on top of the
+system/global isolation every call already gets), so the call is
+isolated from repository, global, *and* system git configuration:
+nothing configured anywhere on this machine — a rewritten URL via
+`url.*.insteadOf`, an injected `http.extraHeader`, a `credential.helper`,
+a `http.proxy` — can reach or influence it, because git never discovers
+the approved repository's `.git/config` for this subprocess in the
+first place. It also pins `-c protocol.allow=never -c
+protocol.https.allow=always` (rejecting file, ssh, git://, ext, and any
+custom remote helper outright — no test-only exception exists in
+production code), `-c credential.helper= -c core.askPass= -c
+http.extraHeader= -c http.proxy=` (empty values, which git treats as
+"use none of this"), `-c http.sslVerify=true` (so nothing inherited can
+disable TLS certificate verification for this call), strips any
+inherited `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (any case) from its
+environment, and sets `GIT_TERMINAL_PROMPT=0`/`GCM_INTERACTIVE=Never` —
+run with a
+fixed timeout and full process-tree termination like every other git
+call here.
+
+No repository path, remote URL, credential, prompt, or raw git output
+ever reaches the reply or the audit log; a malformed or unvalidated
+branch name/commit hash from `git` causes the whole report to fail
+closed (`"That repository is not available."`) rather than being
+partially relayed — branch names are validated with
+`kernel/tools/config.py`'s `is_valid_git_branch_name()` (shared, not
+duplicated, with that module's own load-time validation of an
+admin-supplied `main_branch`; modeled on `git check-ref-format`'s real
+rules — rejects a leading `-`/`.`/`/`, a trailing `/`/`.`, any `..`,
+`//`, `@{`, a bare `@`, or a `.`-leading/`.lock`-suffixed path
+component, on top of a restrictive ASCII character allowlist).
+Covered by `tests/capabilities/tasks/` (command parser, confirmation
+flow, config-failure handling) and `tests/kernel/tools/` (every
+kernel/tools/ module and handler). `repo_health`'s own tests run every
+local git check — including the origin-URL read (via a real repository
+configured with `remote.origin.url` set twice, proving the multi-value
+case is positively detected and rejected end to end, not just via
+mocked output) and the neutral-directory work-tree probe — against
+real, temporary local repositories; the `ls-remote` network call itself
+is always injected by monkeypatching (matching/differing/missing SHA,
+malformed output, timeout, nonzero exit), since production only ever
+permits https and the suite must never depend on — or attempt — a real
+connection. Dedicated tests also configure a real repository's local
+`url.*.insteadOf`, `http.extraHeader`, `http.proxy`, and
+`credential.helper`, and set inherited `GIT_TRACE`/`GIT_TRACE_CURL`
+variables pointing at marker files, asserting none of it ever reaches
+the recorded `ls-remote` argv/cwd/env or creates the marker file, that
+proxy environment variables are stripped for that call, and that a
+non-github or unreachable origin still leaves the local portion of the
+report intact. No test ever contacts GitHub or any real network
+service. Plus dedicated `RequestContext`/authorization-gate tests in
+`tests/kernel/orchestrator/test_orchestrator.py`.
 
 **knowledge** (Milestone 37, extended in Milestone 38) is the third
 implemented capability — `capabilities/knowledge_commands/
@@ -1124,60 +1191,12 @@ recalls memory or reads `KnowledgeStore`.
   result is returned as `EphemeralResult` (see Orchestrator below) so the
   orchestrator does not persist it to memory or the interaction log
   either.
-- **Grounded answering (`ask`, Milestone 38).** Retrieves bounded evidence
-  via `kernel/knowledge_base/evidence.py:retrieve_evidence()` — the same
-  lexical FTS5 mechanics `search()` uses, factored into
-  `kernel/knowledge_base/query.py` so both share one implementation of
-  query validation, source filtering, FTS literal transformation, and
-  ranking order — returning full (still bounded) chunk text instead of a
-  short excerpt: at most 5 chunks, 1,500 characters each, 7,500 total,
-  dropped whole (never partially) once the running total would exceed
-  budget. If no evidence is found, the model is never called. Otherwise
-  `kernel/knowledge_base/answer.py` (pure — no I/O, no model call)
-  assembles one flat prompt: fixed instructions from
-  `prompts/knowledge/ask_system.md`, then the untrusted question and
-  evidence as one `json.dumps(..., ensure_ascii=False)` object between
-  fixed marker lines — `json.dumps()` escapes every newline inside string
-  values, so the whole blob is always one line and retrieved evidence can
-  never produce a standalone line matching the closing marker, without
-  any zero-width-character or delimiter-mutation trick. The capability
-  calls its injected `ModelProvider.send_prompt()` exactly once and
-  strictly parses the required `{"answer", "used_citations",
-  "sufficient"}` JSON response: wrong shape, an invented or unsupplied
-  citation label, an inline/`used_citations` mismatch, or an empty answer
-  all fail closed to a fixed "unverifiable answer" reply, distinct from
-  the fixed "insufficient evidence" reply used when the model itself
-  reports `sufficient: false`. Citation labels (`S1`..`S5`) are assigned
-  by code in retrieval order, never by the model, and the appended
-  "Sources:" section is generated entirely from code-owned metadata
-  (symbolic source key, relative path, chunk ordinal — never a chunk ID,
-  a rank, or an absolute path). A provider exception (including a
-  request timeout — `kernel/models/ollama.py`'s fixed
-  `OLLAMA_REQUEST_TIMEOUT_SECONDS = 120`) is caught and mapped to one
-  fixed "service temporarily unavailable" reply; the raw exception never
-  reaches the reply, the audit record, memory, or the interaction log.
-  **Consent (v1):** the explicit `/knowledge ask` command is itself
-  sufficient consent — no second confirmation, nothing in
-  `PendingAction` — acceptable because the only implemented provider is
-  local Ollama; this must be revisited before a remote provider is ever
-  enabled for this operation, since `ModelProvider` has no
-  locality-detection contract and this milestone deliberately does not
-  add one. `ask`'s result, like `search`'s, is returned as
-  `EphemeralResult`.
-- **Confirmation.** `ingest` is sensitive: the symbolic key is checked
-  against the current approved-source allowlist immediately (no source
-  pre-scan, no document-count disclosure) and, if approved, only
-  *proposed* — the reply names the source key and nothing else. `/knowledge
-  confirm` within 2 minutes calls the existing, unmodified
-  `kernel/knowledge_base/ingest.py:ingest_source()` exactly once;
-  `/knowledge cancel`, an expired confirmation, or a re-check at execute
-  time against a since-changed configuration all fail closed. The pending
-  action lives in `default_knowledge_confirmation_store` — a *separate*
-  `kernel.tools.confirmation.ConfirmationStore` instance from
-  `capabilities/tasks/TasksCapability`'s `default_store`, so the two
-  command families can never collide over the single-slot design
-  `kernel/tools/confirmation.py` describes. `ask` does not use this store
-  at all (see consent, above).
+- **Grounded answering (`ask`).** See Grounded Knowledge Answers below
+  for the full `/knowledge ask` retrieval, prompt, and
+  citation-validation flow.
+- **Confirmation (`ingest`).** See Knowledge Ingestion Confirmation below
+  for how `/knowledge ingest`'s pending state is proposed, confirmed, and
+  stored.
 - **Output limits and privacy.** Fixed, interface-level limits in addition
   to Milestone 36's own service-level ones: at most 10 results requested,
   a 200-character excerpt, an 80-character path, and a 3,500-character
@@ -1213,6 +1232,44 @@ recalls memory or reads `KnowledgeStore`.
   explicit retrieval-augmented generation, never automatic. The offline
   `scripts/knowledge.py` CLI remains available and unaffected by this
   capability's trust gating.
+
+#### Grounded Knowledge Answers
+
+`/knowledge ask` retrieves bounded local evidence via `retrieve_evidence()`
+(see Ask-Specific Minimum-Term Matching above) and, only if evidence was
+found, makes exactly one call to the injected model provider.
+`kernel/knowledge_base/answer.py` assembles one flat prompt — fixed
+instructions plus the untrusted question and evidence as one JSON object
+between fixed marker lines — and strictly parses the model's required
+`{"answer", "used_citations", "sufficient"}` response: any wrong shape,
+invented or missing citation, inline/`used_citations` mismatch, or empty
+answer is rejected outright, never partially trusted. Citation labels
+(`S1`–`S5`) are assigned by code in retrieval order, never by the model,
+and the appended "Sources:" section is generated entirely from
+code-owned metadata. A provider exception (including a request timeout)
+is caught and mapped to one fixed reply; the raw exception never reaches
+the reply, the audit record, memory, or the interaction log. The
+explicit `/knowledge ask` command is itself sufficient consent today,
+since the only implemented provider is local Ollama — this must be
+revisited before a remote provider is ever enabled for this operation.
+
+#### Knowledge Ingestion Confirmation
+
+`/knowledge ingest <key>` is sensitive and uses its own confirmation
+flow, entirely separate from Task Confirmation Storage above: the
+pending action lives in `default_knowledge_confirmation_store`, a
+distinct `kernel.tools.confirmation.ConfirmationStore` instance from
+`capabilities/tasks/TasksCapability`'s `default_store`, so a pending
+`/knowledge ingest` proposal can never collide with, or be silently
+evicted by, a pending `/task` action, and vice versa. The symbolic
+source key is checked against the current approved-source allowlist
+immediately; if approved, the reply proposes the action, naming only the
+source key. `/knowledge confirm` within 2 minutes runs the existing,
+unmodified `ingest_source()` exactly once, re-checking the allowlist at
+execute time so a source removed after proposal but before confirmation
+fails closed; `/knowledge cancel` or a 2-minute timeout discards it
+instead. `ask` does not use this store, or Task Confirmation Storage, at
+all — the two confirmation mechanisms are not interchangeable.
 
 Each capability is meant to be a self-contained domain expert that uses
 kernel services (memory, knowledge, tools, models) to do its job. Capabilities

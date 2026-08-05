@@ -9,6 +9,7 @@ from kernel.knowledge_base.query import (
     MAX_QUERY_TERMS,
     RANKED_ORDER_BY_SQL,
     build_match_expression,
+    extract_query_terms,
     validate_limit,
     validate_query_text,
     validate_source_filter,
@@ -79,6 +80,73 @@ def test_terms_capped_at_max_query_terms():
 def test_query_with_only_punctuation_rejected():
     with pytest.raises(InvalidQueryError):
         build_match_expression("***???")
+
+
+# --- extract_query_terms: shared first stage (Milestone 38.1) ---------------
+# build_match_expression() is now a thin wrapper over extract_query_terms();
+# these tests exercise the shared helper directly, and confirm every
+# build_match_expression() behavior above still traces back to it, byte for
+# byte, with no change to that function's public output.
+
+
+def test_extract_query_terms_single_term():
+    assert extract_query_terms("hello") == ["hello"]
+
+
+def test_extract_query_terms_preserves_order_and_original_spelling():
+    assert extract_query_terms("Hello hello WORLD world") == ["Hello", "WORLD"]
+
+
+def test_extract_query_terms_deduplicates_case_insensitively():
+    assert extract_query_terms("term term TERM Term") == ["term"]
+
+
+def test_extract_query_terms_capped_at_max_query_terms():
+    query = " ".join(f"term{i}" for i in range(30))
+    terms = extract_query_terms(query)
+    assert len(terms) == MAX_QUERY_TERMS
+
+
+def test_extract_query_terms_normalizes_unicode_nfc():
+    import unicodedata
+
+    decomposed = unicodedata.normalize("NFD", "café")
+    terms = extract_query_terms(decomposed)
+    assert terms == [unicodedata.normalize("NFC", "café")]
+
+
+def test_extract_query_terms_blank_rejected():
+    with pytest.raises(InvalidQueryError):
+        extract_query_terms("   ")
+
+
+def test_extract_query_terms_oversized_rejected():
+    with pytest.raises(InvalidQueryError):
+        extract_query_terms("a" * (MAX_QUERY_CHARACTERS + 1))
+
+
+def test_extract_query_terms_control_character_rejected():
+    with pytest.raises(InvalidQueryError):
+        extract_query_terms("hello\x01world")
+
+
+def test_extract_query_terms_only_punctuation_rejected():
+    with pytest.raises(InvalidQueryError):
+        extract_query_terms("***???")
+
+
+def test_extract_query_terms_non_string_rejected():
+    with pytest.raises(InvalidQueryError):
+        extract_query_terms(12345)
+
+
+def test_build_match_expression_matches_quoted_and_of_extracted_terms():
+    # build_match_expression() must remain exactly " AND ".join of quoted
+    # extract_query_terms() output - the refactor's core invariant.
+    query = "Hello hello WORLD world café"
+    terms = extract_query_terms(query)
+    expected = " AND ".join(f'"{term}"' for term in terms)
+    assert build_match_expression(query) == expected
 
 
 # --- validate_limit ----------------------------------------------------------

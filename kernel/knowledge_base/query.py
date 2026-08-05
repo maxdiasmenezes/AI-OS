@@ -62,13 +62,20 @@ def validate_query_text(query: str) -> str:
     return stripped
 
 
-def build_match_expression(query: str) -> str:
-    """Transform arbitrary plain-text query into a safe FTS5 MATCH
-    expression: every extracted alphanumeric term becomes an individually
-    quoted string literal, joined with AND. Terms extracted this way can
-    never contain a quote, wildcard, column separator, or other FTS5
-    punctuation, so nothing in the original query can be interpreted as
-    an FTS5 operator."""
+def extract_query_terms(query: str) -> list[str]:
+    """Validate and tokenize arbitrary plain-text query/question text into
+    a deduplicated, ordered list of literal alphanumeric terms - the
+    shared first stage every MATCH-expression builder in this package
+    starts from (Milestone 38.1). Package-internal: not re-exported from
+    kernel/knowledge_base/__init__.py, since no caller outside this
+    package needs raw terms rather than a finished MATCH expression.
+
+    Validates (via validate_query_text), NFC-normalizes, tokenizes with
+    _TERM_RE (alphanumeric runs only - never a quote, wildcard, column
+    separator, or other FTS5 punctuation), deduplicates case-insensitively
+    while preserving first-occurrence order and original spelling, and
+    caps at MAX_QUERY_TERMS. Raises InvalidQueryError if tokenization
+    yields no terms at all (e.g. blank or all-punctuation input)."""
 
     stripped = validate_query_text(query)
     normalized_query = unicodedata.normalize("NFC", stripped)
@@ -87,7 +94,20 @@ def build_match_expression(query: str) -> str:
         if len(deduped) >= MAX_QUERY_TERMS:
             break
 
-    return " AND ".join(f'"{term}"' for term in deduped)
+    return deduped
+
+
+def build_match_expression(query: str) -> str:
+    """Transform arbitrary plain-text query into a safe FTS5 MATCH
+    expression: every extracted alphanumeric term becomes an individually
+    quoted string literal, joined with AND. Terms extracted this way can
+    never contain a quote, wildcard, column separator, or other FTS5
+    punctuation, so nothing in the original query can be interpreted as
+    an FTS5 operator. Thin wrapper over extract_query_terms() (Milestone
+    38.1) - output is unchanged from before that refactor."""
+
+    terms = extract_query_terms(query)
+    return " AND ".join(f'"{term}"' for term in terms)
 
 
 def validate_limit(limit: int, max_limit: int) -> int:

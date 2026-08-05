@@ -235,9 +235,9 @@ implementation of each, not two that could quietly drift apart.
 
 `retrieve_evidence(question, source_keys=None, limit=3, *, config=None,
 db_path=None)` (`kernel/knowledge_base/evidence.py`) is `search()`'s
-sibling for `/knowledge ask`: the same single, read-only, parameterized,
-ranked query, selecting full (still bounded) chunk text instead of a
-short `snippet()` excerpt. There is no second, caller-controlled chunk-ID
+sibling for `/knowledge ask`: one single, read-only, parameterized, ranked
+query, selecting full (still bounded) chunk text instead of a short
+`snippet()` excerpt. There is no second, caller-controlled chunk-ID
 lookup - full text comes from the same ranked query already scoped to the
 request, so there is nothing for a second retrieval step to do. Fixed
 limits: at most 5 evidence chunks (default 3), at most 1,500 characters
@@ -245,6 +245,65 @@ per chunk (chunking already caps a real chunk smaller, at 1,200), at most
 7,500 characters of evidence total - a chunk that would push the running
 total over budget is dropped whole, in rank order, never included
 partially.
+
+### Ask-only natural-question matching (Milestone 38.1)
+
+Natural questions ("How does the repository backup feature work?") defeat
+`search()`'s strict all-terms-AND matching: a chunk would have to contain
+every generic framing word ("how", "does", "the", "feature", "work") as
+well as the real content terms, which no real chunk does. `/knowledge
+search`'s semantics are unchanged and untouched by this - `build_match_
+expression()` still joins every extracted term with `AND`, exactly as
+before, and it is still the only expression `search()` ever uses.
+
+`retrieve_evidence()` instead builds its own ask-only MATCH expression
+(`evidence.py`'s private `_build_evidence_match_expression()`), still
+built entirely from `kernel/knowledge_base/query.py`'s shared, validated,
+literal-quoting term extraction (`extract_query_terms()`, factored out of
+`build_match_expression()` in this milestone with no change to that
+function's output):
+
+1. Extract terms exactly as `search()` does (validate, NFC-normalize,
+   tokenize, case-insensitive dedupe, cap at 20).
+2. Remove any term whose casefolded form is in a small, fixed, ask-only
+   generic-term set (`evidence.py`'s `_ASK_GENERIC_TERMS`) - English and
+   Portuguese interrogatives, articles, auxiliary verbs, pronouns, common
+   function words, and negation words. This is a deterministic retrieval
+   heuristic, not semantic language understanding: it never translates,
+   stems, or otherwise transforms a term, it only ever removes a term from
+   the retrieval-matching set (never search()'s), and removing a word from
+   this set does not remove it from the question - the complete, original
+   question text (negation included) still reaches the Milestone 38
+   grounded-answer prompt unchanged.
+3. If no terms remain, `retrieve_evidence()` returns `[]` immediately -
+   no database connection is opened and no SQL executes.
+4. Otherwise, the remaining "useful" terms build one MATCH expression by a
+   deterministic minimum-match rule, enforced by FTS5's own tokenizer
+   (never a second, possibly-divergent Python tokenization of chunk
+   text): one useful term is required alone; two useful terms are both
+   required (`"a" AND "b"`, byte-identical in shape to what
+   `build_match_expression()` would produce for the same two terms, so
+   Milestone 38's exact `"repository backup"` behavior is preserved); three
+   or more useful terms require any two of them, expressed as every
+   deterministic two-term `AND` combination in original term order, `OR`'d
+   together - e.g. `("a" AND "b") OR ("a" AND "c") OR ("b" AND "c")` for
+   three terms. Operators and parentheses come only from this code, never
+   from caller input. The term cap (20) bounds the worst case at "20 choose
+   2" = 190 pair clauses (`MAX_EVIDENCE_PAIR_CLAUSES`), asserted
+   defensively at generation time.
+
+This remains exactly one SQL query - the same as before this milestone -
+still parameterized, still ranked by the same `bm25(chunks_fts)` and the
+same deterministic tie-break (`RANKED_ORDER_BY_SQL`, unchanged and still
+shared with `search()`). There is no bounded-candidate-then-Python-filter
+step: FTS5 enforces the minimum-match rule directly, so SQLite's own
+tokenizer - not a separate Python regex applied to chunk text, which could
+disagree with FTS5 on accents, Unicode normalization, or punctuation
+boundaries - decides what counts as a term match. Still no embeddings, no
+vector search, no semantic reranking, no document-frequency queries, no
+query rewriting by a model, and no automatic RAG - this remains lexical
+retrieval that does not understand synonyms, stemming (`backup` and
+`backups` are distinct tokens), translation, or negation semantically.
 
 `kernel/knowledge_base/answer.py` is pure (no I/O, no model call, no
 network): it assembles the one flat prompt string sent to the model

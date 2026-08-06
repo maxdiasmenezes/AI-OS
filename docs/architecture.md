@@ -558,6 +558,25 @@ back, leaving the prior generation searchable. An empty source is a
 valid ingestion that atomically removes any previously indexed documents
 for that source.
 
+As of Milestone 38.2B, `chunk_normalized_text()` takes an `is_markdown`
+keyword, which `ingest_source()` derives solely from the candidate's
+suffix (`.md`, case-insensitively — never content sniffing or a config
+flag). When true, a valid ATX heading outside a fenced code block is a
+hard chunk-packing boundary: text is split into sections at every
+heading's line start first, then each section is paragraph-packed
+independently, so a heading always opens its section's first chunk, no
+chunk ever straddles a real heading, and overlap seeding is clamped to
+the current section's start. `is_markdown=False` (every non-`.md` file,
+and the default) packs the whole document as one section — byte-for-byte
+identical to chunking before this milestone. This changes boundaries,
+offsets, and chunk IDs only for `.md` content; because unchanged
+documents are skipped by content hash, already-indexed `.md` files keep
+their pre-38.2B boundaries until their content changes or the index is
+deliberately rebuilt — see `kernel/knowledge_base/README.md`. This does
+not add or change ranking: `search()` and `retrieve_evidence()` are
+unmodified, and there is no heading-based ranking or heading metadata
+exposed anywhere.
+
 #### Knowledge Search
 
 `kernel/knowledge_base/search.py:search()` is read-only end to end and
@@ -1753,6 +1772,34 @@ this flow — a single call to `handle()` is one full request/response cycle.
   consent, acceptable only because the sole implemented provider is local
   Ollama — revisit before any remote provider is enabled for this
   operation. See Kernel and Capabilities above for the full detail.
+- Milestone 38.2B — Heading-Aware Markdown Chunk Boundaries:
+  `kernel/knowledge_base/chunking.py:chunk_normalized_text()` gains an
+  `is_markdown` keyword (default `False`); `ingest.py` passes
+  `is_markdown=True` only when a candidate's suffix is exactly `.md`
+  (case-insensitively) — derived solely from the traversed file's
+  suffix, never content sniffing or a config flag. When true, a valid
+  ATX heading (`^ {0,3}#{1,6}[ \t]+\S.*$`) outside a fenced code block
+  (3+ backticks/tildes, closed only by a same-or-longer run of the same
+  fence character) is a hard chunk-packing boundary: the document is
+  partitioned into sections at every heading's line start first, then
+  each section is paragraph-packed independently — a heading always
+  opens its section's first chunk, no chunk ever contains text from both
+  before and after a real heading (even with no blank line before it),
+  and overlap seeding is clamped to never search or start before the
+  current section. `is_markdown=False` (every non-`.md` file, and this
+  function's default) packs the whole document as a single section,
+  byte-for-byte identical to chunking before this milestone. This is
+  purely a chunk-boundary change — it does not touch `search.py`,
+  `query.py`, `evidence.py`, the database schema, any provider, prompt,
+  capability, command, or configuration, and it does not add
+  heading-based ranking or expose heading metadata anywhere. Because
+  unchanged documents are skipped by content hash (see Knowledge
+  Ingestion above), already-indexed `.md` documents keep their
+  pre-38.2B chunk boundaries, offsets, and chunk IDs until their content
+  changes or a deliberate one-time index rebuild is performed after
+  deployment — there is no chunker-version field and no automatic
+  forced re-ingestion in this milestone. See Kernel above and
+  `kernel/knowledge_base/README.md` for the full detail.
 
 **Planned / not yet implemented:**
 

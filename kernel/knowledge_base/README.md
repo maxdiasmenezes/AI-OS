@@ -137,6 +137,40 @@ only for internal diffing/identity - it is never returned to a caller;
 `relative_path` (original casing, POSIX form) is what's stored for
 display and returned by search.
 
+### Markdown heading-aware chunk boundaries (Milestone 38.2B)
+
+For a file whose suffix is exactly `.md` (case-insensitively), ingestion
+passes `is_markdown=True` to `chunk_normalized_text()`. A valid ATX
+heading (`^ {0,3}#{1,6}[ \t]+\S.*$`, outside a fenced code block) is then
+a hard chunk-packing boundary: the text is first partitioned into
+sections at every heading's line start, and paragraphs are packed
+independently within each section, exactly as before. This guarantees
+that a heading always begins its section's first chunk, no chunk ever
+contains text from both before and after a real heading (even when no
+blank line precedes the heading), and overlap seeding is clamped to
+never search or start before the current section - overlap can widen a
+chunk backward only within its own section, never into the one before
+it. A line that only *looks* like a heading inside a fenced code block
+(delimited by a line of 3+ backticks or tildes, closed only by a line of
+the same fence character at least as long) is never treated as a
+boundary. Every other file, and every `.md` file's non-Markdown-mode
+callers, packs paragraphs exactly as before this milestone - byte for
+byte unchanged.
+
+This changes chunk boundaries, offsets, ordinals, and therefore chunk IDs
+for `.md` documents only. The content-hash-based unchanged-document skip
+(see Database below) means a previously ingested `.md` file whose content
+hasn't changed is left completely untouched by an ordinary re-ingestion -
+it keeps its old, pre-38.2B chunk boundaries. There is no chunker-version
+field and no automatic forced re-ingestion in this milestone: the only
+way for an already-indexed, unchanged `.md` document to pick up the new
+heading-aware boundaries is one deliberate index rebuild after this
+change is deployed (removing `knowledge_index.sqlite3` and re-running
+`ingest_source()` for every approved source, so every document is
+re-chunked as if new). That rebuild is an operational step for whoever
+deploys this change - it is not performed automatically, and this
+milestone does not perform it.
+
 ## Database
 
 SQLite (stdlib `sqlite3`), schema version 1: `schema_meta`, `sources`,
@@ -343,3 +377,8 @@ encryption-at-rest are all deliberately not implemented. The schema and
 API here (symbolic source keys, relative paths, deterministic chunk IDs)
 are designed so a later orchestrator/RAG integration can read this index
 without requiring a schema change - but no such integration exists yet.
+Milestone 38.2B (see Chunking and identifiers above) changes only where a
+`.md` document is *cut* into chunks; it does not change ranking, ranking
+inputs, or retrieval in any way - there is no heading-based ranking,
+heading-aware retrieval boost, or heading metadata exposed anywhere in
+`search()` or `retrieve_evidence()`.

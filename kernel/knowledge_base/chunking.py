@@ -22,6 +22,10 @@ CHUNK_OVERLAP_CHARACTERS = 200
 
 _PARAGRAPH_SEP_RE = re.compile(r"\n\s*\n+")
 
+_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}[ \t]+\S.*$")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`+|~+)[ \t]*$")
+
 
 class InvalidDocumentEncodingError(ValueError):
     """Raised when raw bytes cannot be strictly decoded as UTF-8 (with or
@@ -65,6 +69,60 @@ def _paragraph_spans(text: str) -> list[tuple[int, int]]:
     if pos < len(text):
         spans.append((pos, len(text)))
     return [(s, e) for s, e in spans if text[s:e].strip()]
+
+
+def _markdown_heading_starts(text: str) -> list[int]:
+    """Locate the start offset of every line in `text` that is a valid
+    ATX heading (``^ {0,3}#{1,6}[ \\t]+\\S.*$``), skipping any line inside a
+    fenced code block (a line opening with 0-3 leading spaces then three
+    or more backticks or tildes, closed by a line of the same fence
+    character at least as long, per CommonMark)."""
+
+    starts: list[int] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    pos = 0
+    length = len(text)
+
+    while pos <= length:
+        newline_idx = text.find("\n", pos)
+        line_end = newline_idx if newline_idx != -1 else length
+        line = text[pos:line_end]
+
+        if in_fence:
+            close_match = _FENCE_CLOSE_RE.match(line)
+            if close_match and close_match.group(1)[0] == fence_char and len(close_match.group(1)) >= fence_len:
+                in_fence = False
+        else:
+            open_match = _FENCE_OPEN_RE.match(line)
+            if open_match:
+                marker = open_match.group(1)
+                fence_char = marker[0]
+                fence_len = len(marker)
+                in_fence = True
+            elif _ATX_HEADING_RE.match(line):
+                starts.append(pos)
+
+        if newline_idx == -1:
+            break
+        pos = newline_idx + 1
+
+    return starts
+
+
+def _markdown_sections(text: str) -> list[tuple[int, int]]:
+    """Partition `text` into (start, end) section spans at every
+    Markdown heading boundary found by `_markdown_heading_starts()`, plus
+    an implicit boundary at offset 0. Each heading starts its own
+    section, with the heading line at the very beginning of that
+    section's text - so no section (and therefore no chunk packed from
+    it) can ever contain text from both before and after a real
+    heading."""
+
+    boundaries = sorted(set([0, *_markdown_heading_starts(text)]))
+    ends = boundaries[1:] + [len(text)]
+    return [(start, end) for start, end in zip(boundaries, ends) if end > start]
 
 
 def _overlap_seed_start(text: str, end: int, floor: int) -> int:
@@ -120,12 +178,17 @@ def _hard_split_span(text: str, start: int, end: int) -> list[tuple[int, int]]:
     return spans
 
 
-def _pack_chunk_spans(text: str, paragraph_spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+def _pack_chunk_spans(
+    text: str, paragraph_spans: list[tuple[int, int]], section_start: int = 0
+) -> list[tuple[int, int]]:
     """Greedily pack consecutive paragraph spans into chunk spans of at
     most MAX_CHUNK_CHARACTERS, seeding each new chunk with
     CHUNK_OVERLAP_CHARACTERS of trailing overlap from the previous one. A
     paragraph longer than MAX_CHUNK_CHARACTERS on its own is hard-split
-    independently via _hard_split_span()."""
+    independently via _hard_split_span(). `section_start` clamps every
+    overlap seed to never search or start before it, so overlap can never
+    reach earlier than the current Markdown section (default 0, the
+    whole-document case, leaves non-Markdown behavior unchanged)."""
 
     chunks: list[tuple[int, int]] = []
     pending_start: int | None = None
@@ -154,7 +217,7 @@ def _pack_chunk_spans(text: str, paragraph_spans: list[tuple[int, int]]) -> list
 
         closed_end = pending_end
         flush()
-        floor = max(p_start - CHUNK_OVERLAP_CHARACTERS, 0)
+        floor = max(p_start - CHUNK_OVERLAP_CHARACTERS, section_start)
         overlap_start = _overlap_seed_start(text, min(closed_end, p_start), floor)
         pending_start, pending_end = overlap_start, p_end
 
@@ -170,18 +233,35 @@ class ChunkSpan:
     char_end: int
 
 
-def chunk_normalized_text(text: str) -> list[ChunkSpan]:
+def chunk_normalized_text(text: str, *, is_markdown: bool = False) -> list[ChunkSpan]:
     """Deterministically split already-normalized document text into
     ordered, non-empty chunks of at most MAX_CHUNK_CHARACTERS each, with
     CHUNK_OVERLAP_CHARACTERS of overlap between consecutive chunks.
     Raises SourceLimitExceededError if the document or its resulting
-    chunk count exceeds the fixed safety limits."""
+    chunk count exceeds the fixed safety limits.
+
+    When `is_markdown` is True (callers pass this only for files whose
+    suffix is exactly ".md", case-insensitively), the text is first
+    partitioned into sections at every ATX heading boundary
+    (`_markdown_sections()`), and paragraphs are packed independently
+    within each section - so a heading always starts its section's first
+    chunk, no chunk ever straddles a real heading, and overlap seeding is
+    clamped to the current section's start. `is_markdown=False` (the
+    default) packs the whole document as a single section, identical to
+    this function's behavior before Milestone 38.2B."""
 
     if len(text) > MAX_DOCUMENT_CHARACTERS:
         raise SourceLimitExceededError("document exceeds the character limit")
 
-    paragraph_spans = _paragraph_spans(text)
-    chunk_spans = _pack_chunk_spans(text, paragraph_spans)
+    sections = _markdown_sections(text) if is_markdown else [(0, len(text))]
+
+    chunk_spans: list[tuple[int, int]] = []
+    for section_start, section_end in sections:
+        paragraph_spans = [
+            (start + section_start, end + section_start)
+            for start, end in _paragraph_spans(text[section_start:section_end])
+        ]
+        chunk_spans.extend(_pack_chunk_spans(text, paragraph_spans, section_start))
 
     if len(chunk_spans) > MAX_CHUNKS_PER_DOCUMENT:
         raise SourceLimitExceededError("document exceeds the chunk count limit")

@@ -265,6 +265,148 @@ def test_unique_constraint_prevents_duplicate_relative_path_key(tmp_path):
         conn.close()
 
 
+# --- Markdown heading-aware chunking on ingest (Milestone 38.2B) ----------
+
+
+def test_md_files_use_markdown_aware_chunking(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    text = (
+        "# First\n\n"
+        + ("alpha " * 300)
+        + "\n\n# Second\n\nShort body under the second heading."
+    )
+    _write(docs / "a.md", text)
+    db_path = _db_path(tmp_path)
+    config = _config(docs)
+
+    ingest_source("ai_os_docs", config=config, db_path=db_path)
+
+    conn = open_reader_connection(db_path)
+    rows = conn.execute(
+        "SELECT char_start, char_end, text FROM chunks ORDER BY chunk_ordinal"
+    ).fetchall()
+    conn.close()
+
+    second_heading_offset = text.index("# Second")
+    assert any(row[0] == second_heading_offset for row in rows)
+    for start, end, _chunk_text in rows:
+        assert not (start < second_heading_offset < end)
+
+
+def test_uppercase_md_suffix_uses_markdown_aware_chunking(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    text = (
+        "# First\n\n"
+        + ("alpha " * 300)
+        + "\n\n# Second\n\nShort body under the second heading."
+    )
+    _write(docs / "A.MD", text)
+    db_path = _db_path(tmp_path)
+    config = _config(docs)
+
+    ingest_source("ai_os_docs", config=config, db_path=db_path)
+
+    conn = open_reader_connection(db_path)
+    rows = conn.execute("SELECT char_start, char_end FROM chunks").fetchall()
+    conn.close()
+
+    second_heading_offset = text.index("# Second")
+    assert any(row[0] == second_heading_offset for row in rows)
+    for start, end in rows:
+        assert not (start < second_heading_offset < end)
+
+
+def test_txt_files_retain_paragraph_only_chunking(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    text = "# This looks like a heading\n\nA short second paragraph that should merge."
+    _write(docs / "a.txt", text)
+    db_path = _db_path(tmp_path)
+    config = _config(docs)
+
+    ingest_source("ai_os_docs", config=config, db_path=db_path)
+
+    conn = open_reader_connection(db_path)
+    rows = conn.execute("SELECT text FROM chunks").fetchall()
+    conn.close()
+
+    assert len(rows) == 1
+    assert rows[0][0] == text
+
+
+def test_markdown_ingestion_is_deterministic(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    text = "# Heading\n\n" + ("word " * 400) + "\n\n## Sub\n\nMore content here."
+    _write(docs / "a.md", text)
+    config = _config(docs)
+
+    db_path_1 = tmp_path / "one.sqlite3"
+    db_path_2 = tmp_path / "two.sqlite3"
+    ingest_source("ai_os_docs", config=config, db_path=db_path_1)
+    ingest_source("ai_os_docs", config=config, db_path=db_path_2)
+
+    conn1 = open_reader_connection(db_path_1)
+    rows1 = conn1.execute(
+        "SELECT char_start, char_end, text FROM chunks ORDER BY chunk_ordinal"
+    ).fetchall()
+    conn1.close()
+    conn2 = open_reader_connection(db_path_2)
+    rows2 = conn2.execute(
+        "SELECT char_start, char_end, text FROM chunks ORDER BY chunk_ordinal"
+    ).fetchall()
+    conn2.close()
+
+    assert rows1 == rows2
+
+
+def test_changed_markdown_content_replaces_chunks_transactionally(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    f = _write(docs / "a.md", "# Original\n\nOriginal body text only.")
+    db_path = _db_path(tmp_path)
+    config = _config(docs)
+
+    ingest_source("ai_os_docs", config=config, db_path=db_path)
+    _write(f, "# Replaced\n\nAll new content.\n\n## Second\n\nMore new content.")
+    result = ingest_source("ai_os_docs", config=config, db_path=db_path)
+
+    assert result.documents_indexed == 1
+    assert result.unchanged_documents == 0
+
+    conn = open_reader_connection(db_path)
+    rows = conn.execute("SELECT text FROM chunks").fetchall()
+    conn.close()
+
+    texts = [r[0] for r in rows]
+    assert not any("Original" in t for t in texts)
+    assert any(t.startswith("# Replaced") for t in texts)
+    assert any(t.startswith("## Second") for t in texts)
+
+
+def test_ingestion_does_not_change_schema_version(tmp_path):
+    from kernel.knowledge_base.db import SCHEMA_VERSION
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    _write(docs / "a.md", "# Heading\n\nBody text.")
+    db_path = _db_path(tmp_path)
+    config = _config(docs)
+
+    ingest_source("ai_os_docs", config=config, db_path=db_path)
+
+    conn = open_reader_connection(db_path)
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    conn.close()
+
+    assert SCHEMA_VERSION == 1
+    assert row[0] == str(SCHEMA_VERSION)
+
+
 # --- atomicity and rollback ----------------------------------------------
 
 

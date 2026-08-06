@@ -24,7 +24,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from kernel.knowledge_base.chunking import (
     InvalidDocumentEncodingError,
@@ -114,7 +114,8 @@ def _run_ingestion_transaction(conn: sqlite3.Connection, source_key: str, canoni
                 continue
             conn.execute("DELETE FROM documents WHERE id = ?", (old_id,))
 
-        chunk_spans = chunk_normalized_text(normalized_text)
+        is_markdown = PurePosixPath(candidate.relative_path).suffix.lower() == ".md"
+        chunk_spans = chunk_normalized_text(normalized_text, is_markdown=is_markdown)
         running_total_chunks += len(chunk_spans)
         if running_total_chunks > MAX_TOTAL_CHUNKS_PER_INGESTION:
             raise SourceLimitExceededError("source exceeds the total chunk limit")

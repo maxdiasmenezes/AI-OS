@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 from scripts.wine_acceptance_check import (
     CellarStats,
     WineAcceptanceError,
@@ -120,7 +120,9 @@ class _FakeRealProvider(ModelProvider):
         self.calls: list[str] = []
         self._text = response_text
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         self.calls.append(prompt)
         return ModelResponse(
             text=self._text, model="fake-real-model", input_tokens=1, output_tokens=1, latency_seconds=0.01,
@@ -550,7 +552,7 @@ def test_real_provider_call_failure_returns_failure(full_cellar_paths):
         def __init__(self):
             pass
 
-        def send_prompt(self, prompt):
+        def send_prompt(self, prompt, *, options=None):
             raise RuntimeError("synthetic call failure")
 
     result = run_acceptance(profile_path, cellar_path, call_model=True, provider_factory=_RaisingProvider)

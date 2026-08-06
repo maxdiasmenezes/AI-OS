@@ -4,7 +4,7 @@ Placeholder for future OpenAI support.
 Not implemented yet - AI-OS is built incrementally, provider by provider.
 """
 
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 
 
 class OpenAIProvider(ModelProvider):
@@ -13,5 +13,7 @@ class OpenAIProvider(ModelProvider):
     def __init__(self, settings: dict):
         pass
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         raise NotImplementedError("OpenAI provider is not implemented yet.")

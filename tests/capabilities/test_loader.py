@@ -10,7 +10,7 @@ from capabilities.wine.capability import WineCapability
 from kernel.capabilities import CapabilityRegistry
 from kernel.knowledge import JSONKnowledgeStore
 from kernel.memory import MemoryManager
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 
 
 class FakeModelProvider(ModelProvider):
@@ -19,7 +19,9 @@ class FakeModelProvider(ModelProvider):
     def __init__(self):
         pass
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         raise AssertionError("provider should not be called in Milestone 21")
 
 
@@ -171,6 +173,8 @@ class _RecordingProvider(ModelProvider):
             latency_seconds=0.1,
         )
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         self.received_prompts.append(prompt)
         return self.response

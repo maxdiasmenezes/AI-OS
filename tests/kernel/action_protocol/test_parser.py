@@ -462,3 +462,39 @@ def test_failure_detail_never_echoes_raw_model_text():
     result = parse_decision(raw, ())
     assert isinstance(result, ParseFailure)
     assert secret_marker not in result.detail
+
+
+# --- Milestone 39 revision: selection stays proposal-only -------------------
+#
+# Regression coverage for the prompt-policy revision: a successful
+# select_candidate parse must never be, or be confused with, a record that
+# an action ran or that confirmation was granted - those concepts have no
+# field anywhere in this closed type, no matter what the model outputs.
+
+
+def test_select_candidate_decision_has_no_execution_or_confirmation_field():
+    raw = json.dumps({
+        "protocol_version": 1, "decision": "select_candidate",
+        "candidate_id": "candidate_1", "user_summary": "x",
+    })
+    result = parse_decision(raw, (_candidate(),))
+    assert isinstance(result, ParseSuccess)
+    field_names = set(vars(result.decision))
+    assert field_names == {"protocol_version", "candidate", "user_summary"}
+
+
+def test_selecting_a_sensitive_candidate_does_not_alter_or_grant_confirmation():
+    sensitive_candidate = _candidate(candidate_id="candidate_1")
+    assert sensitive_candidate.sensitive is True  # test fixture default
+    raw = json.dumps({
+        "protocol_version": 1, "decision": "select_candidate",
+        "candidate_id": "candidate_1", "user_summary": "x",
+    })
+    result = parse_decision(raw, (sensitive_candidate,))
+    assert isinstance(result, ParseSuccess)
+    # The exact, unmodified candidate object is returned - sensitivity is
+    # unchanged and nothing about "confirmed" exists on it to have been set.
+    assert result.decision.candidate is sensitive_candidate
+    assert result.decision.candidate.sensitive is True
+    assert not hasattr(result.decision.candidate, "confirmed")
+    assert not hasattr(result.decision, "confirmed")

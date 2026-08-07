@@ -9,7 +9,7 @@ import json
 import time
 import urllib.request
 
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 
 # Milestone 38: a fixed, code-level request timeout - not user-configurable,
 # not a per-command option. Without this, a hung or unreachable Ollama
@@ -21,6 +21,16 @@ from kernel.models.base import ModelProvider, ModelResponse
 # responsible for mapping such an exception to a fixed, privacy-safe reply.
 OLLAMA_REQUEST_TIMEOUT_SECONDS = 120
 
+# Milestone 39: the accepted range for ModelRequestOptions.temperature_override
+# on this provider specifically - not a ModelRequestOptions-level rule, since
+# only the provider knows what its own API actually accepts. Mirrors the
+# conventional 0.0-2.0 range this provider's underlying model API accepts;
+# the configured default temperature (settings["temperature"], used when no
+# override is given) is trusted local configuration and is not re-validated
+# against this range.
+MIN_TEMPERATURE_OVERRIDE = 0.0
+MAX_TEMPERATURE_OVERRIDE = 2.0
+
 
 class OllamaProvider(ModelProvider):
     """Sends prompts to a local Ollama server."""
@@ -31,18 +41,45 @@ class OllamaProvider(ModelProvider):
         self.max_tokens = settings["max_tokens"]
         self.temperature = settings["temperature"]
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
-        """Send a single prompt to Ollama and return the response."""
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
+        """Send a single prompt to Ollama and return the response.
 
-        payload = json.dumps({
+        With `options=None` (every call site written before Milestone 39),
+        the outgoing payload is byte-identical to before this method
+        gained the `options` parameter. `self.temperature`/`self.model`/
+        `self.max_tokens` are never mutated by this call - a structured,
+        temperature-overridden request has no effect on any later call on
+        this same provider instance.
+        """
+
+        temperature = self.temperature
+        if options is not None and options.temperature_override is not None:
+            if not (
+                MIN_TEMPERATURE_OVERRIDE
+                <= options.temperature_override
+                <= MAX_TEMPERATURE_OVERRIDE
+            ):
+                raise ValueError(
+                    "OllamaProvider: temperature_override must be between "
+                    f"{MIN_TEMPERATURE_OVERRIDE} and {MAX_TEMPERATURE_OVERRIDE}"
+                )
+            temperature = options.temperature_override
+
+        body_dict = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": self.temperature,
+                "temperature": temperature,
                 "num_predict": self.max_tokens,
             },
-        }).encode("utf-8")
+        }
+        if options is not None and options.require_json:
+            body_dict["format"] = options.json_schema if options.json_schema is not None else "json"
+
+        payload = json.dumps(body_dict).encode("utf-8")
 
         request = urllib.request.Request(
             f"{self.base_url}/api/generate",

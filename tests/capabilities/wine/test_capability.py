@@ -8,7 +8,7 @@ import pytest
 from capabilities.wine.capability import WineCapability
 from kernel.knowledge import JSONKnowledgeStore
 from kernel.memory import MemoryManager
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 
 # tests/capabilities/wine/test_capability.py -> tests/capabilities -> tests -> project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -30,7 +30,9 @@ class FakeModelProvider(ModelProvider):
             latency_seconds=0.42,
         )
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         self.received_prompts.append(prompt)
         return self.response
 

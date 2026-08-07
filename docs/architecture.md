@@ -395,7 +395,23 @@ abandoned mid-processing.
   exist for Ollama, Anthropic, OpenAI, and Gemini. Of these, only Ollama is
   selected as the active provider in `kernel/config/config.yaml` and exercised
   end-to-end today; the other adapters are present in the codebase but not
-  verified as the active path.
+  verified as the active path. **Milestone 39** adds `ModelRequestOptions`
+  (`kernel/models/base.py`) — a frozen, keyword-only, per-request options
+  object (`require_json`, `json_schema`, `temperature_override`) that
+  `send_prompt(prompt, *, options=None)` now accepts on every provider.
+  `options=None` (every call site written before Milestone 39: the
+  orchestrator's fallback, `WineCapability`'s fallback, and
+  `KnowledgeCommandsCapability._execute_ask()`) reproduces the exact prior
+  request byte-for-byte — nothing about ordinary prose calls changed.
+  `OllamaProvider` (`kernel/models/ollama.py`) is the only provider that
+  acts on `options`: it conditionally adds a `format` field (`"json"`, or
+  the supplied JSON Schema) and substitutes `temperature_override` into
+  that one request's payload only — `self.temperature`/`self.model`/
+  `self.max_tokens` are never mutated, and a structured request has no
+  effect on any later call on the same provider instance. An out-of-range
+  `temperature_override` (outside `OllamaProvider`'s own
+  `MIN_TEMPERATURE_OVERRIDE`/`MAX_TEMPERATURE_OVERRIDE`, 0.0-2.0) is
+  rejected before any HTTP request is made.
 - **tools** — reusable tools (actions, integrations, lookups) that
   capabilities could invoke. Implemented (Milestone 33; extended in
   Milestone 34; extended again in Milestone 35): the safe computer task
@@ -515,7 +531,83 @@ abandoned mid-processing.
   never a sender-supplied path, executable, working directory, or (for
   scripts) argument of any kind; `repo_health.py` and
   `repository_backup.py` — see Repository Health Checks and Repository
-  Backup below for their full behavior.
+  Backup below for their full behavior. **Milestone 39** adds a small,
+  read-only descriptor view to `ActionRegistry`:
+  `descriptors() -> tuple[ActionDescriptor, ...]`, in fixed declaration
+  order, where `ActionDescriptor` (`kernel/tools/registry.py`) carries
+  `name`, `resource_key_requirement` (a closed
+  `ResourceKeyRequirement` enum — `FORBIDDEN`/`OPTIONAL`/`REQUIRED`;
+  `system_status` is the only `FORBIDDEN` one, the other five are
+  `REQUIRED`), `resource_key_description` (a short, generic phrase, never
+  a real key), and `sensitive`. No handler, path, or configuration value
+  is ever exposed through it — see `kernel/action_protocol/` below, its
+  only consumer so far.
+- **action_protocol** (Milestone 39 — Reliable Action Protocol) — the
+  machine-readable protocol through which a model returns exactly one
+  validated decision, without ever generating or altering a tool name, a
+  resource key, or an arguments object itself. A new package,
+  `kernel/action_protocol/`, implementing the approved two-stage
+  Deterministic Candidate Protocol; **not yet wired to any caller** — no
+  changes to `kernel/orchestrator/`, any `capabilities/`, or
+  `interfaces/whatsapp/` in this milestone.
+
+  **Stage A - deterministic candidate resolution**
+  (`candidates.py:resolve_action_candidates()`). Never calls a model,
+  never executes an action. Matches the raw request against a small,
+  conservative, hand-written grammar over the six `ActionRegistry`
+  actions (favoring false negatives over false positives throughout),
+  resolves any named target against the real `ToolsConfig` with exact,
+  case-insensitive symbolic-key lookup only (no aliases, no fuzzy or
+  semantic matching, no default target — matching
+  `kernel/config/tools.yaml`'s own schema exactly), and returns a
+  `CandidateResolution`: either zero or more immutable `ActionCandidate`
+  objects, or — when a supported single-action intent is recognized but
+  its required target is absent — a deterministic
+  `RequestClarificationDecision` returned without ever calling the model.
+  A target-looking token that fails a narrow shape check
+  (`[A-Za-z0-9_-]`, 1-64 characters) or does not match a real configured
+  key produces zero candidates, never a guess — this is what keeps a
+  destructive command, a drive-letter path, or a quoted shell fragment
+  from ever reaching a registry lookup at all. A recognized action
+  combined with further content (`and`/`then`/`also`/`after that`/
+  `before that`/`;`/a newline, with real content on both sides) also
+  produces zero candidates — a compound request is never narrowed to its
+  safe-looking first clause.
+
+  **Stage B - constrained model decision** (`prompt.py` + `parser.py`).
+  `build_prompt()`/`build_schema()` build one flat prompt and one dynamic
+  JSON Schema per request: the model sees the request text and, for each
+  candidate, only an opaque `candidate_id`, a code-generated
+  `user_summary`, and whether it is `sensitive` — never a raw path,
+  command, executable, or the underlying action/resource-key fields
+  themselves. The schema's `oneOf` permits exactly `respond`,
+  `request_clarification`, `cannot_complete`, and — only when at least
+  one candidate exists — `select_candidate`, whose `candidate_id` is an
+  `enum` of exactly that request's live candidate IDs; with zero
+  candidates, `select_candidate` is entirely absent from the schema, so
+  the model is structurally unable to select a tool, not merely
+  instructed not to. `parser.py:parse_decision()` never raises for a
+  malformed or unsafe model response (mirrors
+  `kernel/knowledge_base/answer.py`'s `parse_structured_answer()`
+  contract): complete-response parsing only (`json.loads()` requires the
+  whole string be one JSON value, so prose before/after or multiple
+  objects already fail), at most one whole-response Markdown fence
+  stripped, duplicate JSON keys and `NaN`/`Infinity`/`-Infinity` rejected,
+  JSON nesting deeper than 8 rejected before the recursive decoder ever
+  sees it, an exact field set required per decision branch (so a field
+  from another branch, or a `tool_name`/`resource_key`/`arguments`/
+  confirmation field, is always rejected), and a `select_candidate`
+  decision's `candidate_id` resolved only against the exact, request-local
+  candidate tuple supplied to the parser — an unknown ID fails closed even
+  though the dynamic schema should already make it unreachable. The
+  parser performs no I/O and imports no executor or confirmation store;
+  nothing a request's text claims (an already-approved candidate ID, a
+  claim that confirmation was already granted) has any channel of effect.
+
+  See `kernel/action_protocol/README.md` for the full design and its
+  documented limitation: the conservative grammar's false negatives are
+  intentional, not a defect — broader natural-language coverage is a
+  later-milestone tradeoff.
 - **config** — settings that govern how the kernel and its components
   behave. Implemented: non-secret settings load from `kernel/config/config.yaml`
   (active provider, provider settings, memory, knowledge, and log locations),
@@ -1800,6 +1892,21 @@ this flow — a single call to `handle()` is one full request/response cycle.
   deployment — there is no chunker-version field and no automatic
   forced re-ingestion in this milestone. See Kernel above and
   `kernel/knowledge_base/README.md` for the full detail.
+- Milestone 39 — Reliable Action Protocol: the deterministic-candidate
+  action protocol described under Kernel above
+  (`kernel/action_protocol/`), plus `ModelRequestOptions`
+  (`kernel/models/base.py`) and the `ActionRegistry.descriptors()` view
+  (`kernel/tools/registry.py`) it consumes. Model-generated tool names,
+  resource keys, and arguments objects are prohibited by construction —
+  the model may only ever select a code-generated `candidate_id` already
+  offered to it for that request, never invent or alter one. This
+  milestone has **no production caller**: nothing in
+  `kernel/orchestrator/`, any `capabilities/`, or `interfaces/whatsapp/`
+  invokes this package, no tool is executed by it, and no
+  natural-language WhatsApp task is reachable through it yet — it is a
+  self-contained, tested library. Persisted task state begins Milestone
+  40; a bounded planner begins Milestone 41; an autonomous execution loop
+  begins Milestone 42.
 
 **Planned / not yet implemented:**
 

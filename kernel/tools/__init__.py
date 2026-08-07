@@ -20,7 +20,7 @@ from kernel.tools.config import (
 )
 from kernel.tools.confirmation import ConfirmationStore, PendingAction, default_store
 from kernel.tools.executor import SafeTaskExecutor
-from kernel.tools.registry import ActionRegistry
+from kernel.tools.registry import ActionDescriptor, ActionRegistry, ResourceKeyRequirement
 from kernel.tools.types import ActionRequest, ActionResult
 
 __all__ = [
@@ -36,7 +36,9 @@ __all__ = [
     "PendingAction",
     "default_store",
     "SafeTaskExecutor",
+    "ActionDescriptor",
     "ActionRegistry",
+    "ResourceKeyRequirement",
     "ActionRequest",
     "ActionResult",
 ]

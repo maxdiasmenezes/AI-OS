@@ -17,7 +17,7 @@ from kernel.capabilities.base import EphemeralResult
 from kernel.knowledge_base.config import KnowledgeBaseConfig, SourceSpec
 from kernel.knowledge_base.evidence import EvidenceChunk
 from kernel.knowledge_base.types import DatabaseUnavailableError, InvalidSourceFilterError
-from kernel.models.base import ModelResponse
+from kernel.models.base import ModelRequestOptions, ModelResponse
 from kernel.tools.confirmation import ConfirmationStore
 
 from capabilities.knowledge_commands.capability import KnowledgeCommandsCapability
@@ -36,7 +36,9 @@ class FakeModelProvider:
         self.received_prompts: list[str] = []
         self.call_count = 0
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         self.received_prompts.append(prompt)
         self.call_count += 1
         if self._error is not None:

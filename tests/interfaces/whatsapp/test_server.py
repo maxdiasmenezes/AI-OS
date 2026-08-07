@@ -32,7 +32,7 @@ from interfaces.whatsapp.server import (
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.memory import MemoryManager
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 
 _APP_SECRET = "test-app-secret"
 _VERIFY_TOKEN = "test-verify-token"
@@ -1049,7 +1049,9 @@ class FakeProvider(ModelProvider):
     def __init__(self, response: ModelResponse):
         self._response = response
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         return self._response
 
 

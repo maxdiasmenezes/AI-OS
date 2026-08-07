@@ -12,7 +12,7 @@ from kernel.capabilities.base import Capability, EphemeralResult
 from kernel.config.config import Config
 from kernel.knowledge import JSONKnowledgeStore, KnowledgeStore
 from kernel.memory import MemoryEntry, MemoryManager
-from kernel.models.base import ModelProvider, ModelResponse
+from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 from kernel.orchestrator import Orchestrator, RequestContext
 from kernel.orchestrator.orchestrator import COMPUTER_ACTIONS_DENIED_TEXT
 from kernel.tools import audit
@@ -29,7 +29,9 @@ class FakeModelProvider(ModelProvider):
         self._response = response
         self.received_prompts: list[str] = []
 
-    def send_prompt(self, prompt: str) -> ModelResponse:
+    def send_prompt(
+        self, prompt: str, *, options: ModelRequestOptions | None = None
+    ) -> ModelResponse:
         self.received_prompts.append(prompt)
         return self._response
 

@@ -71,3 +71,11 @@ storage/knowledge/*.sqlite3
 storage/knowledge/*.sqlite3-wal
 storage/knowledge/*.sqlite3-shm
 storage/knowledge/*.sqlite3-journal
+
+# Milestone 40: the local SQLite persistent-task database (database file
+# plus its WAL/shared-memory/journal sidecar files) - machine-local
+# derived data, never committed.
+storage/tasks/*.sqlite3
+storage/tasks/*.sqlite3-wal
+storage/tasks/*.sqlite3-shm
+storage/tasks/*.sqlite3-journal

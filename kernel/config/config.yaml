@@ -30,3 +30,6 @@ memory:
 
 knowledge:
   storage_dir: "storage/knowledge"
+
+tasks:
+  storage_dir: "storage/tasks"

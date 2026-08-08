@@ -245,3 +245,75 @@ def test_prompt_forbids_markdown_and_extra_text():
     lowered = prompt.casefold()
     assert "no markdown" in lowered
     assert "nothing else" in lowered or "exactly one json object" in lowered
+
+
+# --- Milestone 39 revision: explicit decision precedence -------------------
+#
+# Regression coverage for the semantic-routing failure the empirical pass
+# found: the model using "respond" to fabricate the outcome of an action or
+# current-state check it never performed. These tests only verify the
+# shipped prompt *text* states the policy - they cannot verify a live
+# model's behavior (that is the empirical harness's job, not pytest's).
+
+
+def test_prompt_states_select_candidate_is_first_priority_and_proposal_only():
+    prompt = build_prompt("anything", (_candidate(),)).casefold()
+    assert "select_candidate" in prompt
+    assert "proposal" in prompt
+    assert "nothing has run yet" in prompt
+
+
+def test_prompt_forbids_respond_from_claiming_a_candidate_action_completed():
+    prompt = build_prompt("anything", (_candidate(),)).casefold()
+    assert "never describe it" in prompt
+    assert "already done, checked, opened, run, or" in prompt
+
+
+def test_prompt_forbids_respond_from_simulating_an_unsupported_action():
+    prompt = build_prompt("anything", ()).casefold()
+    assert "must never simulate, invent, or claim the" in prompt
+    assert "never use \"respond\" to claim" in prompt
+    assert "an unsupported" in prompt
+
+
+def test_prompt_directs_cannot_complete_when_no_candidate_can_perform_the_action():
+    prompt = build_prompt("anything", ()).casefold()
+    assert "cannot_complete" in prompt
+    assert "no candidate below can do" in prompt
+
+
+def test_prompt_distinguishes_missing_detail_from_unsupported_action_kind():
+    # Regression for the specific residual failure the second empirical
+    # pass found: the model asking a clarifying question about an action
+    # (delete, format, email, shutdown) that no candidate could ever
+    # represent, instead of declining outright.
+    prompt = build_prompt("anything", ()).casefold()
+    assert "not one a candidate could ever represent" in prompt
+    assert "do not ask a clarifying question about the details" in prompt
+
+
+def test_prompt_directs_clarification_for_missing_or_ambiguous_target():
+    prompt = build_prompt("anything", ()).casefold()
+    assert "request_clarification" in prompt
+    assert "a candidate could exist once you know that detail" in prompt
+
+
+def test_prompt_includes_worked_examples_for_all_four_decisions():
+    prompt = build_prompt("anything", (_candidate(),))
+    for marker in (
+        "correct: select_candidate",
+        "correct: cannot_complete",
+        "correct: request_clarification",
+        "correct: respond",
+    ):
+        assert marker in prompt
+
+
+def test_decision_precedence_order_is_select_then_clarify_then_cannot_complete_then_respond():
+    prompt = build_prompt("anything", (_candidate(),))
+    assert (
+        prompt.index('1. "select_candidate"')
+        < prompt.index('2. "request_clarification"')
+        < prompt.index('3. "cannot_complete"')
+        < prompt.index('4. "respond"')
+    )

@@ -56,12 +56,25 @@ to the kernel.
   sources, reachable only through scripts/knowledge.py (a human-invoked
   CLI outside the runtime kernel); not wired into the orchestrator, any
   capability, or kernel/knowledge above.
-  kernel/employee_tasks: implemented (Milestone 40) - a separate,
+  kernel/employee_tasks: implemented (Milestone 40; schema version 2,
+  adding plan persistence, in Milestone 41 P2) - a separate,
   dedicated SQLite database (storage/tasks/tasks.sqlite3) giving durable
   task identity and lifecycle state; not wired into the orchestrator, any
   capability, kernel/action_protocol, or kernel/tools/confirmation.py -
   deliberately distinct from capabilities/tasks/TasksCapability, an
-  unrelated, existing command capability.
+  unrelated, existing command capability. As of Milestone 41 P2 it has
+  exactly one caller, kernel/task_orchestration/ below - still no
+  production caller upstream of that.
+  kernel/task_planner: implemented (Milestone 41 P1 - Bounded Task
+  Planner) - takes one persisted employee_tasks Task and a deterministic
+  action catalog and produces a bounded, validated plan via exactly one
+  structured-output model call; never executes anything. See Bounded Task
+  Planner below.
+  kernel/task_orchestration: implemented (Milestone 41 P2 - Planning
+  Orchestration) - connects kernel/task_planner to kernel/employee_tasks
+  without either depending on the other, running one task through
+  created -> planning -> {ready | failed}. See Planning Orchestration
+  below. No production caller yet.
 ```
 
 ## Layers
@@ -655,16 +668,20 @@ backup is created.
 
 #### Persistent Task Lifecycle
 
-`kernel/employee_tasks/` (Milestone 40) persists task identity and
-lifecycle state in a dedicated SQLite database,
+`kernel/employee_tasks/` (Milestone 40; schema version 2 in Milestone 41
+P2) persists task identity, lifecycle state, and — once planning
+succeeds — a validated plan, in a dedicated SQLite database,
 `storage/tasks/tasks.sqlite3`, whose location is derived from the
 `tasks.storage_dir` setting in `kernel/config/config.yaml` the same way
 `kernel/knowledge_base/db.py` derives its own database path — read
 directly from the YAML file, independently of `kernel/config/config.py`,
 so this package needs no wiring into `Config` or `Orchestrator` to be
-usable. It is **not** wired into either in this milestone: nothing calls
-`kernel/employee_tasks/` yet, and it calls no model, no tool, and no
-other kernel or capability package.
+usable. It is **not** wired into either as of Milestone 41: nothing in
+`kernel/orchestrator/`, any `capabilities/`, or `interfaces/whatsapp/`
+calls it, and it still calls no model and no tool itself. As of Milestone
+41 P2 it does have one caller, `kernel/task_orchestration/` (see Planning
+Orchestration below), which is itself not wired into anything upstream
+yet either.
 
 - **Identity.** `task_id` is a code-generated UUID7
   (`uuid.uuid7()`, Python 3.14 stdlib, no new dependency) — time-ordered,
@@ -688,28 +705,209 @@ other kernel or capability package.
   state; terminal states accept no further transition, enforced both
   before any SQL runs and again by the conditional `UPDATE`'s `WHERE`
   clause.
-- **Schema (version 1).** A `tasks` table (current row per task: state,
+- **Schema (version 2).** A `tasks` table (current row per task: state,
   the original `request_text`, `source`, an optional `dedup_key`,
   timestamps, failure fields, an opaque size-capped `metadata_json`
-  string, and an optimistic `version` counter) plus an append-only
-  `task_transitions` journal (one row per state change, including a
-  synthetic `NULL -> created` row recorded at creation) — current-row
-  update and journal insert always commit together in one transaction,
-  matching `kernel/knowledge_base/db.py`'s `schema_meta`
-  version-tracking convention.
+  string, an optimistic `version` counter, and — schema version 2,
+  Milestone 41 P2 — an opaque, size-capped (`MAX_PLAN_JSON_CHARS`,
+  16,384) `plan_json` column) plus an append-only `task_transitions`
+  journal (one row per state change, including a synthetic
+  `NULL -> created` row recorded at creation) — current-row update and
+  journal insert always commit together in one transaction, matching
+  `kernel/knowledge_base/db.py`'s `schema_meta` version-tracking
+  convention. Version 1 → 2 migration (`kernel/employee_tasks/db.py:
+  _migrate_v1_to_v2()`) adds the column to an existing database with a
+  single `ALTER TABLE` committed atomically with the `schema_meta` version
+  bump; every pre-existing row implicitly gets `plan_json = NULL`, which
+  is exactly correct since no task from before this milestone has ever
+  had a plan.
 - **Concurrency.** `BEGIN IMMEDIATE` on every write, WAL journal mode and
   a fixed busy timeout on the writer connection, `PRAGMA query_only=ON`
   on the reader connection — the same split `kernel/knowledge_base/db.py`
   established. Every transition requires the caller's expected current
   state; a stale or racing writer gets a typed `InvalidTransitionError`
   or `TaskAlreadyTerminalError` and modifies neither table.
-- **Scope.** This milestone persists identity and lifecycle state only —
-  it does not plan, execute, call a model, or call a tool. A later
-  milestone connects task → protocol → planner → executor; this one
-  provides only the durable primitive that will sit underneath it.
+- **Plan persistence (Milestone 41 P2).**
+  `TaskRepository.persist_plan_and_ready()` writes `plan_json` and
+  transitions `planning -> ready` atomically, in the same transaction as
+  the journal entry — a task is never left `ready` without a plan, and a
+  plan is never persisted without that transition. The underlying
+  conditional `UPDATE` requires both `state = 'planning'` AND
+  `plan_json IS NULL`, so a plan may be persisted exactly once per task;
+  a second attempt, or one made against the wrong state, fails closed
+  with the same typed errors (`InvalidTransitionError`/
+  `TaskAlreadyTerminalError`) every other transition already uses — no
+  new error taxonomy was introduced for this. `plan_json`'s content is
+  treated exactly as opaquely as `metadata_json`: this layer validates
+  only that it parses as JSON and stays within its size bound, and never
+  imports `kernel.task_planner` or any `TaskPlan` type.
+- **Scope.** As of Milestone 41 P2, this package persists identity,
+  lifecycle state, and a validated plan once planning succeeds — it still
+  does not execute a task, call a model, or call a tool itself (planning
+  happens in `kernel/task_planner/`, orchestrated by
+  `kernel/task_orchestration/` — see below). Execution of a plan's steps
+  begins in Milestone 42.
 
 See `kernel/employee_tasks/__init__.py` and `storage/tasks/README.md` for
 the full design and the "task" naming disambiguation.
+
+#### Bounded Task Planner
+
+`kernel/task_planner/` (Milestone 41 P1) takes one `kernel/employee_tasks`
+`TaskRecord` and a deterministic action catalog and produces a bounded,
+validated plan (`TaskPlan`) via exactly one structured-output model call —
+never executing anything, never calling a tool, never granting
+confirmation. It has no dependency on `kernel/employee_tasks`' `db.py` or
+`repository.py` (only the plain, I/O-free `TaskRecord` type and, for
+serialization, the `MAX_PLAN_JSON_CHARS` bound), and no dependency on
+`kernel/action_protocol/` — enforced mechanically by an AST-based
+import-boundary test, not just by convention.
+
+- **Action catalog** (`catalog.py:build_catalog()`) — the model-facing
+  action-reference strategy: the full, request-independent cross product
+  of `ActionRegistry.descriptors()` (Milestone 39) and each action's real
+  configured resource keys, giving each `(action, resource_key)` pair an
+  opaque `catalog_id`. Deliberately **not** `kernel/action_protocol/
+  candidates.py`'s `resolve_action_candidates()`: that resolver is a
+  per-request natural-language grammar that, by design, returns zero
+  candidates for anything compound, which a bounded multi-step planner
+  cannot be built on top of — confirmed empirically before this milestone
+  was designed (see below).
+- **Prompt/schema** (`prompt.py`) — a fixed set of five ordered precedence
+  rules (full coverage of every requested operation; never guess from a
+  genuinely ambiguous request; the step limit is a hard representability
+  limit, never a truncation target; one action per action step; a
+  `respond` step is synthesis only, never an implied action) plus six
+  compact few-shot examples, and a two-branch (`"plan"`/`"cannot_plan"`)
+  dynamic JSON Schema whose `action` step branch's `catalog_id` enum is
+  exactly the offered catalog — the model is structurally unable to
+  reference an action outside that set. Uses the same request-specific
+  `require_json=True` / dynamic schema / `temperature_override`
+  structured-output path Milestone 39 proved
+  (`kernel/models/base.py:ModelRequestOptions`), fixed at
+  `PLANNER_TEMPERATURE_OVERRIDE = 0.0`.
+- **Parser** (`parser.py:parse_plan_response()`) — strict, fail-closed,
+  never raises: complete-response-only JSON parsing, duplicate-key and
+  `NaN`/`Infinity` rejection, a nesting-depth pre-check, an exact
+  required-field set per branch, and per-step validation including a
+  backward-only `depends_on` bound (`1 <= dependency < position`) that
+  makes a dependency cycle structurally unreachable rather than merely
+  checked-for. `requires_confirmation` is derived deterministically from
+  the selected catalog entry's registry sensitivity — never a field the
+  model can supply; no such field exists anywhere in the schema.
+- **Capability grounding** (`grounding.py:validate_capability_grounding()`) —
+  a small, deterministic validation boundary that runs strictly after a
+  structurally valid plan already exists, never inside the parser. A real,
+  correctly-referenced catalog action is necessary but not sufficient: an
+  action whose resource key names one specific, narrowly-purposed
+  capability (`open_application`, `run_registered_script` — always) or
+  whose action has more than one configured resource in the catalog (any
+  action, once ambiguous among multiple real options) must have every
+  word of its selected resource key textually present in the request —
+  purely lexical whole-word containment, never semantic/NLP matching, no
+  model call. This closes a real failure mode found during model
+  evaluation: a generic request ("run the tests") must never silently
+  authorize a specifically-named capability ("the `whatsapp_test`
+  script") the request never mentioned, while an explicit request naming
+  it legitimately may. A step that fails this check produces a
+  `PlannerFailure` (`UNGROUNDED_CAPABILITY`), never a `TaskPlan`.
+- **Planner model selection.** `llama3.1:8b` (the general conversational
+  provider's own model) and `qwen3:14b` were both evaluated as candidate
+  structured-planner models against a fixed 33-request corpus (single-
+  step, multi-step, ambiguous, and adversarial requests) using this exact
+  prompt/schema/parser, `require_json=True`, and
+  `temperature_override=0.0` — both scored 87.9% strict semantic-plan
+  accuracy, below the required 90% reliability gate.
+  `gemma3:12b` scored 97.0% (32/33) and passed every acceptance
+  criterion (100% strict-schema-valid, 100% correct action-reference
+  accuracy, zero invented actions, zero confirmation-policy violations,
+  zero ungrounded-capability false-positives on legitimate requests). It
+  is recorded as the dedicated planner model in `kernel/config/
+  config.yaml`'s `planner` section (Milestone 41 P3) — structured the
+  same way as the general `provider`/`providers` section, so a future
+  caller can construct a `ModelProvider` from
+  `config.planner_provider_settings` the same way `get_provider()`
+  already does for the general one. **The general conversational
+  provider is unchanged** — it remains `ollama`/`llama3.1:8b`; nothing
+  currently constructs or calls a planner-specific `ModelProvider`, and
+  no runtime caller invokes planning from a real request.
+- **Serialization** (`serialization.py`) — `serialize_plan()`/
+  `deserialize_plan()` convert a `TaskPlan` to and from the deterministic
+  (sorted-key, compact) JSON string `kernel/employee_tasks/` persists
+  opaquely as `plan_json` (see Persistent Task Lifecycle above). A
+  malformed persisted string is a distinct, typed
+  `PlanDeserializationError` — a storage/corruption concern — never
+  converted into a `PlannerErrorCode`/`PlannerFailure`, which describe a
+  problem with a model's response, not a database row. `TaskPlan.task_id`
+  round-trips exactly like every other field; a future execution consumer
+  (Milestone 42) that loads a `TaskRecord` and its `plan_json`
+  independently must verify
+  `deserialize_plan(record.plan_json).task_id == record.task_id` before
+  treating any step as executable — `kernel/employee_tasks/` itself never
+  cross-checks this, since `plan_json` is opaque to it.
+
+Boundary: Milestone 41 decides and persists **what** should be done. It
+never decides **when** or **next**, and never performs the doing.
+Milestone 42 owns execution.
+
+#### Planning Orchestration
+
+`kernel/task_orchestration/` (Milestone 41 P2) connects the pure planner
+above to the persistent task lifecycle, without either depending on the
+other — it depends on both `kernel.employee_tasks` and
+`kernel.task_planner` (plus `kernel.models` for the injected
+`ModelProvider` type), and neither of those depends on it. An AST-based
+import-boundary test confirms it never imports a tool executor, a tool
+execution handler, process-control execution, confirmation execution, or
+`kernel.tools` at all.
+
+`advance_task_planning(task, repository, catalog, model_provider)` runs
+the complete `created -> planning -> {ready | failed}` sequence for one
+task, one invocation:
+
+- The caller must supply a task already in `created`; a task in any other
+  state is rejected before any repository write or model call.
+  `TaskRepository.transition_task()`'s own database-level race check is
+  the real safety net against a stale in-hand `TaskRecord` — its
+  `InvalidTransitionError`/`TaskAlreadyTerminalError` propagate uncaught,
+  never concealed or retried.
+- Exactly one call to `kernel.task_planner.plan_task()` is made, wrapped
+  in a deliberately broad `except Exception` — `kernel.models.base.
+  ModelProvider.send_prompt()` is an abstract method with no declared
+  exception contract, and different concrete adapters (Ollama, Anthropic,
+  OpenAI, Gemini) can raise entirely different types, so no narrower catch
+  is available without this layer reaching into provider-specific
+  internals it must not know about. Every other call in this function —
+  `transition_task()`, `mark_failed()`, `persist_plan_and_ready()` — is
+  deliberately **not** wrapped in any `try`/`except`: a concurrency
+  conflict or a genuine defect in any of them propagates as itself, proven
+  by dedicated tests rather than by inspection alone.
+- The four-way `PlanOutcome` maps to lifecycle actions as: `TaskPlan` →
+  serialize, then atomically persist `plan_json` and transition to
+  `ready`; `CannotPlan`/`RequiresClarification` (the latter reserved,
+  not yet producible by the current two-branch wire protocol) → `failed`
+  with a fixed, code-authored failure code/summary; `PlannerFailure` →
+  `failed` with `failure_code = outcome.error.value` and a **fixed,
+  code-authored** summary looked up by error code — never the model's own
+  `CannotPlan.reason`/`RequiresClarification.question` text, and never
+  `PlannerFailure.detail` directly (at least one detail string embeds a
+  model-supplied integer, so it cannot be treated as uniformly
+  code-authored). `failure_summary`/`safe_summary` are trusted-display
+  fields; this is the one place that distinction is actually enforced,
+  not merely intended.
+- No retries anywhere. Crash recovery for a process that dies while a
+  task sits in `planning` is explicitly out of scope for this milestone —
+  later persistence/recovery work, not this one.
+
+As of Milestone 41 P3, nothing calls `advance_task_planning()` from a
+real request — there is still no runtime caller, no wiring into
+`kernel/orchestrator/`, any capability, or `interfaces/whatsapp/`, and no
+task is ever created outside a test. `tests/kernel/task_orchestration/
+test_integration.py` proves the complete non-executing chain — real
+`create_task()` → real `advance_task_planning()` → a durable `TaskPlan` →
+closing and reopening the database connection → reloading the
+`TaskRecord` → `deserialize_plan()` → `task_id` integrity — works
+end to end.
 
 #### Knowledge Ingestion
 
@@ -1987,20 +2185,35 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `kernel/orchestrator/`, any `capabilities/`, or `interfaces/whatsapp/`
   invokes this package, no tool is executed by it, and no
   natural-language WhatsApp task is reachable through it yet — it is a
-  self-contained, tested library. Persisted task state begins Milestone
-  40; a bounded planner begins Milestone 41; an autonomous execution loop
-  begins Milestone 42.
+  self-contained, tested library. Persisted task state, a bounded
+  planner, and planning orchestration are Milestones 40 and 41 (see
+  those bullets below); an autonomous execution loop begins Milestone 42.
 - Milestone 40 — Persistent Task Lifecycle: `kernel/employee_tasks/`, a
   new package giving durable task identity and lifecycle state — see
   Kernel above (Persistent Task Lifecycle) for the full design. Like
-  Milestone 39, this milestone has **no production caller**: nothing in
-  `kernel/orchestrator/`, any `capabilities/`, `kernel/action_protocol/`,
-  or `interfaces/whatsapp/` invokes this package. It persists task
-  identity and lifecycle state only — no planning, no execution, no model
-  call, no tool call, and no wiring to `kernel/tools/confirmation.py`'s
-  pending-action store (`waiting_for_confirmation` is only a persisted
-  state). A bounded planner begins Milestone 41; an autonomous execution
-  loop begins Milestone 42.
+  Milestone 39, this milestone has **no production caller** upstream of
+  it: nothing in `kernel/orchestrator/`, any `capabilities/`,
+  `kernel/action_protocol/`, or `interfaces/whatsapp/` invokes this
+  package. It persists task identity and lifecycle state (and, as of
+  Milestone 41 P2, a validated plan) — no execution, no tool call, and no
+  wiring to `kernel/tools/confirmation.py`'s pending-action store
+  (`waiting_for_confirmation` is only a persisted state).
+- Milestone 41 — Bounded Task Planner (P1) and Planning Orchestration
+  (P2): `kernel/task_planner/` and `kernel/task_orchestration/` — see
+  Kernel above (Bounded Task Planner, Planning Orchestration) for the
+  full design. Takes one persisted `employee_tasks` Task and produces a
+  bounded, validated plan via exactly one structured-output model call,
+  then persists it and transitions the task to `ready` (or `failed`) —
+  never executing anything. `gemma3:12b` is the empirically-selected,
+  dedicated planner model (97.0% strict semantic-plan accuracy against a
+  33-request corpus, versus 87.9% for both `llama3.1:8b` and
+  `qwen3:14b`, below the required 90% gate); it is recorded in
+  `kernel/config/config.yaml`'s `planner` section but not yet constructed
+  or called by anything — the general conversational provider remains
+  unchanged. Like Milestones 39 and 40, this milestone has **no
+  production caller**: nothing creates a task or triggers planning from a
+  real request. An autonomous execution loop — deciding *when*/*next* and
+  performing the doing — begins Milestone 42.
 
 **Planned / not yet implemented:**
 

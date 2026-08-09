@@ -22,6 +22,26 @@ providers:
     max_tokens: 1024
     temperature: 1.0
 
+# Milestone 41: the dedicated structured-planner provider, entirely
+# separate from the general conversational `provider`/`providers` above -
+# selected after an empirical reliability comparison (llama3.1:8b 87.9%,
+# qwen3:14b 87.9%, both below the required gate; gemma3:12b 97.0%, the
+# only one that passed - see docs/architecture.md's Milestone 41 section).
+# The general conversational provider above is unaffected by this section
+# and remains ollama/llama3.1:8b. Mirrors the same provider/providers
+# shape as the top level, scoped under `planner`, so a future planner
+# provider (kernel/models/factory.py's ModelProvider construction) can
+# read config.planner_provider_settings exactly like get_provider() reads
+# config.provider_settings today - not consumed by anything yet.
+planner:
+  provider: ollama
+  providers:
+    ollama:
+      model: "gemma3:12b"
+      base_url: "http://localhost:11434"
+      max_tokens: 1024
+      temperature: 0.0
+
 log_dir: "storage/logs"
 log_file: "interactions.jsonl"
 

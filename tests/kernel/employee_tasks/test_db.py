@@ -198,3 +198,189 @@ def test_check_integrity_detects_corruption(tmp_path):
             check_integrity(conn)
     finally:
         conn.close()
+
+
+# --- Milestone 41 P2: schema v1 -> v2 migration -------------------------------
+
+_V1_STATE_LIST_SQL = (
+    "'created', 'planning', 'ready', 'running', 'waiting_for_confirmation', "
+    "'completed', 'failed', 'cancelled'"
+)
+
+
+def _create_v1_database(db_path):
+    """Build a real, historical schema-version-1 database by hand - the
+    exact schema this package shipped with before Milestone 41 P2 (no
+    plan_json column) - so migration can be tested against a genuine
+    pre-migration file, not a description of one."""
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            f"""
+            CREATE TABLE tasks (
+                task_id          TEXT PRIMARY KEY,
+                display_id       TEXT NOT NULL UNIQUE,
+                state            TEXT NOT NULL CHECK (state IN ({_V1_STATE_LIST_SQL})),
+                request_text     TEXT NOT NULL,
+                source            TEXT NOT NULL,
+                dedup_key        TEXT UNIQUE,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                started_at       TEXT,
+                completed_at     TEXT,
+                failure_code     TEXT,
+                failure_summary  TEXT,
+                metadata_json    TEXT NOT NULL DEFAULT '{{}}',
+                protocol_version INTEGER NOT NULL,
+                version          INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1)
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE task_transitions (
+                transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id       TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                from_state    TEXT CHECK (from_state IS NULL OR from_state IN ({_V1_STATE_LIST_SQL})),
+                to_state      TEXT NOT NULL CHECK (to_state IN ({_V1_STATE_LIST_SQL})),
+                timestamp     TEXT NOT NULL,
+                reason_code   TEXT,
+                safe_summary  TEXT,
+                task_version  INTEGER NOT NULL CHECK (task_version >= 1)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX tasks_created_idx ON tasks(created_at, task_id)")
+        conn.execute(
+            "CREATE INDEX transitions_task_idx ON task_transitions(task_id, transition_id)"
+        )
+        conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1')")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _insert_v1_task(db_path, task_id, display_id):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO tasks (task_id, display_id, state, request_text, source, "
+            "created_at, updated_at, metadata_json, protocol_version, version) "
+            "VALUES (?, ?, 'created', 'do something', 'test', '2026-01-01T00:00:00+00:00', "
+            "'2026-01-01T00:00:00+00:00', '{}', 1, 1)",
+            (task_id, display_id),
+        )
+        conn.execute(
+            "INSERT INTO task_transitions (task_id, from_state, to_state, timestamp, "
+            "reason_code, safe_summary, task_version) "
+            "VALUES (?, NULL, 'created', '2026-01-01T00:00:00+00:00', 'task_created', NULL, 1)",
+            (task_id,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def test_fresh_database_is_created_at_current_schema_version(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "plan_json" in columns
+    finally:
+        conn.close()
+
+
+def test_existing_v1_database_migrates_to_current_schema_version(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v1_database(db_path)
+
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        assert "plan_json" in columns
+    finally:
+        conn.close()
+
+
+def test_migration_preserves_existing_task_data(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v1_database(db_path)
+    _insert_v1_task(db_path, "task-1", "TASK-AAAA1111")
+
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT task_id, display_id, state, request_text, source, version "
+            "FROM tasks WHERE task_id = ?",
+            ("task-1",),
+        ).fetchone()
+        assert row == ("task-1", "TASK-AAAA1111", "created", "do something", "test", 1)
+
+        transitions = conn.execute(
+            "SELECT from_state, to_state FROM task_transitions WHERE task_id = ?", ("task-1",)
+        ).fetchall()
+        assert transitions == [(None, "created")]
+    finally:
+        conn.close()
+
+
+def test_migration_gives_existing_tasks_a_null_plan_json(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v1_database(db_path)
+    _insert_v1_task(db_path, "task-1", "TASK-AAAA1111")
+
+    conn = open_writer_connection(db_path)
+    try:
+        plan_json = conn.execute(
+            "SELECT plan_json FROM tasks WHERE task_id = ?", ("task-1",)
+        ).fetchone()[0]
+        assert plan_json is None
+    finally:
+        conn.close()
+
+
+def test_migration_is_idempotent_on_repeated_initialization(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v1_database(db_path)
+    _insert_v1_task(db_path, "task-1", "TASK-AAAA1111")
+
+    open_writer_connection(db_path).close()
+    # Second open against an already-migrated database must not error
+    # (e.g. must not re-run "ALTER TABLE ... ADD COLUMN" against a column
+    # that already exists) and must leave the data exactly as it was.
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+        task_row = conn.execute(
+            "SELECT task_id, plan_json FROM tasks WHERE task_id = ?", ("task-1",)
+        ).fetchone()
+        assert task_row == ("task-1", None)
+    finally:
+        conn.close()
+
+
+def test_newer_unsupported_schema_version_still_fails_closed(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    conn = open_writer_connection(db_path)
+    conn.execute("UPDATE schema_meta SET value = '999' WHERE key = 'schema_version'")
+    conn.close()
+
+    with pytest.raises(TaskSchemaIncompatibleError):
+        open_writer_connection(db_path)

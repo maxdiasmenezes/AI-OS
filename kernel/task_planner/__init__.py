@@ -11,13 +11,17 @@ deterministic action catalog (catalog.py:build_catalog(), built from the
 real ActionRegistry + ToolsConfig) and produces a bounded, validated
 PlanOutcome via exactly one structured-output model call
 (planner.py:plan_task()). It never executes an action, never calls
-kernel/tools/SafeTaskExecutor, never persists anything, and never mutates
-a TaskRecord or transitions task state - this package has no dependency
-on kernel/employee_tasks' db.py or repository.py, only on its plain,
-I/O-free TaskRecord type. A higher layer that does not yet exist in this
-milestone is responsible for calling kernel/employee_tasks/TaskRepository
-to move a task through created -> planning -> ready/failed around a call
-to plan_task().
+kernel/tools/SafeTaskExecutor, never performs I/O itself, and never
+mutates a TaskRecord or transitions task state - this package has no
+dependency on kernel/employee_tasks' db.py or repository.py, only on its
+plain, I/O-free top-level exports (the TaskRecord type, and, as of
+Milestone 41 P2, the MAX_PLAN_JSON_CHARS bound serialization.py shares
+with it). serialization.py:serialize_plan()/deserialize_plan() convert a
+TaskPlan to and from the durable string kernel.employee_tasks persists
+opaquely - this package prepares that string, it does not write it
+anywhere; kernel/task_orchestration/ (Milestone 41 P2) is the layer that
+actually calls kernel/employee_tasks/TaskRepository to move a task
+through created -> planning -> ready/failed around a call to plan_task().
 
 This package also has no dependency on kernel/action_protocol/ - Milestone
 39's resolve_action_candidates() is a per-request, natural-language,
@@ -27,8 +31,9 @@ of every registered action and its configured resource keys, and the model
 picks zero or more catalog entries per bounded plan. Neither package
 depends on the other.
 
-Execution, tool calls, autonomous continuation from one step to another,
-and plan persistence all begin in a later milestone - not this one.
+Execution, tool calls, and autonomous continuation from one step to
+another all begin in a later milestone - not this one, and not
+kernel/task_orchestration/ either.
 """
 
 from kernel.task_planner.catalog import build_catalog
@@ -36,6 +41,12 @@ from kernel.task_planner.grounding import validate_capability_grounding
 from kernel.task_planner.parser import parse_plan_response
 from kernel.task_planner.planner import plan_task
 from kernel.task_planner.prompt import build_prompt, build_schema
+from kernel.task_planner.serialization import (
+    PlanDeserializationError,
+    PlanSerializationError,
+    deserialize_plan,
+    serialize_plan,
+)
 from kernel.task_planner.types import (
     MAX_DEPENDENCIES_PER_STEP,
     MAX_EXPECTED_RESULT_CHARS,
@@ -88,4 +99,8 @@ __all__ = [
     "parse_plan_response",
     "validate_capability_grounding",
     "plan_task",
+    "serialize_plan",
+    "deserialize_plan",
+    "PlanSerializationError",
+    "PlanDeserializationError",
 ]

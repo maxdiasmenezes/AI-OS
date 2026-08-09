@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PROTOCOL_VERSION = 1
 
 # Fixed, code-level bounds on every externally supplied text field. Not
@@ -38,6 +38,15 @@ MAX_SAFE_SUMMARY_CHARS = 512
 # metadata_json - it never inspects a plan's structure or acts on its
 # content.
 MAX_PLAN_JSON_CHARS = 16_384
+# Schema version 3 (Milestone 42 P1): bound on the opaque, per-step
+# result_json column in task_step_progress - the durable, safe-to-relay
+# observation a future kernel.task_execution writes once a step reaches a
+# terminal status. Sized the same as metadata_json: a bounded summary/
+# failure description, never raw tool output. This layer only ever
+# validates result_json for size/well-formedness, exactly like
+# metadata_json/plan_json - it never inspects its structure or acts on its
+# content.
+MAX_STEP_RESULT_JSON_CHARS = 4096
 
 DISPLAY_ID_PREFIX = "TASK-"
 DISPLAY_ID_LENGTH = 8
@@ -103,6 +112,33 @@ ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
 }
 
 
+class StepStatus(str, Enum):
+    """The closed set of durable statuses one plan step's progress row may
+    hold (Milestone 42 P1). Inherits str for the same reason
+    TaskState does - a member compares equal to, and can be stored/read
+    as, its plain string value.
+
+    There is deliberately no NOT_STARTED member: the absence of a
+    task_step_progress row for a given (task_id, step_position) IS
+    "not started" - see TaskRepository.claim_step()/get_step_progress().
+    Persisting an explicit not_started row for every step of every plan
+    would be redundant data with no independent meaning."""
+
+    IN_PROGRESS = "in_progress"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+# Write-once terminal step statuses (SUCCEEDED, FAILED) are enforced
+# directly by TaskRepository._finalize_step()'s conditional UPDATE
+# (... WHERE status = 'in_progress') - unlike TERMINAL_STATES, no separate
+# frozenset constant is declared here, since nothing in this package needs
+# to test "is this status terminal" as a standalone question; the one
+# place that matters (_finalize_step()) already expresses the equivalent
+# and sufficient condition ("is this status still in_progress") directly
+# in SQL.
+
+
 class TaskStorageError(Exception):
     """Base class for every error kernel/employee_tasks/ raises
     deliberately (as opposed to letting an unrelated exception escape).
@@ -164,6 +200,27 @@ class TaskInputTooLargeError(TaskStorageError):
     validation rule."""
 
 
+class StepAlreadyClaimedError(TaskStorageError):
+    """TaskRepository.claim_step() targeted a (task_id, step_position)
+    pair that already has a task_step_progress row - whatever its status.
+    A step may be claimed exactly once: the underlying INSERT relies on
+    the table's (task_id, step_position) PRIMARY KEY to guarantee that,
+    of any number of concurrent callers claiming the same step, exactly
+    one succeeds and every other one gets this error. Never retried
+    automatically - see kernel/task_execution/ (Milestone 42) for the
+    fail-closed policy this supports."""
+
+
+class StepNotInProgressError(TaskStorageError):
+    """TaskRepository.mark_step_succeeded()/mark_step_failed() was called
+    for a (task_id, step_position) that either has no claimed row at all,
+    or whose row is no longer in_progress (already succeeded or failed).
+    Terminal step status is write-once: neither a succeeded nor a failed
+    row can ever move to any other status, and a terminal row's
+    result/failure fields can never be overwritten - both are enforced by
+    this same error, raised from the same conditional-UPDATE guard."""
+
+
 @dataclass(frozen=True)
 class TaskRecord:
     """One persisted task's current row. `metadata_json` and `plan_json`
@@ -206,6 +263,37 @@ class TaskTransition:
     timestamp: str
     reason_code: str | None
     safe_summary: str | None
+    task_version: int
+
+
+@dataclass(frozen=True)
+class TaskStepProgress:
+    """One durable task_step_progress row (Milestone 42 P1) - the
+    smallest durable record of one plan step's execution progress.
+    `step_position` matches kernel.task_planner.types.PlanStep.position
+    exactly, but this layer never imports or inspects PlanStep/TaskPlan -
+    step_position is treated as an opaque, positive, code-supplied integer,
+    exactly like plan_json's content is opaque to this package (see
+    kernel/employee_tasks/__init__.py's own scope statement).
+
+    There is no row for a step that has not been claimed yet - see
+    StepStatus's own docstring. `result_json` is populated only once the
+    step reaches a terminal status (`succeeded`, always; `failed`,
+    optionally) and is treated exactly as opaquely as plan_json/
+    metadata_json: this layer validates only that it parses as JSON and
+    stays within its size bound. `task_version` is the `tasks.version`
+    value observed at claim time - a lightweight forensic snapshot, not a
+    concurrency mechanism in its own right (the (task_id, step_position)
+    PRIMARY KEY is what actually makes claim_step() atomic)."""
+
+    task_id: str
+    step_position: int
+    status: StepStatus
+    started_at: str
+    completed_at: str | None
+    result_json: str | None
+    failure_code: str | None
+    failure_summary: str | None
     task_version: int
 
 

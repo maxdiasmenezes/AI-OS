@@ -59,6 +59,43 @@ _STATE_LIST_SQL = (
     "'completed', 'failed', 'cancelled'"
 )
 
+# Schema version 3 (Milestone 42 P1): the closed set of durable step-status
+# values - mirrors kernel/employee_tasks/types.py:StepStatus exactly.
+# Deliberately no 'not_started' value - see that enum's own docstring.
+_STEP_STATUS_LIST_SQL = "'in_progress', 'succeeded', 'failed'"
+
+# Schema version 3 (Milestone 42 P1): durable per-step execution progress -
+# see kernel/employee_tasks/types.py:TaskStepProgress. The (task_id,
+# step_position) PRIMARY KEY is the atomic claim mechanism
+# TaskRepository.claim_step() relies on: SQLite itself guarantees that of
+# any number of concurrent INSERTs targeting the same pair, exactly one
+# succeeds. No separate index is needed for per-task lookups
+# (list_step_progress()) - the PRIMARY KEY's own index already covers the
+# task_id-only prefix. Defined once, as a single constant, and reused by
+# BOTH _SCHEMA_STATEMENTS (a fresh v3+ database) and
+# _MIGRATION_2_TO_3_STATEMENTS (an existing v2 database being migrated) -
+# unlike _migrate_v1_to_v2's ALTER TABLE (which only makes sense against an
+# existing table), this is a wholly new table, so the fresh-schema path and
+# the migration path need byte-identical CREATE TABLE text; defining it
+# once here, rather than as two independently-maintained literal strings,
+# removes any risk of the two ever drifting apart - matching this module's
+# own established convention of sharing a repeated fragment as one module
+# constant (see _STATE_LIST_SQL/_STEP_STATUS_LIST_SQL above).
+_TASK_STEP_PROGRESS_TABLE_SQL = f"""
+    CREATE TABLE IF NOT EXISTS task_step_progress (
+        task_id         TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+        step_position   INTEGER NOT NULL CHECK (step_position >= 1),
+        status          TEXT NOT NULL CHECK (status IN ({_STEP_STATUS_LIST_SQL})),
+        started_at      TEXT NOT NULL,
+        completed_at    TEXT,
+        result_json     TEXT,
+        failure_code    TEXT,
+        failure_summary TEXT,
+        task_version    INTEGER NOT NULL CHECK (task_version >= 1),
+        PRIMARY KEY (task_id, step_position)
+    )
+    """
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS schema_meta (
@@ -100,6 +137,7 @@ _SCHEMA_STATEMENTS = (
     """,
     "CREATE INDEX IF NOT EXISTS tasks_created_idx ON tasks(created_at, task_id)",
     "CREATE INDEX IF NOT EXISTS transitions_task_idx ON task_transitions(task_id, transition_id)",
+    _TASK_STEP_PROGRESS_TABLE_SQL,
 )
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -170,14 +208,17 @@ def resolve_database_path(config_yaml_path: Path | None = None) -> Path:
     return canonical_storage_dir / DATABASE_FILENAME
 
 
-# Milestone 41 P2: the only migration this package has ever needed - adds
-# the nullable plan_json column a fresh v2 database already has via
-# _SCHEMA_STATEMENTS above. Existing rows implicitly get plan_json = NULL
-# (SQLite's default for a column added without an explicit DEFAULT), which
-# is exactly the correct value for every pre-existing task - none of them
-# has ever had a plan. Runs inside the same transaction as the schema_meta
-# version bump, so a database can never be left claiming version 2 while
-# still missing the column, or vice versa.
+# Milestone 41 P2: adds the nullable plan_json column a fresh v2+ database
+# already has via _SCHEMA_STATEMENTS above. Existing rows implicitly get
+# plan_json = NULL (SQLite's default for a column added without an
+# explicit DEFAULT), which is exactly the correct value for every
+# pre-existing task - none of them has ever had a plan. Runs inside the
+# same transaction as the schema_meta version bump, so a database can
+# never be left claiming version 2 while still missing the column, or
+# vice versa. Bumps to the fixed literal "2" - NOT str(SCHEMA_VERSION),
+# which now points at the current version (3) - because this migration's
+# only job is v1 -> v2; reaching a still-newer version is
+# _ensure_schema()'s chaining responsibility below, not this function's.
 _MIGRATION_1_TO_2_STATEMENTS = ("ALTER TABLE tasks ADD COLUMN plan_json TEXT",)
 
 
@@ -188,7 +229,35 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
             conn.execute(statement)
         conn.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
-            (str(SCHEMA_VERSION),),
+            ("2",),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        raise TaskStorageUnavailableError("task database is unavailable") from exc
+
+
+# Milestone 42 P1: adds the task_step_progress table a fresh v3+ database
+# already has via _SCHEMA_STATEMENTS above - no ALTER TABLE needed, since
+# this is a wholly new table rather than a new column on an existing one.
+# Same single-transaction discipline as _migrate_v1_to_v2: the new table
+# and the schema_meta version bump commit together, or neither does.
+# Bumps to the fixed literal "3" for the same reason _migrate_v1_to_v2
+# bumps to "2" - see that function's own comment. Reuses
+# _TASK_STEP_PROGRESS_TABLE_SQL (defined once, above _SCHEMA_STATEMENTS) -
+# see that constant's own comment for why the fresh-schema and migration
+# paths must never risk drifting apart on this table's definition.
+_MIGRATION_2_TO_3_STATEMENTS = (_TASK_STEP_PROGRESS_TABLE_SQL,)
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _MIGRATION_2_TO_3_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("3",),
         )
         conn.execute("COMMIT")
     except sqlite3.Error as exc:
@@ -206,11 +275,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
     if row is not None:
         current_version = row[0]
-        if current_version == str(SCHEMA_VERSION):
-            return  # already current - idempotent no-op, matches a fresh v2 database
+        # Chain every migration this package still supports, in order, so
+        # a writer opening ANY previously-shipped version (v1, v2, or
+        # already-current v3) reaches the current schema deterministically
+        # in one open_writer_connection() call - never a version this
+        # chain doesn't recognize as a starting point along the way.
         if current_version == "1":
             _migrate_v1_to_v2(conn)
-            return
+            current_version = "2"
+        if current_version == "2":
+            _migrate_v2_to_v3(conn)
+            current_version = "3"
+        if current_version == str(SCHEMA_VERSION):
+            return  # already current - idempotent no-op
         raise TaskSchemaIncompatibleError("task database schema is incompatible")
 
     try:

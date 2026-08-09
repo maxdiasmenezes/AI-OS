@@ -23,14 +23,30 @@ as terminal alternatives), backed by its own SQLite database
 (storage/tasks/tasks.sqlite3, schema-versioned independently of
 kernel/knowledge_base's database).
 
-Milestone 40 persists task identity and lifecycle state only. It never
-plans, executes, calls a model, or calls a tool, and has no dependency on
-kernel/action_protocol/, kernel/tools/, kernel/models/, capabilities/, or
-interfaces/whatsapp/ - none of those may depend on it either, in this
-milestone. `waiting_for_confirmation` is only a persisted lifecycle
-state; it is not wired to kernel/tools/confirmation.py's pending-action
-store. A later milestone connects task -> protocol -> planner -> executor
-- not this one.
+Milestone 40 persists task identity and lifecycle state only. Milestone 41
+P2 added opaque plan persistence (plan_json). Milestone 42 P1 adds durable,
+per-step execution progress (task_step_progress, schema version 3) - see
+TaskStepProgress and TaskRepository's claim_step()/mark_step_succeeded()/
+mark_step_failed()/get_step_progress()/list_step_progress(). This package
+still never plans, executes, calls a model, or calls a tool itself, and
+this package itself still has no dependency on kernel/action_protocol/,
+kernel/tools/, kernel/models/, kernel/task_planner/, kernel/task_execution/,
+capabilities/, or interfaces/whatsapp/ - that direction is a one-way rule
+enforced on THIS package, not on them. The reverse is expected and already
+true: kernel/task_planner/ (Milestone 41) and kernel/task_execution/
+(Milestone 42 P1) both legitimately import this package's plain, I/O-free
+top-level contracts (TaskRecord; and, as of Milestone 42 P1,
+TaskStepProgress/StepStatus) - that is exactly what this package's public
+interface exists to be depended on for. What never happens is this package
+importing anything from them. `waiting_for_confirmation` is only a
+persisted lifecycle state; it is not wired to
+kernel/tools/confirmation.py's pending-action store, and this package
+still has no durable confirmation record of its own (that is Milestone 42
+P2's scope, not this one). Step progress is deliberately plan-agnostic:
+`step_position` is treated as an opaque, positive integer this package
+never validates against any particular
+TaskPlan - kernel/task_execution/ (Milestone 42 P1) is the layer that
+knows what a plan step is and decides which position to claim next.
 
 Callers outside this package must import from here, never from the
 individual submodules directly.
@@ -58,6 +74,7 @@ from kernel.employee_tasks.types import (
     MAX_REQUEST_TEXT_CHARS,
     MAX_SAFE_SUMMARY_CHARS,
     MAX_SOURCE_CHARS,
+    MAX_STEP_RESULT_JSON_CHARS,
     MIN_LIST_LIMIT,
     MIN_REQUEST_TEXT_CHARS,
     MIN_SOURCE_CHARS,
@@ -65,12 +82,16 @@ from kernel.employee_tasks.types import (
     TERMINAL_STATES,
     DuplicateTaskError,
     InvalidTransitionError,
+    StepAlreadyClaimedError,
+    StepNotInProgressError,
+    StepStatus,
     TaskAlreadyTerminalError,
     TaskInputTooLargeError,
     TaskNotFoundError,
     TaskRecord,
     TaskSchemaIncompatibleError,
     TaskState,
+    TaskStepProgress,
     TaskStorageCorruptError,
     TaskStorageError,
     TaskStorageUnavailableError,
@@ -86,11 +107,15 @@ __all__ = [
     "TaskState",
     "TERMINAL_STATES",
     "ALLOWED_TRANSITIONS",
+    "TaskStepProgress",
+    "StepStatus",
     "TaskStorageError",
     "TaskNotFoundError",
     "InvalidTransitionError",
     "TaskAlreadyTerminalError",
     "DuplicateTaskError",
+    "StepAlreadyClaimedError",
+    "StepNotInProgressError",
     "TaskStorageUnavailableError",
     "TaskStorageCorruptError",
     "TaskSchemaIncompatibleError",
@@ -104,6 +129,7 @@ __all__ = [
     "MAX_SOURCE_CHARS",
     "MAX_METADATA_JSON_CHARS",
     "MAX_PLAN_JSON_CHARS",
+    "MAX_STEP_RESULT_JSON_CHARS",
     "MAX_DEDUP_KEY_CHARS",
     "MAX_FAILURE_CODE_CHARS",
     "MAX_FAILURE_SUMMARY_CHARS",

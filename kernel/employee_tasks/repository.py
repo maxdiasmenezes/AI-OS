@@ -1,6 +1,8 @@
 """
 TaskRepository: the narrow persistence API for kernel/employee_tasks/
-(Milestone 40; persist_plan_and_ready() added in Milestone 41 P2). See
+(Milestone 40; persist_plan_and_ready() added in Milestone 41 P2;
+claim_step()/mark_step_succeeded()/mark_step_failed()/get_step_progress()/
+list_step_progress() added in Milestone 42 P1). See
 kernel/employee_tasks/__init__.py for what this package is and
 deliberately is not.
 
@@ -22,14 +24,34 @@ moved on from - exactly one of two callers racing the same transition can
 ever succeed; the other observes either TaskAlreadyTerminalError or
 InvalidTransitionError, and modifies neither table.
 
-metadata_json and plan_json are both treated as opaque, size-capped JSON
-strings end to end: this module validates that each parses as JSON and
-enforces its character limit, but never inspects its keys, never
-deserializes it into a value callers can act on, and never uses it to
-make an execution or authorization decision. This module has no
-dependency on, and never imports, kernel.task_planner or any TaskPlan
-type - kernel/task_planner/serialization.py is the only intended producer
-of a plan_json string, but this layer has no knowledge of that.
+metadata_json, plan_json, and (Milestone 42 P1) result_json are all
+treated as opaque, size-capped JSON strings end to end: this module
+validates that each parses as JSON and enforces its character limit, but
+never inspects its keys, never deserializes it into a value callers can
+act on, and never uses it to make an execution or authorization decision.
+This module has no dependency on, and never imports, kernel.task_planner
+or any TaskPlan/PlanStep type - kernel/task_planner/serialization.py is
+the only intended producer of a plan_json string, and a future
+kernel/task_execution/ is the only intended producer of a result_json
+string, but this layer has no knowledge of either.
+
+Step progress (task_step_progress) follows the same "absence is
+meaningful" pattern as the rest of this module. claim_step() combines two
+distinct guards inside one BEGIN IMMEDIATE transaction: an explicit
+SELECT-then-check of the task's CURRENT state (a step may only be claimed
+while the task is RUNNING - TaskAlreadyTerminalError/InvalidTransitionError
+otherwise, exactly the same typed conventions transition_task() uses),
+followed by a plain INSERT whose (task_id, step_position) PRIMARY KEY is
+itself the atomic per-step claim mechanism (of any number of concurrent
+callers claiming the SAME step, exactly one INSERT succeeds; every other
+one raises StepAlreadyClaimedError) - so unlike every other write method
+here, claim_step() does not need its own conditional UPDATE (... WHERE
+... = ?) to make the claim itself atomic, only to make the state
+re-check atomic with respect to a concurrent writer, which BEGIN IMMEDIATE
+alone already guarantees. mark_step_succeeded()/mark_step_failed() DO use
+a conditional UPDATE (... WHERE status = 'in_progress'), mirroring
+_apply_transition()'s own discipline, to make terminal step status
+write-once - see StepNotInProgressError's docstring.
 """
 
 import json
@@ -50,17 +72,22 @@ from kernel.employee_tasks.types import (
     MAX_REQUEST_TEXT_CHARS,
     MAX_SAFE_SUMMARY_CHARS,
     MAX_SOURCE_CHARS,
+    MAX_STEP_RESULT_JSON_CHARS,
     MIN_LIST_LIMIT,
     MIN_REQUEST_TEXT_CHARS,
     MIN_SOURCE_CHARS,
     TERMINAL_STATES,
     DuplicateTaskError,
     InvalidTransitionError,
+    StepAlreadyClaimedError,
+    StepNotInProgressError,
+    StepStatus,
     TaskAlreadyTerminalError,
     TaskInputTooLargeError,
     TaskNotFoundError,
     TaskRecord,
     TaskState,
+    TaskStepProgress,
     TaskStorageUnavailableError,
     TaskTransition,
     generate_display_id,
@@ -73,6 +100,11 @@ _SELECT_COLUMNS = (
     "task_id, display_id, state, request_text, source, dedup_key, "
     "created_at, updated_at, started_at, completed_at, failure_code, "
     "failure_summary, metadata_json, protocol_version, version, plan_json"
+)
+
+_STEP_PROGRESS_SELECT_COLUMNS = (
+    "task_id, step_position, status, started_at, completed_at, "
+    "result_json, failure_code, failure_summary, task_version"
 )
 
 
@@ -132,6 +164,33 @@ def _validate_plan_json(value: str) -> str:
     return value
 
 
+def _validate_step_position(value) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise TaskInputTooLargeError("step_position must be a positive integer")
+    return value
+
+
+def _validate_step_result_json(value) -> str:
+    if not isinstance(value, str):
+        raise TaskInputTooLargeError("result_json must be a string")
+    _reject_nul(value, "result_json")
+    if len(value) > MAX_STEP_RESULT_JSON_CHARS:
+        raise TaskInputTooLargeError(
+            f"result_json must be at most {MAX_STEP_RESULT_JSON_CHARS} characters"
+        )
+    try:
+        json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise TaskInputTooLargeError("result_json must be valid JSON text") from exc
+    return value
+
+
+def _validate_optional_step_result_json(value) -> str | None:
+    if value is None:
+        return None
+    return _validate_step_result_json(value)
+
+
 def _validate_limit(limit: int) -> int:
     if not isinstance(limit, int) or isinstance(limit, bool) or not (
         MIN_LIST_LIMIT <= limit <= MAX_LIST_LIMIT
@@ -167,6 +226,20 @@ def _row_to_record(row) -> TaskRecord:
         protocol_version=row[13],
         version=row[14],
         plan_json=row[15],
+    )
+
+
+def _row_to_step_progress(row) -> TaskStepProgress:
+    return TaskStepProgress(
+        task_id=row[0],
+        step_position=row[1],
+        status=StepStatus(row[2]),
+        started_at=row[3],
+        completed_at=row[4],
+        result_json=row[5],
+        failure_code=row[6],
+        failure_summary=row[7],
+        task_version=row[8],
     )
 
 
@@ -528,6 +601,223 @@ class TaskRepository:
             conn.execute("COMMIT")
 
         return self.get_task(task_id)
+
+    # -- step progress (Milestone 42 P1) -----------------------------------
+
+    def claim_step(self, task_id: str, step_position: int) -> TaskStepProgress:
+        """Atomically claim one plan step for execution: absence of a
+        task_step_progress row means not_started (see StepStatus's own
+        docstring), so claiming is a plain INSERT of an `in_progress` row.
+        The table's (task_id, step_position) PRIMARY KEY is what makes a
+        claim on one already-claimed step atomic - of any number of
+        concurrent callers claiming the SAME step, SQLite guarantees
+        exactly one INSERT succeeds; every other one raises
+        StepAlreadyClaimedError and must not retry blindly (see
+        kernel/task_execution/'s fail-closed doctrine, not implemented in
+        this milestone).
+
+        That alone is not sufficient execution authorization: a step may
+        only ever be claimed while the task's CURRENT persisted state is
+        TaskState.RUNNING - never from an earlier, possibly-stale
+        in-memory TaskRecord a caller happens to be holding. This method
+        re-reads `tasks.state` itself, inside the same BEGIN IMMEDIATE
+        transaction as the INSERT, so the read and the claim are atomic
+        with respect to every other writer (see the module docstring's
+        "two distinct guards inside one BEGIN IMMEDIATE transaction" note
+        for why claim_step specifically still needs this extra read
+        despite not using a conditional UPDATE): a worker that observed
+        RUNNING before another
+        connection committed RUNNING -> CANCELLED can never go on to claim
+        a step for that task - the state re-read inside this same
+        transaction always sees the committed CANCELLED row, never the
+        stale in-memory value. A non-RUNNING state is reported using the
+        same typed conventions every other method in this class already
+        uses: TaskAlreadyTerminalError for a terminal state
+        (completed/failed/cancelled), InvalidTransitionError for any other
+        non-RUNNING state (created/planning/ready/waiting_for_confirmation).
+        No new error type exists solely for this check.
+
+        A successful claim is the authorization boundary for this one
+        step for the remainder of Milestone 42 P1: what CANCELLED means
+        for a step already claimed before the cancellation - and whether/
+        how execution of an in-flight claimed step is affected - is
+        explicitly deferred to Milestone 42 P2's design, not decided or
+        implemented here.
+
+        `step_position` is treated as an opaque, positive integer this
+        layer never validates against any particular TaskPlan - the caller
+        (kernel/task_execution/, in a later milestone) is responsible for
+        only ever claiming a position it already knows belongs to the
+        task's persisted plan.
+        """
+
+        step_position = _validate_step_position(step_position)
+        conn = self._conn
+        now = _now()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT state, version FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+            actual_state, task_version = row
+
+            if actual_state in _TERMINAL_STATE_VALUES:
+                raise TaskAlreadyTerminalError(actual_state)
+            if actual_state != TaskState.RUNNING.value:
+                raise InvalidTransitionError(
+                    f"expected task to be in 'running' to claim a step but it is in "
+                    f"{actual_state!r}"
+                )
+
+            conn.execute(
+                "INSERT INTO task_step_progress "
+                "(task_id, step_position, status, started_at, task_version) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, step_position, StepStatus.IN_PROGRESS.value, now, task_version),
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.execute("ROLLBACK")
+            raise StepAlreadyClaimedError(
+                f"step {step_position} of task {task_id} has already been claimed"
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_step_progress(task_id, step_position)
+
+    def mark_step_succeeded(
+        self, task_id: str, step_position: int, result_json: str
+    ) -> TaskStepProgress:
+        """in_progress -> succeeded, exactly once. `result_json` is a
+        required, bounded, opaque observation - see TaskStepProgress's own
+        docstring; this method never inspects its content."""
+
+        step_position = _validate_step_position(step_position)
+        result_json = _validate_step_result_json(result_json)
+        return self._finalize_step(
+            task_id,
+            step_position,
+            StepStatus.SUCCEEDED,
+            result_json=result_json,
+            failure_code=None,
+            failure_summary=None,
+        )
+
+    def mark_step_failed(
+        self,
+        task_id: str,
+        step_position: int,
+        failure_code: str,
+        failure_summary: str,
+        *,
+        result_json: str | None = None,
+    ) -> TaskStepProgress:
+        """in_progress -> failed, exactly once. `result_json` is optional
+        here (unlike mark_step_succeeded) - a failure may have nothing
+        beyond its failure_code/failure_summary to record."""
+
+        step_position = _validate_step_position(step_position)
+        failure_code = _validate_bounded_text(
+            failure_code, "failure_code", 1, MAX_FAILURE_CODE_CHARS
+        )
+        failure_summary = _validate_bounded_text(
+            failure_summary, "failure_summary", 1, MAX_FAILURE_SUMMARY_CHARS
+        )
+        result_json = _validate_optional_step_result_json(result_json)
+        return self._finalize_step(
+            task_id,
+            step_position,
+            StepStatus.FAILED,
+            result_json=result_json,
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+        )
+
+    def get_step_progress(self, task_id: str, step_position: int) -> TaskStepProgress | None:
+        """None means no row exists for this (task_id, step_position) -
+        i.e. not_started. Never raises TaskNotFoundError for an unknown
+        task_id either; this is a plain lookup, not a task-identity check."""
+
+        row = self._conn.execute(
+            f"SELECT {_STEP_PROGRESS_SELECT_COLUMNS} FROM task_step_progress "
+            "WHERE task_id = ? AND step_position = ?",
+            (task_id, step_position),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_step_progress(row)
+
+    def list_step_progress(self, task_id: str) -> list[TaskStepProgress]:
+        """Every claimed step for one task, ordered by step_position. A
+        step with no row here has never been claimed (not_started) - this
+        method has no way to, and does not attempt to, represent that
+        absence as an entry of its own."""
+
+        rows = self._conn.execute(
+            f"SELECT {_STEP_PROGRESS_SELECT_COLUMNS} FROM task_step_progress "
+            "WHERE task_id = ? ORDER BY step_position",
+            (task_id,),
+        ).fetchall()
+        return [_row_to_step_progress(row) for row in rows]
+
+    def _finalize_step(
+        self,
+        task_id: str,
+        step_position: int,
+        target_status: StepStatus,
+        *,
+        result_json: str | None,
+        failure_code: str | None,
+        failure_summary: str | None,
+    ) -> TaskStepProgress:
+        conn = self._conn
+        now = _now()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "UPDATE task_step_progress SET status = ?, completed_at = ?, "
+                "result_json = ?, failure_code = ?, failure_summary = ? "
+                "WHERE task_id = ? AND step_position = ? AND status = ?",
+                (
+                    target_status.value,
+                    now,
+                    result_json,
+                    failure_code,
+                    failure_summary,
+                    task_id,
+                    step_position,
+                    StepStatus.IN_PROGRESS.value,
+                ),
+            )
+            if cursor.rowcount == 0:
+                # Either no row was ever claimed for this (task_id,
+                # step_position), or it already reached a terminal status -
+                # both cases are the same fail-closed refusal: a terminal
+                # step's status and result can never be overwritten, and a
+                # never-claimed step can never be finalized directly.
+                raise StepNotInProgressError(
+                    f"step {step_position} of task {task_id} is not currently in_progress"
+                )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_step_progress(task_id, step_position)
 
     def _apply_transition(
         self,

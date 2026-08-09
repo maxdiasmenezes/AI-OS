@@ -82,7 +82,8 @@ _SCHEMA_STATEMENTS = (
         failure_summary  TEXT,
         metadata_json    TEXT NOT NULL DEFAULT '{{}}',
         protocol_version INTEGER NOT NULL,
-        version          INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1)
+        version          INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+        plan_json        TEXT
     )
     """,
     f"""
@@ -169,6 +170,32 @@ def resolve_database_path(config_yaml_path: Path | None = None) -> Path:
     return canonical_storage_dir / DATABASE_FILENAME
 
 
+# Milestone 41 P2: the only migration this package has ever needed - adds
+# the nullable plan_json column a fresh v2 database already has via
+# _SCHEMA_STATEMENTS above. Existing rows implicitly get plan_json = NULL
+# (SQLite's default for a column added without an explicit DEFAULT), which
+# is exactly the correct value for every pre-existing task - none of them
+# has ever had a plan. Runs inside the same transaction as the schema_meta
+# version bump, so a database can never be left claiming version 2 while
+# still missing the column, or vice versa.
+_MIGRATION_1_TO_2_STATEMENTS = ("ALTER TABLE tasks ADD COLUMN plan_json TEXT",)
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _MIGRATION_1_TO_2_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        raise TaskStorageUnavailableError("task database is unavailable") from exc
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         row = conn.execute(
@@ -178,9 +205,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         row = None  # schema_meta doesn't exist yet - a fresh database.
 
     if row is not None:
-        if row[0] != str(SCHEMA_VERSION):
-            raise TaskSchemaIncompatibleError("task database schema is incompatible")
-        return
+        current_version = row[0]
+        if current_version == str(SCHEMA_VERSION):
+            return  # already current - idempotent no-op, matches a fresh v2 database
+        if current_version == "1":
+            _migrate_v1_to_v2(conn)
+            return
+        raise TaskSchemaIncompatibleError("task database schema is incompatible")
 
     try:
         conn.execute("BEGIN IMMEDIATE")

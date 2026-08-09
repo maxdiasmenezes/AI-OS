@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROTOCOL_VERSION = 1
 
 # Fixed, code-level bounds on every externally supplied text field. Not
@@ -28,6 +28,16 @@ MAX_FAILURE_CODE_CHARS = 64
 MAX_FAILURE_SUMMARY_CHARS = 512
 MAX_REASON_CODE_CHARS = 64
 MAX_SAFE_SUMMARY_CHARS = 512
+# Schema version 2 (Milestone 41 P2): bound on the opaque, code-generated
+# plan_json column - kernel/task_planner/serialization.py:serialize_plan()
+# enforces this same bound before ever returning a string for persistence
+# (imported from here, the single source of truth - see that module's own
+# docstring). Sized with headroom over an 8-step plan's computed worst case
+# (~7KB of bounded text fields plus JSON syntax overhead). This layer only
+# ever validates plan_json for size/well-formedness, exactly like
+# metadata_json - it never inspects a plan's structure or acts on its
+# content.
+MAX_PLAN_JSON_CHARS = 16_384
 
 DISPLAY_ID_PREFIX = "TASK-"
 DISPLAY_ID_LENGTH = 8
@@ -156,9 +166,14 @@ class TaskInputTooLargeError(TaskStorageError):
 
 @dataclass(frozen=True)
 class TaskRecord:
-    """One persisted task's current row. `metadata_json` is stored and
-    returned as an opaque, size-capped JSON string - this layer never
-    parses its keys or acts on its contents (see repository.py)."""
+    """One persisted task's current row. `metadata_json` and `plan_json`
+    are both stored and returned as opaque, size-capped JSON strings -
+    this layer never parses their keys or acts on their contents (see
+    repository.py). `plan_json` is None until a validated plan has been
+    persisted (schema version 2, Milestone 41 P2) - only
+    TaskRepository.persist_plan_and_ready() ever sets it, exactly once,
+    atomically with the planning -> ready transition; there is no general
+    update API for it."""
 
     task_id: str
     display_id: str
@@ -175,6 +190,7 @@ class TaskRecord:
     metadata_json: str
     protocol_version: int
     version: int
+    plan_json: str | None = None
 
 
 @dataclass(frozen=True)

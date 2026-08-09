@@ -1,14 +1,19 @@
 """
 TaskRepository: the narrow persistence API for kernel/employee_tasks/
-(Milestone 40). See kernel/employee_tasks/__init__.py for what this
-package is and deliberately is not.
+(Milestone 40; persist_plan_and_ready() added in Milestone 41 P2). See
+kernel/employee_tasks/__init__.py for what this package is and
+deliberately is not.
 
 Every write method (create_task, transition_task, mark_failed,
-mark_cancelled) wraps its current-row update and its append-only journal
-insert in exactly one BEGIN IMMEDIATE ... COMMIT transaction: there is
-never a committed state update without its matching journal entry, or a
-journal entry without its matching state update. Any exception rolls the
-whole transaction back before propagating - see _apply_transition().
+mark_cancelled, persist_plan_and_ready) wraps its current-row update and
+its append-only journal insert in exactly one BEGIN IMMEDIATE ... COMMIT
+transaction: there is never a committed state update without its matching
+journal entry, or a journal entry without its matching state update. Any
+exception rolls the whole transaction back before propagating - see
+_apply_transition() (used by transition_task/mark_failed/mark_cancelled)
+and persist_plan_and_ready() (which needs its own conditional UPDATE, not
+_apply_transition()'s, since it requires the extra plan_json IS NULL
+guard - see that method's own docstring).
 
 Every state-changing method requires the caller's expected current state
 and performs a SQL-level conditional UPDATE (... WHERE state = ?), so a
@@ -17,11 +22,14 @@ moved on from - exactly one of two callers racing the same transition can
 ever succeed; the other observes either TaskAlreadyTerminalError or
 InvalidTransitionError, and modifies neither table.
 
-metadata_json is treated as an opaque, size-capped JSON string end to
-end: this module validates that it parses as JSON and enforces the
-character limit, but never inspects its keys, never deserializes it into
-a value callers can act on, and never uses it to make an execution or
-authorization decision.
+metadata_json and plan_json are both treated as opaque, size-capped JSON
+strings end to end: this module validates that each parses as JSON and
+enforces its character limit, but never inspects its keys, never
+deserializes it into a value callers can act on, and never uses it to
+make an execution or authorization decision. This module has no
+dependency on, and never imports, kernel.task_planner or any TaskPlan
+type - kernel/task_planner/serialization.py is the only intended producer
+of a plan_json string, but this layer has no knowledge of that.
 """
 
 import json
@@ -37,6 +45,7 @@ from kernel.employee_tasks.types import (
     MAX_FAILURE_SUMMARY_CHARS,
     MAX_LIST_LIMIT,
     MAX_METADATA_JSON_CHARS,
+    MAX_PLAN_JSON_CHARS,
     MAX_REASON_CODE_CHARS,
     MAX_REQUEST_TEXT_CHARS,
     MAX_SAFE_SUMMARY_CHARS,
@@ -63,7 +72,7 @@ _TERMINAL_STATE_VALUES = frozenset(state.value for state in TERMINAL_STATES)
 _SELECT_COLUMNS = (
     "task_id, display_id, state, request_text, source, dedup_key, "
     "created_at, updated_at, started_at, completed_at, failure_code, "
-    "failure_summary, metadata_json, protocol_version, version"
+    "failure_summary, metadata_json, protocol_version, version, plan_json"
 )
 
 
@@ -108,6 +117,21 @@ def _validate_metadata_json(value: str) -> str:
     return value
 
 
+def _validate_plan_json(value: str) -> str:
+    if not isinstance(value, str):
+        raise TaskInputTooLargeError("plan_json must be a string")
+    _reject_nul(value, "plan_json")
+    if len(value) > MAX_PLAN_JSON_CHARS:
+        raise TaskInputTooLargeError(
+            f"plan_json must be at most {MAX_PLAN_JSON_CHARS} characters"
+        )
+    try:
+        json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise TaskInputTooLargeError("plan_json must be valid JSON text") from exc
+    return value
+
+
 def _validate_limit(limit: int) -> int:
     if not isinstance(limit, int) or isinstance(limit, bool) or not (
         MIN_LIST_LIMIT <= limit <= MAX_LIST_LIMIT
@@ -142,6 +166,7 @@ def _row_to_record(row) -> TaskRecord:
         metadata_json=row[12],
         protocol_version=row[13],
         version=row[14],
+        plan_json=row[15],
     )
 
 
@@ -385,6 +410,124 @@ class TaskRepository:
         return self._apply_transition(
             task_id, expected, TaskState.CANCELLED, reason_code=reason_code, safe_summary=safe_summary
         )
+
+    def persist_plan_and_ready(
+        self,
+        task_id: str,
+        expected_state,
+        plan_json: str,
+        *,
+        reason_code: str | None = None,
+        safe_summary: str | None = None,
+    ) -> TaskRecord:
+        """Atomically persist a validated plan and transition
+        expected_state -> ready, in one transaction with the journal
+        entry - matching every other transition method's guarantee that a
+        state change and its journal row always commit together.
+
+        `plan_json` is treated exactly as opaquely as metadata_json
+        (kernel/task_planner/serialization.py:serialize_plan() is the only
+        intended producer of this string; this layer only validates it for
+        size/well-formedness, never for plan-specific shape). A plan may be
+        persisted exactly once: the underlying UPDATE requires BOTH
+        `state = <expected_state>` AND `plan_json IS NULL`, so a second
+        call for the same task - even one that still correctly names
+        `expected_state` - fails closed rather than overwriting the first
+        plan. There is no corresponding "unset" or "replace" API; this is
+        deliberately not a general plan-update operation."""
+
+        expected = _coerce_state(expected_state)
+        plan_json = _validate_plan_json(plan_json)
+        reason_code = _validate_optional_bounded_text(
+            reason_code, "reason_code", MAX_REASON_CODE_CHARS
+        )
+        safe_summary = _validate_optional_bounded_text(
+            safe_summary, "safe_summary", MAX_SAFE_SUMMARY_CHARS
+        )
+
+        if expected in TERMINAL_STATES:
+            raise TaskAlreadyTerminalError(expected.value)
+        if TaskState.READY not in ALLOWED_TRANSITIONS[expected]:
+            raise InvalidTransitionError(
+                f"{expected.value} -> ready is not an allowed transition"
+            )
+
+        conn = self._conn
+        now = _now()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT state, plan_json, version FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+
+            actual_state, existing_plan_json, current_version = row
+            if actual_state != expected.value:
+                if actual_state in _TERMINAL_STATE_VALUES:
+                    raise TaskAlreadyTerminalError(actual_state)
+                raise InvalidTransitionError(
+                    f"expected task to be in {expected.value!r} but it is in {actual_state!r}"
+                )
+            if existing_plan_json is not None:
+                raise InvalidTransitionError(
+                    f"task {task_id} already has a persisted plan"
+                )
+
+            cursor = conn.execute(
+                "UPDATE tasks SET plan_json = ?, state = ?, updated_at = ?, "
+                "version = version + 1 "
+                "WHERE task_id = ? AND state = ? AND plan_json IS NULL",
+                (plan_json, TaskState.READY.value, now, task_id, expected.value),
+            )
+            if cursor.rowcount == 0:
+                # Lost a race to a concurrent writer between our SELECT and
+                # our UPDATE - re-inspect to report the precise conflict,
+                # exactly like _apply_transition()'s own race handling.
+                row2 = conn.execute(
+                    "SELECT state, plan_json FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row2 is None:
+                    raise TaskNotFoundError(task_id)
+                actual_state2, existing_plan_json2 = row2
+                if actual_state2 in _TERMINAL_STATE_VALUES:
+                    raise TaskAlreadyTerminalError(actual_state2)
+                if actual_state2 != expected.value:
+                    raise InvalidTransitionError(
+                        f"expected task to be in {expected.value!r} but it is in "
+                        f"{actual_state2!r}"
+                    )
+                raise InvalidTransitionError(
+                    f"task {task_id} already has a persisted plan"
+                )
+
+            new_version = current_version + 1
+            conn.execute(
+                "INSERT INTO task_transitions ("
+                "task_id, from_state, to_state, timestamp, reason_code, "
+                "safe_summary, task_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    expected.value,
+                    TaskState.READY.value,
+                    now,
+                    reason_code,
+                    safe_summary,
+                    new_version,
+                ),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_task(task_id)
 
     def _apply_transition(
         self,

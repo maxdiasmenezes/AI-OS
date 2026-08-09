@@ -21,15 +21,33 @@ _ENV_PATH = _PROJECT_ROOT / ".env"
 
 
 class Config:
-    """Everything the kernel needs to run a single prompt."""
+    """Everything the kernel needs to run a single prompt.
+
+    `planner_provider`/`planner_provider_settings` (Milestone 41) are the
+    dedicated structured-planner provider selection - shaped exactly like
+    `provider`/`provider_settings` (the same dict a ModelProvider subclass's
+    constructor expects), so a future caller can construct one the same
+    way get_provider() constructs the general one, from
+    `_PROVIDERS[config.planner_provider](config.planner_provider_settings)`.
+    Nothing does that yet - no planner-provider factory or construction
+    exists as of this milestone. Both default to None so every existing
+    caller that constructs a Config without them (production `load_config()`
+    always supplies both; some tests construct a bare Config for
+    conversational-only scenarios that have no need of a planner provider)
+    keeps working unchanged.
+    """
 
     def __init__(self, provider: str, provider_settings: dict, log_path: Path,
-                 memory_settings: dict, knowledge_storage_dir: Path):
+                 memory_settings: dict, knowledge_storage_dir: Path,
+                 planner_provider: str | None = None,
+                 planner_provider_settings: dict | None = None):
         self.provider = provider
         self.provider_settings = provider_settings
         self.log_path = log_path
         self.memory_settings = memory_settings
         self.knowledge_storage_dir = knowledge_storage_dir
+        self.planner_provider = planner_provider
+        self.planner_provider_settings = planner_provider_settings
 
 
 def load_config() -> Config:
@@ -48,10 +66,16 @@ def load_config() -> Config:
     memory_settings = settings["memory"]
     knowledge_storage_dir = _PROJECT_ROOT / settings["knowledge"]["storage_dir"]
 
+    planner_settings = settings["planner"]
+    planner_provider = planner_settings["provider"]
+    planner_provider_settings = planner_settings["providers"][planner_provider]
+
     return Config(
         provider=provider,
         provider_settings=provider_settings,
         log_path=log_path,
         memory_settings=memory_settings,
         knowledge_storage_dir=knowledge_storage_dir,
+        planner_provider=planner_provider,
+        planner_provider_settings=planner_provider_settings,
     )

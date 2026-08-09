@@ -16,6 +16,7 @@ from kernel.employee_tasks.types import (
     MAX_FAILURE_SUMMARY_CHARS,
     MAX_LIST_LIMIT,
     MAX_METADATA_JSON_CHARS,
+    MAX_PLAN_JSON_CHARS,
     MAX_REASON_CODE_CHARS,
     MAX_REQUEST_TEXT_CHARS,
     MAX_SAFE_SUMMARY_CHARS,
@@ -715,3 +716,157 @@ def test_transaction_rollback_leaves_no_partial_row_on_integrity_violation(repo)
 
     count_after = len(repo.list_tasks(limit=100))
     assert count_before == count_after
+
+
+# --- Milestone 41 P2: plan_json / persist_plan_and_ready ---------------------
+
+
+def test_task_record_exposes_plan_json(repo):
+    record = repo.create_task("request", "whatsapp")
+    assert hasattr(record, "plan_json")
+
+
+def test_new_tasks_start_with_plan_json_none(repo):
+    record = repo.create_task("request", "whatsapp")
+    assert record.plan_json is None
+
+
+def test_persist_plan_and_ready_happy_path(repo):
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+
+    result = repo.persist_plan_and_ready(
+        record.task_id, "planning", '{"objective":"x"}', reason_code="plan_ready"
+    )
+
+    assert result.state == TaskState.READY
+    assert result.plan_json == '{"objective":"x"}'
+    assert result.version == 3  # created(1) -> planning(2) -> ready(3)
+
+
+def test_persisted_plan_survives_repository_reopen(db_path):
+    conn1 = open_writer_connection(db_path)
+    repo1 = TaskRepository(conn1)
+    record = repo1.create_task("request", "whatsapp")
+    repo1.transition_task(record.task_id, "created", "planning")
+    repo1.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+    conn1.close()
+
+    conn2 = open_writer_connection(db_path)
+    repo2 = TaskRepository(conn2)
+    reloaded = repo2.get_task(record.task_id)
+    assert reloaded.state == TaskState.READY
+    assert reloaded.plan_json == '{"objective":"x"}'
+    conn2.close()
+
+
+def test_persist_plan_and_ready_records_one_journal_entry(repo):
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+    repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+
+    transitions = repo.list_transitions(record.task_id)
+    assert [t.to_state for t in transitions] == [
+        TaskState.CREATED,
+        TaskState.PLANNING,
+        TaskState.READY,
+    ]
+
+
+def test_persist_plan_and_ready_rejects_second_write(repo):
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+    repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+
+    # The task is now "ready", not "planning" - a second attempt with the
+    # correct original expected_state fails on the state check alone.
+    with pytest.raises(InvalidTransitionError):
+        repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"y"}')
+
+
+def test_persist_plan_and_ready_rejects_second_write_even_when_state_is_planning(db_path):
+    # A more targeted proof that the guard is plan_json IS NULL, not just
+    # "state == planning": force the row back to "planning" via a
+    # separate raw connection (simulating a database that already carries
+    # a persisted plan for some other reason) and confirm a second write
+    # through the repository API is still rejected.
+    conn = open_writer_connection(db_path)
+    repo = TaskRepository(conn)
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+    repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("UPDATE tasks SET state = 'planning' WHERE task_id = ?", (record.task_id,))
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(InvalidTransitionError):
+        repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"y"}')
+
+    unchanged = repo.get_task(record.task_id)
+    assert unchanged.plan_json == '{"objective":"x"}'
+    conn.close()
+
+
+def test_persist_plan_and_ready_rejects_wrong_state(repo):
+    record = repo.create_task("request", "whatsapp")
+    # Still "created" - never transitioned to "planning".
+    with pytest.raises(InvalidTransitionError):
+        repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+
+
+def test_persist_plan_and_ready_rejects_terminal_task(repo):
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+    repo.mark_failed(record.task_id, "planning", "some_code", "some summary")
+
+    with pytest.raises(TaskAlreadyTerminalError):
+        repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+
+
+def test_persist_plan_and_ready_rejects_nonexistent_task(repo):
+    with pytest.raises(TaskNotFoundError):
+        repo.persist_plan_and_ready(
+            "00000000-0000-7000-8000-000000000000", "planning", '{"objective":"x"}'
+        )
+
+
+def test_persist_plan_and_ready_validates_plan_json_size(repo):
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+
+    oversized = '{"x":"' + ("a" * MAX_PLAN_JSON_CHARS) + '"}'
+    with pytest.raises(TaskInputTooLargeError):
+        repo.persist_plan_and_ready(record.task_id, "planning", oversized)
+
+
+def test_persist_plan_and_ready_rejects_non_json_plan_json(repo):
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+
+    with pytest.raises(TaskInputTooLargeError):
+        repo.persist_plan_and_ready(record.task_id, "planning", "not json")
+
+
+def test_plan_and_transition_journal_are_atomic_on_crash(db_path):
+    conn = open_writer_connection(db_path)
+    repo = TaskRepository(conn)
+    record = repo.create_task("request", "whatsapp")
+    repo.transition_task(record.task_id, "created", "planning")
+
+    faulty = _FaultInjectingConnection(conn, "INSERT INTO task_transitions")
+    faulty_repo = TaskRepository(faulty)
+
+    with pytest.raises(RuntimeError):
+        faulty_repo.persist_plan_and_ready(record.task_id, "planning", '{"objective":"x"}')
+
+    post_crash = repo.get_task(record.task_id)
+    assert post_crash.state == TaskState.PLANNING  # rolled back, not "ready"
+    assert post_crash.plan_json is None  # rolled back, not persisted
+    assert post_crash.version == 2  # unchanged from before the crashed attempt
+
+    transitions = repo.list_transitions(record.task_id)
+    assert [t.to_state for t in transitions] == [TaskState.CREATED, TaskState.PLANNING]
+
+    conn.close()

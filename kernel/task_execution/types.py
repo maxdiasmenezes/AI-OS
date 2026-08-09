@@ -1,7 +1,11 @@
 """
 Typed data for kernel/task_execution/ (Milestone 42 P1 - Durable Step
-Progress + Deterministic Next-Step Eligibility): the closed outcome union
-evaluate_next_step() returns instead of executing anything.
+Progress + Deterministic Next-Step Eligibility; Milestone 42 P2 - Action
+Execution and Durable Confirmation adds TASK_CONFIRMATION_TTL_SECONDS and
+ExecutionAdvanceResult/ExecutionAdvanceStatus below): the closed outcome
+union evaluate_next_step() returns instead of executing anything, plus the
+result shape service.py's advance_task_execution()/
+approve_task_confirmation()/deny_task_confirmation() return.
 
 Nothing here performs I/O, calls a model, executes an action, or mutates
 kernel/employee_tasks - these are plain, frozen data, matching
@@ -65,6 +69,7 @@ that might carry unsafe detail.
 from dataclasses import dataclass
 from enum import Enum
 
+from kernel.employee_tasks import TaskRecord
 from kernel.task_planner import PlanStep
 
 
@@ -148,3 +153,42 @@ EligibilityOutcome = (
     | PlanDeserializationFailure
     | ActionRevalidationFailure
 )
+
+
+# Milestone 42 P2: the task-execution confirmation safety window. Kept
+# separate from kernel/tools/confirmation.py's ConfirmationStore's own
+# CONFIRMATION_TTL_SECONDS (also 120) so this package never imports that
+# module merely to share a numeric literal - the two confirmation systems
+# are wholly independent (see kernel/employee_tasks/__init__.py). The
+# value deliberately matches that store's own safety window today, but
+# either may diverge later without coupling the two; M46 may revisit the
+# UX/configuration of this value once confirmations are actually delivered
+# over WhatsApp - this constant only establishes P2's safety semantics.
+TASK_CONFIRMATION_TTL_SECONDS = 120.0
+
+
+class ExecutionAdvanceStatus(Enum):
+    """What kernel/task_execution/service.py's advance_task_execution()/
+    approve_task_confirmation()/deny_task_confirmation() actually did (or
+    found), distinguishing every outcome a caller needs to tell apart."""
+
+    STEP_SUCCEEDED = "step_succeeded"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    WAITING_FOR_CONFIRMATION = "waiting_for_confirmation"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    TASK_CANCELLED = "task_cancelled"
+
+
+@dataclass(frozen=True)
+class ExecutionAdvanceResult:
+    """The return shape for every kernel/task_execution/service.py public
+    entrypoint. `task` is always the task's freshly reloaded, current
+    TaskRecord after whatever this call did (never a stale echo of the
+    caller's input). `detail` is an optional, fixed, code-authored short
+    string (a failure/outcome code, e.g. "confirmation_expired") - never
+    raw plan_json/model/request text."""
+
+    task: TaskRecord
+    status: ExecutionAdvanceStatus
+    detail: str | None = None

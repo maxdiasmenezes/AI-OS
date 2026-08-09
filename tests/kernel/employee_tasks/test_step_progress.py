@@ -31,11 +31,21 @@ _STATE_PATH = {
     "planning": ["planning"],
     "ready": ["planning", "ready"],
     "running": ["planning", "ready", "running"],
-    "waiting_for_confirmation": ["planning", "ready", "running", "waiting_for_confirmation"],
 }
 
 
 def _drive_to_state(repo, task_id, state: str) -> None:
+    """Reaching "waiting_for_confirmation" goes through
+    propose_confirmation() (Milestone 42 P2) - never a generic
+    transition_task() call, which correctly refuses that edge. Proposes
+    for step position 2, not 1, so the caller's own claim_step(..., 1)
+    assertions are never affected by a step this helper itself touched."""
+
+    if state == "waiting_for_confirmation":
+        _drive_to_state(repo, task_id, "running")
+        repo.propose_confirmation(task_id, 2, "repository_backup", "ai_os", ttl_seconds=120)
+        return
+
     current = "created"
     for next_state in _STATE_PATH[state]:
         repo.transition_task(task_id, current, next_state)

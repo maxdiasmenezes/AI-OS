@@ -96,6 +96,27 @@ _TASK_STEP_PROGRESS_TABLE_SQL = f"""
     )
     """
 
+# Schema version 4 (Milestone 42 P2): durable, task-scoped pending
+# confirmations - see kernel/employee_tasks/types.py:PendingTaskConfirmation.
+# task_id is the PRIMARY KEY (at most one pending confirmation per task,
+# guaranteed by execution being strictly sequential); confirmation_id is
+# separately UNIQUE (a single-use identity token, never reused across two
+# different proposals for the same task, even sequential ones - see that
+# type's own docstring for why task_id alone is not enough). Defined once
+# and reused by BOTH _SCHEMA_STATEMENTS and _MIGRATION_3_TO_4_STATEMENTS,
+# for the same drift-avoidance reason _TASK_STEP_PROGRESS_TABLE_SQL is.
+_TASK_PENDING_CONFIRMATION_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS task_pending_confirmation (
+        task_id         TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+        confirmation_id TEXT NOT NULL UNIQUE,
+        step_position   INTEGER NOT NULL CHECK (step_position >= 1),
+        action_name     TEXT NOT NULL,
+        resource_key    TEXT,
+        created_at      TEXT NOT NULL,
+        expires_at      TEXT NOT NULL
+    )
+    """
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS schema_meta (
@@ -138,6 +159,7 @@ _SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS tasks_created_idx ON tasks(created_at, task_id)",
     "CREATE INDEX IF NOT EXISTS transitions_task_idx ON task_transitions(task_id, transition_id)",
     _TASK_STEP_PROGRESS_TABLE_SQL,
+    _TASK_PENDING_CONFIRMATION_TABLE_SQL,
 )
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -265,6 +287,31 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         raise TaskStorageUnavailableError("task database is unavailable") from exc
 
 
+# Milestone 42 P2: adds the task_pending_confirmation table a fresh v4+
+# database already has via _SCHEMA_STATEMENTS above - same "wholly new
+# table, no ALTER TABLE" shape as _migrate_v2_to_v3. Bumps to the fixed
+# literal "4" for the same reason the earlier migrations bump to their own
+# fixed literals - see _migrate_v1_to_v2's comment. Reuses
+# _TASK_PENDING_CONFIRMATION_TABLE_SQL (defined once, above
+# _SCHEMA_STATEMENTS).
+_MIGRATION_3_TO_4_STATEMENTS = (_TASK_PENDING_CONFIRMATION_TABLE_SQL,)
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _MIGRATION_3_TO_4_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("4",),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        raise TaskStorageUnavailableError("task database is unavailable") from exc
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         row = conn.execute(
@@ -276,8 +323,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if row is not None:
         current_version = row[0]
         # Chain every migration this package still supports, in order, so
-        # a writer opening ANY previously-shipped version (v1, v2, or
-        # already-current v3) reaches the current schema deterministically
+        # a writer opening ANY previously-shipped version (v1, v2, v3, or
+        # already-current v4) reaches the current schema deterministically
         # in one open_writer_connection() call - never a version this
         # chain doesn't recognize as a starting point along the way.
         if current_version == "1":
@@ -286,6 +333,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if current_version == "2":
             _migrate_v2_to_v3(conn)
             current_version = "3"
+        if current_version == "3":
+            _migrate_v3_to_v4(conn)
+            current_version = "4"
         if current_version == str(SCHEMA_VERSION):
             return  # already current - idempotent no-op
         raise TaskSchemaIncompatibleError("task database schema is incompatible")

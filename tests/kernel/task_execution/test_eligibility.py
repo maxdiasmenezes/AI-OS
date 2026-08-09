@@ -404,6 +404,13 @@ def test_respond_step_still_subject_to_dependency_enforcement(registry, tools_co
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[3] / "kernel" / "task_execution"
 
+# service.py (Milestone 42 P2) is deliberately NOT one of the "pure" files
+# checked here - it legitimately imports kernel.tools.executor/types (see
+# test_service.py's own, separately-scoped boundary test for what IS and
+# is not allowed there). types.py/eligibility.py/observation.py must never
+# touch execution machinery at all - see this module's own docstring.
+_PURE_MODULE_FILES = ("types.py", "eligibility.py", "observation.py", "__init__.py")
+
 _FORBIDDEN_IMPORT_PREFIXES = (
     "kernel.employee_tasks.db",
     "kernel.employee_tasks.repository",
@@ -431,8 +438,9 @@ def _imported_module_names(source_path: Path) -> set[str]:
     return names
 
 
-def test_task_execution_package_never_imports_io_or_execution_modules():
-    for py_file in _PACKAGE_DIR.glob("*.py"):
+def test_task_execution_pure_modules_never_import_io_or_execution_modules():
+    for filename in _PURE_MODULE_FILES:
+        py_file = _PACKAGE_DIR / filename
         imported = _imported_module_names(py_file)
         for forbidden in _FORBIDDEN_IMPORT_PREFIXES:
             matches = {

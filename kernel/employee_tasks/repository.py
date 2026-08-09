@@ -52,15 +52,37 @@ alone already guarantees. mark_step_succeeded()/mark_step_failed() DO use
 a conditional UPDATE (... WHERE status = 'in_progress'), mirroring
 _apply_transition()'s own discipline, to make terminal step status
 write-once - see StepNotInProgressError's docstring.
+
+WAITING_FOR_CONFIRMATION carries a stronger persistence invariant than any
+other TaskState: a task in that state must always have exactly one
+matching task_pending_confirmation row, and a task in any other state must
+never have one. ALLOWED_TRANSITIONS correctly lists
+RUNNING -> WAITING_FOR_CONFIRMATION and
+WAITING_FOR_CONFIRMATION -> {RUNNING, CANCELLED, FAILED} as valid
+lifecycle edges - that graph is intentionally unchanged - but
+transition_task()/mark_cancelled()/mark_failed() MECHANICALLY REFUSE any
+call that would enter or leave WAITING_FOR_CONFIRMATION
+(InvalidTransitionError, via the module-level
+_reject_generic_waiting_for_confirmation() every one of them calls before
+touching the database), because none of them know task_pending_confirmation
+exists and none could keep it synchronized with task state. The ONLY
+legal repository paths into or out of WAITING_FOR_CONFIRMATION are
+propose_confirmation() (in), and consume_confirmation_and_claim_step()/
+deny_confirmation()/fail_pending_confirmation() (out) - this is enforced
+at the repository API boundary itself, not left as documented caller
+discipline.
 """
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from kernel.employee_tasks.types import (
     ALLOWED_TRANSITIONS,
     DEFAULT_LIST_LIMIT,
+    MAX_CONFIRMATION_ACTION_NAME_CHARS,
+    MAX_CONFIRMATION_ID_CHARS,
+    MAX_CONFIRMATION_RESOURCE_KEY_CHARS,
     MAX_DEDUP_KEY_CHARS,
     MAX_DISPLAY_ID_ATTEMPTS,
     MAX_FAILURE_CODE_CHARS,
@@ -77,8 +99,12 @@ from kernel.employee_tasks.types import (
     MIN_REQUEST_TEXT_CHARS,
     MIN_SOURCE_CHARS,
     TERMINAL_STATES,
+    ConfirmationExpiredError,
+    ConfirmationMismatchError,
     DuplicateTaskError,
     InvalidTransitionError,
+    NoPendingConfirmationError,
+    PendingTaskConfirmation,
     StepAlreadyClaimedError,
     StepNotInProgressError,
     StepStatus,
@@ -92,6 +118,7 @@ from kernel.employee_tasks.types import (
     TaskTransition,
     generate_display_id,
     generate_task_id,
+    parse_task_timestamp,
 )
 
 _TERMINAL_STATE_VALUES = frozenset(state.value for state in TERMINAL_STATES)
@@ -105,6 +132,11 @@ _SELECT_COLUMNS = (
 _STEP_PROGRESS_SELECT_COLUMNS = (
     "task_id, step_position, status, started_at, completed_at, "
     "result_json, failure_code, failure_summary, task_version"
+)
+
+_PENDING_CONFIRMATION_SELECT_COLUMNS = (
+    "task_id, confirmation_id, step_position, action_name, resource_key, "
+    "created_at, expires_at"
 )
 
 
@@ -191,6 +223,45 @@ def _validate_optional_step_result_json(value) -> str | None:
     return _validate_step_result_json(value)
 
 
+def _validate_confirmation_action_name(value) -> str:
+    return _validate_bounded_text(
+        value, "action_name", 1, MAX_CONFIRMATION_ACTION_NAME_CHARS
+    )
+
+
+def _validate_confirmation_resource_key(value) -> str | None:
+    if value is None:
+        return None
+    return _validate_bounded_text(
+        value, "resource_key", 1, MAX_CONFIRMATION_RESOURCE_KEY_CHARS
+    )
+
+
+def _validate_ttl_seconds(value) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise TaskInputTooLargeError("ttl_seconds must be a positive number")
+    return float(value)
+
+
+def _validate_confirmation_id(value) -> str:
+    """confirmation_id is code-generated at propose_confirmation() time,
+    but consume_confirmation_and_claim_step()/deny_confirmation()/
+    fail_pending_confirmation() receive it back from a caller (eventually
+    an external one, once a later milestone wires up approval delivery) -
+    validated here exactly like every other externally-supplied text field
+    in this module (type, non-empty, bounded, NUL-rejected) before it is
+    ever compared against a persisted row. Exact opaque-token equality is
+    what actually authorizes anything here, not any particular string
+    shape - this deliberately does not require confirmation_id to parse
+    as a UUID."""
+
+    return _validate_bounded_text(value, "confirmation_id", 1, MAX_CONFIRMATION_ID_CHARS)
+
+
 def _validate_limit(limit: int) -> int:
     if not isinstance(limit, int) or isinstance(limit, bool) or not (
         MIN_LIST_LIMIT <= limit <= MAX_LIST_LIMIT
@@ -241,6 +312,81 @@ def _row_to_step_progress(row) -> TaskStepProgress:
         failure_summary=row[7],
         task_version=row[8],
     )
+
+
+def _row_to_pending_confirmation(row) -> PendingTaskConfirmation:
+    return PendingTaskConfirmation(
+        task_id=row[0],
+        confirmation_id=row[1],
+        step_position=row[2],
+        action_name=row[3],
+        resource_key=row[4],
+        created_at=row[5],
+        expires_at=row[6],
+    )
+
+
+def _select_task_state_for_update(conn: sqlite3.Connection, task_id: str) -> tuple[str, int]:
+    """Must be called after BEGIN IMMEDIATE, inside the write-locked
+    transaction that will act on the result. Returns (state, version) for
+    an existing task, or raises TaskNotFoundError. Shared by every method
+    (claim_step, propose_confirmation, consume_confirmation_and_claim_step,
+    deny_confirmation, fail_pending_confirmation, fail_running_step) that
+    needs to check the task's CURRENT state before acting on it - never a
+    caller-held, possibly-stale TaskRecord."""
+
+    row = conn.execute("SELECT state, version FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise TaskNotFoundError(task_id)
+    return row[0], row[1]
+
+
+def _require_task_state(actual_state: str, expected: TaskState) -> None:
+    """Raises TaskAlreadyTerminalError for a terminal actual_state, or
+    InvalidTransitionError for any other mismatch against `expected` -
+    the same typed conventions every state-checking method in this class
+    already uses (see _apply_transition())."""
+
+    if actual_state in _TERMINAL_STATE_VALUES:
+        raise TaskAlreadyTerminalError(actual_state)
+    if actual_state != expected.value:
+        raise InvalidTransitionError(
+            f"expected task to be in {expected.value!r} but it is in {actual_state!r}"
+        )
+
+
+_WAITING_FOR_CONFIRMATION_BYPASS_MESSAGE = (
+    "waiting_for_confirmation may only be entered or left through the dedicated "
+    "confirmation operations (propose_confirmation(), "
+    "consume_confirmation_and_claim_step(), deny_confirmation(), "
+    "fail_pending_confirmation()) - never through transition_task(), mark_cancelled(), "
+    "or mark_failed(), which know nothing about the durable task_pending_confirmation "
+    "row and would desynchronize it from task state"
+)
+
+
+def _reject_generic_waiting_for_confirmation(*states: TaskState) -> None:
+    """ALLOWED_TRANSITIONS correctly says RUNNING -> WAITING_FOR_CONFIRMATION
+    and WAITING_FOR_CONFIRMATION -> {RUNNING, CANCELLED, FAILED} are valid
+    lifecycle edges - that graph is not wrong and is deliberately left
+    unchanged (see ALLOWED_TRANSITIONS' own docstring). What is wrong is
+    reaching those edges through a GENERIC method that only ever touches
+    `tasks`/`task_transitions`: WAITING_FOR_CONFIRMATION has a stronger
+    persistence invariant than any other state - it must always have
+    exactly one matching task_pending_confirmation row, and every other
+    state must never have one. Only propose_confirmation() (creates the
+    row atomically with the RUNNING -> WAITING_FOR_CONFIRMATION transition)
+    and consume_confirmation_and_claim_step()/deny_confirmation()/
+    fail_pending_confirmation() (each atomically consumes the row as part
+    of their own transition) can uphold that invariant; a generic
+    transition_task()/mark_cancelled()/mark_failed() call cannot, because
+    none of them know task_pending_confirmation exists. This is therefore
+    enforced here, at the repository API boundary, for every state-changing
+    method that does not itself manage that table - never left as caller
+    discipline or a docstring-only warning."""
+
+    if TaskState.WAITING_FOR_CONFIRMATION in states:
+        raise InvalidTransitionError(_WAITING_FOR_CONFIRMATION_BYPASS_MESSAGE)
 
 
 class TaskRepository:
@@ -407,6 +553,19 @@ class TaskRepository:
         reason_code: str | None = None,
         safe_summary: str | None = None,
     ) -> TaskRecord:
+        """Generic state transition for any edge in ALLOWED_TRANSITIONS
+        EXCEPT one that enters or leaves waiting_for_confirmation - both
+        directions are mechanically refused (InvalidTransitionError, via
+        _reject_generic_waiting_for_confirmation() - see that function's
+        own docstring for why): RUNNING -> WAITING_FOR_CONFIRMATION must
+        go through propose_confirmation() (which creates the matching
+        pending row atomically), and WAITING_FOR_CONFIRMATION -> anything
+        must go through consume_confirmation_and_claim_step()/
+        deny_confirmation()/fail_pending_confirmation() (each of which
+        atomically consumes that row). This method has no knowledge of
+        task_pending_confirmation and cannot keep it in sync, so it is
+        never trusted with either edge."""
+
         expected = _coerce_state(expected_state)
         target = _coerce_state(new_state)
         reason_code = _validate_optional_bounded_text(
@@ -415,6 +574,8 @@ class TaskRepository:
         safe_summary = _validate_optional_bounded_text(
             safe_summary, "safe_summary", MAX_SAFE_SUMMARY_CHARS
         )
+
+        _reject_generic_waiting_for_confirmation(expected, target)
 
         if expected in TERMINAL_STATES:
             raise TaskAlreadyTerminalError(expected.value)
@@ -434,6 +595,15 @@ class TaskRepository:
         failure_code: str,
         failure_summary: str,
     ) -> TaskRecord:
+        """Generic failure transition for any non-terminal state EXCEPT
+        waiting_for_confirmation, which this method mechanically refuses
+        (InvalidTransitionError, via _reject_generic_waiting_for_confirmation()
+        - see that function's own docstring): a task in
+        waiting_for_confirmation must be failed through
+        fail_pending_confirmation() instead, which atomically consumes the
+        pending task_pending_confirmation row as part of the same
+        transaction - this general method cannot uphold that invariant."""
+
         expected = _coerce_state(expected_state)
         failure_code = _validate_bounded_text(
             failure_code, "failure_code", 1, MAX_FAILURE_CODE_CHARS
@@ -441,6 +611,8 @@ class TaskRepository:
         failure_summary = _validate_bounded_text(
             failure_summary, "failure_summary", 1, MAX_FAILURE_SUMMARY_CHARS
         )
+
+        _reject_generic_waiting_for_confirmation(expected)
 
         if expected in TERMINAL_STATES:
             raise TaskAlreadyTerminalError(expected.value)
@@ -467,11 +639,24 @@ class TaskRepository:
         reason_code: str = "user_cancelled",
         safe_summary: str | None = None,
     ) -> TaskRecord:
+        """General-purpose cancellation for any non-terminal state (see
+        ALLOWED_TRANSITIONS) EXCEPT waiting_for_confirmation, which this
+        method mechanically refuses (InvalidTransitionError, via
+        _reject_generic_waiting_for_confirmation() - see that function's
+        own docstring): a task in waiting_for_confirmation must be
+        cancelled through deny_confirmation() instead, which atomically
+        consumes the pending task_pending_confirmation row as part of the
+        same transaction - this general method only ever touches
+        `tasks`/`task_transitions` and cannot uphold that invariant. This
+        is enforced here, not merely documented as caller discipline."""
+
         expected = _coerce_state(expected_state)
         reason_code = _validate_bounded_text(reason_code, "reason_code", 1, MAX_REASON_CODE_CHARS)
         safe_summary = _validate_optional_bounded_text(
             safe_summary, "safe_summary", MAX_SAFE_SUMMARY_CHARS
         )
+
+        _reject_generic_waiting_for_confirmation(expected)
 
         if expected in TERMINAL_STATES:
             raise TaskAlreadyTerminalError(expected.value)
@@ -657,20 +842,8 @@ class TaskRepository:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute(
-                "SELECT state, version FROM tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            if row is None:
-                raise TaskNotFoundError(task_id)
-            actual_state, task_version = row
-
-            if actual_state in _TERMINAL_STATE_VALUES:
-                raise TaskAlreadyTerminalError(actual_state)
-            if actual_state != TaskState.RUNNING.value:
-                raise InvalidTransitionError(
-                    f"expected task to be in 'running' to claim a step but it is in "
-                    f"{actual_state!r}"
-                )
+            actual_state, task_version = _select_task_state_for_update(conn, task_id)
+            _require_task_state(actual_state, TaskState.RUNNING)
 
             conn.execute(
                 "INSERT INTO task_step_progress "
@@ -742,6 +915,123 @@ class TaskRepository:
             failure_summary=failure_summary,
         )
 
+    def fail_running_step(
+        self,
+        task_id: str,
+        step_position: int,
+        failure_code: str,
+        failure_summary: str,
+        *,
+        result_json: str | None = None,
+    ) -> TaskRecord:
+        """Atomically fail one in_progress step AND the RUNNING task that
+        claimed it, in a single transaction (Milestone 42 P2) - so a
+        step's failure and its task's failure can never drift apart (a
+        step recorded as failed while its task is still RUNNING, or vice
+        versa). Requires the task to still be RUNNING: if a concurrent
+        writer already moved it to a terminal state (e.g. CANCELLED) since
+        the step was claimed, this raises TaskAlreadyTerminalError WITHOUT
+        touching task_step_progress at all - the already-authorized
+        external action's outcome still needs to be recorded, but that is
+        the caller's job via a separate mark_step_failed() call in that
+        specific fallback case (see kernel/task_execution/service.py's own
+        handling: an already-claimed, already-executed action's outcome
+        must never be silently discarded just because the task moved on,
+        but the task itself must never be overwritten out of a state
+        another writer already committed)."""
+
+        step_position = _validate_step_position(step_position)
+        failure_code = _validate_bounded_text(
+            failure_code, "failure_code", 1, MAX_FAILURE_CODE_CHARS
+        )
+        failure_summary = _validate_bounded_text(
+            failure_summary, "failure_summary", 1, MAX_FAILURE_SUMMARY_CHARS
+        )
+        result_json = _validate_optional_step_result_json(result_json)
+
+        conn = self._conn
+        now = _now()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            _require_task_state(actual_state, TaskState.RUNNING)
+
+            step_cursor = conn.execute(
+                "UPDATE task_step_progress SET status = ?, completed_at = ?, "
+                "result_json = ?, failure_code = ?, failure_summary = ? "
+                "WHERE task_id = ? AND step_position = ? AND status = ?",
+                (
+                    StepStatus.FAILED.value,
+                    now,
+                    result_json,
+                    failure_code,
+                    failure_summary,
+                    task_id,
+                    step_position,
+                    StepStatus.IN_PROGRESS.value,
+                ),
+            )
+            if step_cursor.rowcount == 0:
+                raise StepNotInProgressError(
+                    f"step {step_position} of task {task_id} is not currently in_progress"
+                )
+
+            task_cursor = conn.execute(
+                "UPDATE tasks SET state = ?, updated_at = ?, completed_at = ?, "
+                "failure_code = ?, failure_summary = ?, version = version + 1 "
+                "WHERE task_id = ? AND state = ?",
+                (
+                    TaskState.FAILED.value,
+                    now,
+                    now,
+                    failure_code,
+                    failure_summary,
+                    task_id,
+                    TaskState.RUNNING.value,
+                ),
+            )
+            if task_cursor.rowcount == 0:
+                # Lost a race to a concurrent writer between our SELECT and
+                # this UPDATE - re-inspect to report the precise conflict,
+                # exactly like _apply_transition()'s own race handling.
+                row2 = conn.execute(
+                    "SELECT state FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row2 is None:
+                    raise TaskNotFoundError(task_id)
+                _require_task_state(row2[0], TaskState.RUNNING)
+                raise InvalidTransitionError(
+                    f"task {task_id} is no longer running"
+                )
+
+            new_version = current_version + 1
+            conn.execute(
+                "INSERT INTO task_transitions ("
+                "task_id, from_state, to_state, timestamp, reason_code, "
+                "safe_summary, task_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    TaskState.RUNNING.value,
+                    TaskState.FAILED.value,
+                    now,
+                    failure_code,
+                    failure_summary,
+                    new_version,
+                ),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_task(task_id)
+
     def get_step_progress(self, task_id: str, step_position: int) -> TaskStepProgress | None:
         """None means no row exists for this (task_id, step_position) -
         i.e. not_started. Never raises TaskNotFoundError for an unknown
@@ -768,6 +1058,425 @@ class TaskRepository:
             (task_id,),
         ).fetchall()
         return [_row_to_step_progress(row) for row in rows]
+
+    # -- durable confirmation (Milestone 42 P2) -----------------------------
+
+    def propose_confirmation(
+        self,
+        task_id: str,
+        step_position: int,
+        action_name: str,
+        resource_key: str | None,
+        ttl_seconds: float,
+        *,
+        reason_code: str | None = None,
+        safe_summary: str | None = None,
+    ) -> TaskRecord:
+        """Atomically propose a durable, task-scoped confirmation for
+        exactly one sensitive ACTION step, and transition
+        RUNNING -> WAITING_FOR_CONFIRMATION, in one transaction. Requires
+        the task to be RUNNING and step_position to never have been
+        claimed (no task_step_progress row for it yet) - both checked
+        inside this same transaction, never trusted from a caller-held
+        TaskRecord/EligibleStep.
+
+        `task_id` is task_pending_confirmation's PRIMARY KEY: at most one
+        pending confirmation can ever exist per task (see
+        PendingTaskConfirmation's own docstring for why). Of any number of
+        concurrent callers proposing for the same RUNNING task, only one
+        can win the RUNNING -> WAITING_FOR_CONFIRMATION conditional
+        UPDATE below; every other one observes the task is no longer
+        RUNNING and fails closed with the same typed conventions every
+        other transition method in this class uses.
+
+        `confirmation_id` is freshly code-generated here by reusing
+        generate_task_id()'s generic UUID7 generator (see that function's
+        own docstring - it is not task-specific despite its name) - never
+        supplied by a caller, never derived from request text or model
+        output. `ttl_seconds` is caller-supplied: kernel/task_execution/
+        owns this policy value (e.g. TASK_CONFIRMATION_TTL_SECONDS) so
+        this layer stays policy-free, exactly like every other opaque
+        value it accepts - it only computes
+        `expires_at = now + ttl_seconds` from its own single, consistent
+        `now` instant."""
+
+        step_position = _validate_step_position(step_position)
+        action_name = _validate_confirmation_action_name(action_name)
+        resource_key = _validate_confirmation_resource_key(resource_key)
+        ttl_seconds = _validate_ttl_seconds(ttl_seconds)
+        reason_code = _validate_optional_bounded_text(
+            reason_code, "reason_code", MAX_REASON_CODE_CHARS
+        )
+        safe_summary = _validate_optional_bounded_text(
+            safe_summary, "safe_summary", MAX_SAFE_SUMMARY_CHARS
+        )
+
+        conn = self._conn
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(seconds=ttl_seconds)).isoformat()
+        confirmation_id = generate_task_id()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            _require_task_state(actual_state, TaskState.RUNNING)
+
+            existing_step = conn.execute(
+                "SELECT 1 FROM task_step_progress WHERE task_id = ? AND step_position = ?",
+                (task_id, step_position),
+            ).fetchone()
+            if existing_step is not None:
+                raise StepAlreadyClaimedError(
+                    f"step {step_position} of task {task_id} has already been claimed"
+                )
+
+            task_cursor = conn.execute(
+                "UPDATE tasks SET state = ?, updated_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND state = ?",
+                (
+                    TaskState.WAITING_FOR_CONFIRMATION.value,
+                    now,
+                    task_id,
+                    TaskState.RUNNING.value,
+                ),
+            )
+            if task_cursor.rowcount == 0:
+                row2 = conn.execute(
+                    "SELECT state FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row2 is None:
+                    raise TaskNotFoundError(task_id)
+                _require_task_state(row2[0], TaskState.RUNNING)
+                raise InvalidTransitionError(f"task {task_id} is no longer running")
+
+            conn.execute(
+                "INSERT INTO task_pending_confirmation "
+                "(task_id, confirmation_id, step_position, action_name, resource_key, "
+                "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    confirmation_id,
+                    step_position,
+                    action_name,
+                    resource_key,
+                    now,
+                    expires_at,
+                ),
+            )
+
+            new_version = current_version + 1
+            conn.execute(
+                "INSERT INTO task_transitions ("
+                "task_id, from_state, to_state, timestamp, reason_code, "
+                "safe_summary, task_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    TaskState.RUNNING.value,
+                    TaskState.WAITING_FOR_CONFIRMATION.value,
+                    now,
+                    reason_code,
+                    safe_summary,
+                    new_version,
+                ),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_task(task_id)
+
+    def get_pending_confirmation(self, task_id: str) -> PendingTaskConfirmation | None:
+        """None means no pending confirmation exists for this task - a
+        plain lookup, not a task-identity check (never raises
+        TaskNotFoundError for an unknown task_id)."""
+
+        row = self._conn.execute(
+            f"SELECT {_PENDING_CONFIRMATION_SELECT_COLUMNS} FROM task_pending_confirmation "
+            "WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_pending_confirmation(row)
+
+    def consume_confirmation_and_claim_step(
+        self,
+        task_id: str,
+        confirmation_id: str,
+        step_position: int,
+        action_name: str,
+        resource_key: str | None,
+        *,
+        reason_code: str | None = None,
+        safe_summary: str | None = None,
+    ) -> TaskRecord:
+        """The approval path's atomic consume+claim - the replay-prevention
+        boundary. Requires the task to be WAITING_FOR_CONFIRMATION and the
+        pending confirmation to match EXACTLY (confirmation_id,
+        step_position, action_name, resource_key) and be unexpired.
+        Atomically: delete the pending confirmation, transition
+        WAITING_FOR_CONFIRMATION -> RUNNING, and claim step_position as
+        in_progress - all in one transaction, all before any external
+        execution may occur.
+
+        A duplicate/second approval attempt (even with the exact same
+        confirmation_id) can never claim or execute the step twice: after
+        the first successful call, the pending row is gone and the task is
+        no longer WAITING_FOR_CONFIRMATION, so a second call fails closed
+        with NoPendingConfirmationError or InvalidTransitionError before
+        it ever reaches the claim step - see this method's own race
+        handling below, identical in shape to every other conditional
+        transition in this class."""
+
+        confirmation_id = _validate_confirmation_id(confirmation_id)
+        step_position = _validate_step_position(step_position)
+        conn = self._conn
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            _require_task_state(actual_state, TaskState.WAITING_FOR_CONFIRMATION)
+
+            pending_row = conn.execute(
+                f"SELECT {_PENDING_CONFIRMATION_SELECT_COLUMNS} FROM task_pending_confirmation "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if pending_row is None:
+                raise NoPendingConfirmationError(task_id)
+            pending = _row_to_pending_confirmation(pending_row)
+
+            if (
+                pending.confirmation_id != confirmation_id
+                or pending.step_position != step_position
+                or pending.action_name != action_name
+                or pending.resource_key != resource_key
+            ):
+                raise ConfirmationMismatchError(task_id)
+
+            # A real chronological comparison of parsed, timezone-aware
+            # datetimes - never a lexical string comparison of the two
+            # ISO-8601 strings (see parse_task_timestamp()'s own
+            # docstring for why that is not safe for an authorization-
+            # expiry decision). A malformed persisted expires_at fails
+            # closed as TaskStorageCorruptError here, propagated
+            # uncaught - never silently treated as "not yet expired".
+            if now_dt > parse_task_timestamp(pending.expires_at, "expires_at"):
+                raise ConfirmationExpiredError(task_id)
+
+            conn.execute("DELETE FROM task_pending_confirmation WHERE task_id = ?", (task_id,))
+
+            task_cursor = conn.execute(
+                "UPDATE tasks SET state = ?, updated_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND state = ?",
+                (
+                    TaskState.RUNNING.value,
+                    now,
+                    task_id,
+                    TaskState.WAITING_FOR_CONFIRMATION.value,
+                ),
+            )
+            if task_cursor.rowcount == 0:
+                row2 = conn.execute(
+                    "SELECT state FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row2 is None:
+                    raise TaskNotFoundError(task_id)
+                _require_task_state(row2[0], TaskState.WAITING_FOR_CONFIRMATION)
+                raise InvalidTransitionError(
+                    f"task {task_id} is no longer waiting for confirmation"
+                )
+
+            new_version = current_version + 1
+            conn.execute(
+                "INSERT INTO task_transitions ("
+                "task_id, from_state, to_state, timestamp, reason_code, "
+                "safe_summary, task_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    TaskState.WAITING_FOR_CONFIRMATION.value,
+                    TaskState.RUNNING.value,
+                    now,
+                    reason_code,
+                    safe_summary,
+                    new_version,
+                ),
+            )
+
+            conn.execute(
+                "INSERT INTO task_step_progress "
+                "(task_id, step_position, status, started_at, task_version) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, step_position, StepStatus.IN_PROGRESS.value, now, new_version),
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.execute("ROLLBACK")
+            raise StepAlreadyClaimedError(
+                f"step {step_position} of task {task_id} has already been claimed"
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_task(task_id)
+
+    def deny_confirmation(
+        self,
+        task_id: str,
+        confirmation_id: str,
+        *,
+        reason_code: str = "confirmation_denied",
+        safe_summary: str | None = None,
+    ) -> TaskRecord:
+        """WAITING_FOR_CONFIRMATION -> CANCELLED, consuming the pending
+        confirmation atomically. No replanning: this is a plain
+        cancellation, not a request for a different action."""
+
+        reason_code = _validate_bounded_text(reason_code, "reason_code", 1, MAX_REASON_CODE_CHARS)
+        safe_summary = _validate_optional_bounded_text(
+            safe_summary, "safe_summary", MAX_SAFE_SUMMARY_CHARS
+        )
+        return self._resolve_pending_confirmation(
+            task_id,
+            confirmation_id,
+            TaskState.CANCELLED,
+            reason_code=reason_code,
+            safe_summary=safe_summary,
+        )
+
+    def fail_pending_confirmation(
+        self,
+        task_id: str,
+        confirmation_id: str,
+        failure_code: str,
+        failure_summary: str,
+    ) -> TaskRecord:
+        """WAITING_FOR_CONFIRMATION -> FAILED, consuming the pending
+        confirmation atomically. Used both for an expired confirmation and
+        for one whose action/resource is no longer valid at approval time
+        (kernel/task_execution/service.py owns both fixed, code-authored
+        failure_code/failure_summary values - this method never invents
+        them itself, matching mark_failed()'s own contract)."""
+
+        failure_code = _validate_bounded_text(
+            failure_code, "failure_code", 1, MAX_FAILURE_CODE_CHARS
+        )
+        failure_summary = _validate_bounded_text(
+            failure_summary, "failure_summary", 1, MAX_FAILURE_SUMMARY_CHARS
+        )
+        return self._resolve_pending_confirmation(
+            task_id,
+            confirmation_id,
+            TaskState.FAILED,
+            reason_code=failure_code,
+            safe_summary=failure_summary,
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+        )
+
+    def _resolve_pending_confirmation(
+        self,
+        task_id: str,
+        confirmation_id: str,
+        target_state: TaskState,
+        *,
+        reason_code: str | None,
+        safe_summary: str | None,
+        failure_code: str | None = None,
+        failure_summary: str | None = None,
+    ) -> TaskRecord:
+        """Shared by deny_confirmation() (-> CANCELLED) and
+        fail_pending_confirmation() (-> FAILED): verify the pending
+        confirmation's confirmation_id matches exactly, delete it, and
+        transition WAITING_FOR_CONFIRMATION -> target_state - all
+        atomically, mirroring _apply_transition()'s own race-handling
+        shape."""
+
+        confirmation_id = _validate_confirmation_id(confirmation_id)
+        conn = self._conn
+        now = _now()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            _require_task_state(actual_state, TaskState.WAITING_FOR_CONFIRMATION)
+
+            pending_row = conn.execute(
+                "SELECT confirmation_id FROM task_pending_confirmation WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if pending_row is None:
+                raise NoPendingConfirmationError(task_id)
+            if pending_row[0] != confirmation_id:
+                raise ConfirmationMismatchError(task_id)
+
+            conn.execute("DELETE FROM task_pending_confirmation WHERE task_id = ?", (task_id,))
+
+            set_clauses = ["state = ?", "updated_at = ?", "completed_at = ?", "version = version + 1"]
+            params: list = [target_state.value, now, now]
+            if failure_code is not None:
+                set_clauses.append("failure_code = ?")
+                params.append(failure_code)
+            if failure_summary is not None:
+                set_clauses.append("failure_summary = ?")
+                params.append(failure_summary)
+
+            task_cursor = conn.execute(
+                f"UPDATE tasks SET {', '.join(set_clauses)} WHERE task_id = ? AND state = ?",
+                (*params, task_id, TaskState.WAITING_FOR_CONFIRMATION.value),
+            )
+            if task_cursor.rowcount == 0:
+                row2 = conn.execute(
+                    "SELECT state FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if row2 is None:
+                    raise TaskNotFoundError(task_id)
+                _require_task_state(row2[0], TaskState.WAITING_FOR_CONFIRMATION)
+                raise InvalidTransitionError(
+                    f"task {task_id} is no longer waiting for confirmation"
+                )
+
+            new_version = current_version + 1
+            conn.execute(
+                "INSERT INTO task_transitions ("
+                "task_id, from_state, to_state, timestamp, reason_code, "
+                "safe_summary, task_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    TaskState.WAITING_FOR_CONFIRMATION.value,
+                    target_state.value,
+                    now,
+                    reason_code,
+                    safe_summary,
+                    new_version,
+                ),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return self.get_task(task_id)
 
     def _finalize_step(
         self,

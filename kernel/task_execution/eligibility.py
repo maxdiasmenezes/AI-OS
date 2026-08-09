@@ -83,35 +83,92 @@ _RESOURCE_FIELD_BY_ACTION = {
 }
 
 
-def _revalidate_action_step(
-    step: PlanStep, registry: ActionRegistry, tools_config: ToolsConfig
+def revalidate_action(
+    action_name: str,
+    resource_key: str | None,
+    registry: ActionRegistry,
+    tools_config: ToolsConfig,
 ) -> bool:
-    """True only if step.action_name/step.resource_key still resolve
-    exactly against the CURRENT registry/config - no substitution, no
-    fuzzy matching, no fallback to any other configured resource.
-    step.catalog_id is never consulted here."""
+    """True only if `action_name`/`resource_key` still resolve exactly
+    against the CURRENT registry/config - no substitution, no fuzzy
+    matching, no fallback to any other configured resource. A step's
+    catalog_id is never consulted here or by any caller of this function.
 
-    if not registry.is_known(step.action_name):
+    Public (not module-private) because kernel/task_execution/service.py
+    (Milestone 42 P2) reuses this exact check at confirmation-approval
+    time (see approve_task_confirmation()) - the durable pending
+    confirmation row only carries action_name/resource_key, not a full
+    PlanStep, so this function takes the two raw values directly rather
+    than a PlanStep, decoupling it from evaluate_next_step()'s own
+    call site below (which still calls it with a real step's fields)."""
+
+    if not registry.is_known(action_name):
         return False
 
     descriptor = next(
-        (d for d in registry.descriptors() if d.name == step.action_name), None
+        (d for d in registry.descriptors() if d.name == action_name), None
     )
     if descriptor is None:
         return False
 
     if descriptor.resource_key_requirement is ResourceKeyRequirement.FORBIDDEN:
-        return step.resource_key is None
+        return resource_key is None
 
-    if step.resource_key is None:
+    if resource_key is None:
         return False
 
-    resource_field = _RESOURCE_FIELD_BY_ACTION.get(step.action_name)
+    resource_field = _RESOURCE_FIELD_BY_ACTION.get(action_name)
     if resource_field is None:
         return False
 
     configured_resources = getattr(tools_config, resource_field)
-    return step.resource_key in configured_resources
+    return resource_key in configured_resources
+
+
+def resolve_persisted_plan_step(
+    task: TaskRecord, position: int
+) -> PlanStep | PlanIntegrityFailure | PlanDeserializationFailure:
+    """Deserialize task.plan_json, verify plan.task_id == task.task_id,
+    and locate exactly the PlanStep at `position` in the persisted plan -
+    the smallest pure "resolve one step from the persisted plan"
+    operation, factored out for reuse by
+    kernel.task_execution.service.approve_task_confirmation() (Milestone
+    42 P2 correction): a durable task_pending_confirmation row is a record
+    of a confirmation PROPOSAL, never execution authority by itself -
+    approval must re-bind it to the IMMUTABLE persisted TaskPlan before
+    treating any of its fields as authoritative, exactly like
+    evaluate_next_step() already does for the non-sensitive path below.
+
+    Deliberately not used internally by evaluate_next_step() itself - that
+    function's own inline plan-resolution logic performs the identical
+    deserialize/task_id checks as one step of its larger eligibility scan
+    (which also needs the FULL step list, not just one position); sharing
+    this helper there would not simplify anything and is out of scope for
+    this correction (no behavior change, no broad refactor for aesthetics
+    alone - see this package's own "small, focused changes" doctrine)."""
+
+    if task.plan_json is None:
+        return PlanIntegrityFailure(detail="task has no persisted plan")
+
+    try:
+        plan = deserialize_plan(task.plan_json)
+    except PlanDeserializationError:
+        return PlanDeserializationFailure(
+            detail="task.plan_json is not a valid serialized plan"
+        )
+
+    if plan.task_id != task.task_id:
+        return PlanIntegrityFailure(
+            detail="persisted plan's task_id does not match the task record"
+        )
+
+    for step in plan.steps:
+        if step.position == position:
+            return step
+
+    return PlanIntegrityFailure(
+        detail=f"persisted plan has no step at position {position}"
+    )
 
 
 def evaluate_next_step(
@@ -175,7 +232,7 @@ def evaluate_next_step(
             )
 
         if step.kind is StepKind.ACTION:
-            if not _revalidate_action_step(step, registry, tools_config):
+            if not revalidate_action(step.action_name, step.resource_key, registry, tools_config):
                 return ActionRevalidationFailure(
                     step_position=step.position,
                     action_name=step.action_name,

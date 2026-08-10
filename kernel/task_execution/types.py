@@ -70,7 +70,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from kernel.employee_tasks import TaskRecord
-from kernel.task_planner import PlanStep
+from kernel.task_planner import MAX_PLAN_STEPS, PlanStep
 
 
 class EligibilityBlockReason(Enum):
@@ -165,6 +165,43 @@ EligibilityOutcome = (
 # UX/configuration of this value once confirmations are actually delivered
 # over WhatsApp - this constant only establishes P2's safety semantics.
 TASK_CONFIRMATION_TTL_SECONDS = 120.0
+
+# Milestone 42 P3: an EARLY, raw-text bound on RESPOND's synthesized
+# response, checked before any persistence attempt is even built (see
+# respond.py's _validate_response_text()) - this alone rejects a response
+# that is oversized in its own right, before it is ever wrapped in a
+# StepObservation. IMPORTANT: this raw character count does NOT by itself
+# guarantee the resulting StepObservation fits within
+# MAX_STEP_RESULT_JSON_CHARS once serialized - json.dumps() escaping
+# (quotes -> \", backslashes -> \\, and most control characters -> a
+# 6-character \uXXXX sequence) can expand a string's serialized length
+# substantially; a string of 3,800 quote characters, for example,
+# serializes to roughly 7,600 characters, well past the 4,096-character
+# result_json bound, even though every individual character was ASCII and
+# within this bound. The AUTHORITATIVE persistence bound is always
+# len(serialize_observation(observation)) <= MAX_STEP_RESULT_JSON_CHARS,
+# checked explicitly and separately by service.py's RESPOND success path,
+# which fails the step/task closed with respond_invalid_output if
+# serialize_observation() raises ObservationSerializationError, rather
+# than ever persisting a truncated or partial observation - see
+# service.py's own RESPOND handling and test_service.py's escaping-bound
+# tests. This raw bound remains a useful, cheap, early rejection for a
+# response that is simply too long on its own; it is never treated as a
+# substitute for the real serialized-size check.
+MAX_RESPOND_TEXT_CHARS = 3800
+
+# Milestone 42 P3: the bounded autonomous runner's hard step-advance limit
+# (service.py's run_task_until_blocked()). A plan of MAX_PLAN_STEPS steps
+# (kernel.task_planner.types.MAX_PLAN_STEPS - the planner's own maximum
+# plan size) needs at most MAX_PLAN_STEPS successful advances (one per
+# step) plus exactly one further advance to observe AllStepsComplete ->
+# COMPLETED - so this bound is derived directly from, and stays in lock
+# step with, that existing maximum rather than an arbitrary headroom
+# number: every valid maximum-size plan can always finish inside this
+# bound, and a logic bug cannot spin extra successful advances beyond what
+# any valid plan could ever legitimately need before the bound trips and
+# fails the task closed.
+MAX_EXECUTION_ADVANCES = MAX_PLAN_STEPS + 1
 
 
 class ExecutionAdvanceStatus(Enum):

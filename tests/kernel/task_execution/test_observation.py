@@ -11,6 +11,7 @@ from kernel.task_execution.observation import (
     ObservationSerializationError,
     StepObservation,
     build_action_observation,
+    build_respond_observation,
     deserialize_observation,
     serialize_observation,
 )
@@ -109,6 +110,51 @@ def test_deserialize_observation_never_raises_arbitrary_exception_types():
     for raw in garbage_inputs:
         with pytest.raises(ObservationDeserializationError):
             deserialize_observation(raw)
+
+
+def test_build_respond_observation_success_uses_fixed_symbolic_outcome():
+    observation = build_respond_observation(
+        4,
+        success=True,
+        safe_summary="Your backup completed successfully.",
+        failure_code=None,
+        completed_at="2026-08-08T00:00:00+00:00",
+    )
+
+    assert observation.observation_version == OBSERVATION_VERSION
+    assert observation.step_position == 4
+    assert observation.step_kind == StepKind.RESPOND
+    assert observation.success is True
+    assert observation.safe_summary == "Your backup completed successfully."
+    assert observation.failure_code is None
+    assert observation.action_outcome == "response_synthesized"
+    assert observation.completed_at == "2026-08-08T00:00:00+00:00"
+
+
+def test_build_respond_observation_failure_reuses_failure_code_for_action_outcome():
+    observation = build_respond_observation(
+        2,
+        success=False,
+        safe_summary="The response could not be generated.",
+        failure_code="respond_provider_unavailable",
+        completed_at="2026-08-08T00:00:00+00:00",
+    )
+
+    assert observation.success is False
+    assert observation.failure_code == "respond_provider_unavailable"
+    assert observation.action_outcome == "respond_provider_unavailable"
+
+
+def test_respond_observation_round_trips_through_serialize_deserialize():
+    observation = build_respond_observation(
+        1,
+        success=True,
+        safe_summary="Done.",
+        failure_code=None,
+        completed_at="2026-08-08T00:00:00+00:00",
+    )
+    raw = serialize_observation(observation)
+    assert deserialize_observation(raw) == observation
 
 
 def test_step_observation_is_frozen():

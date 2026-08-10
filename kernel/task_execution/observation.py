@@ -1,8 +1,9 @@
 """
-StepObservation: the durable, bounded record of one ACTION step's
-execution result (Milestone 42 P2), and its deterministic serialize/
-deserialize pair - matching kernel/task_planner/serialization.py's exact
-discipline for TaskPlan.
+StepObservation: the durable, bounded record of one plan step's execution
+result - an ACTION step's (Milestone 42 P2) or a RESPOND step's
+(Milestone 42 P3) - and its deterministic serialize/deserialize pair -
+matching kernel/task_planner/serialization.py's exact discipline for
+TaskPlan.
 
 kernel.tools.executor.SafeTaskExecutor.execute() already returns
 ActionResult(success, message, outcome) - message is already the
@@ -13,7 +14,12 @@ fixed, bounded, machine-readable outcome codes ("executed", "failed",
 "rejected", "timed_out", ...). build_action_observation() reuses both
 fields exactly as given - it never inspects, reformats, or adds to them,
 and never accepts or stores anything beyond what SafeTaskExecutor already
-decided was safe to hand back.
+decided was safe to hand back. build_respond_observation() (Milestone 42
+P3) is the equivalent mapping for a RESPOND step: its `safe_summary` is
+either the synthesized response text (kernel.task_execution.respond
+already validated and bounded it) or a fixed, code-authored failure
+summary - never raw model output, a provider exception, or unvalidated
+text.
 
 Deliberately two distinct failure concerns, kept apart on purpose (mirrors
 kernel/task_planner/serialization.py's own PlanSerializationError/
@@ -99,6 +105,46 @@ def build_action_observation(
         safe_summary=result.message,
         failure_code=None if result.success else result.outcome,
         action_outcome=result.outcome,
+        completed_at=completed_at,
+    )
+
+
+_RESPOND_SUCCESS_OUTCOME = "response_synthesized"
+
+
+def build_respond_observation(
+    step_position: int,
+    *,
+    success: bool,
+    safe_summary: str,
+    failure_code: str | None,
+    completed_at: str,
+) -> StepObservation:
+    """The one mapping from a RESPOND step's synthesis outcome (Milestone
+    42 P3 - see respond.py) to a durable StepObservation - mirrors
+    build_action_observation()'s exact shape and discipline for the
+    RESPOND step kind. Unlike an ACTION step, a RESPOND step has no
+    ActionResult/audit outcome code of its own to reuse for
+    `action_outcome` (a field this dataclass still requires regardless of
+    step kind - see StepObservation's own docstring) -
+    `_RESPOND_SUCCESS_OUTCOME` is this module's own fixed, code-authored
+    symbolic value for a successful synthesis; a failure reuses
+    `failure_code` for `action_outcome`, exactly like
+    build_action_observation() already reuses ActionResult.outcome for
+    both fields on its own failure path. `safe_summary` is the caller's
+    already-validated/bounded text (the synthesized response on success,
+    a fixed code-authored failure summary on failure) - this function
+    never validates or bounds it itself, exactly like
+    build_action_observation() never re-validates ActionResult.message."""
+
+    return StepObservation(
+        observation_version=OBSERVATION_VERSION,
+        step_position=step_position,
+        step_kind=StepKind.RESPOND,
+        success=success,
+        safe_summary=safe_summary,
+        failure_code=None if success else failure_code,
+        action_outcome=_RESPOND_SUCCESS_OUTCOME if success else failure_code,
         completed_at=completed_at,
     )
 

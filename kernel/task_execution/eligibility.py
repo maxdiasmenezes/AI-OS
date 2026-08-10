@@ -44,6 +44,26 @@ not-started step's declared dependencies are therefore re-checked
 explicitly, directly against durable step progress, independent of scan
 order.
 
+PLAN SIZE INTEGRITY (Milestone 42 P3 correction): kernel.task_planner's own
+MAX_PLAN_STEPS bound is enforced only at PLAN-PARSE time
+(kernel.task_planner.parser.parse_plan_response() - never re-checked by
+kernel.task_planner.serialization.deserialize_plan(), which validates only
+JSON shape, not step count). A persisted plan_json is therefore NOT
+guaranteed to still respect that bound by the time this module reads it
+back - a hand-crafted or corrupted row could contain more steps than the
+planner itself could ever produce. Both evaluate_next_step() and
+resolve_persisted_plan_step() re-check `len(plan.steps) <= MAX_PLAN_STEPS`
+immediately after deserializing, using the SAME PlanIntegrityFailure this
+module already returns for a task_id mismatch (an oversized plan is the
+same category of concern - the persisted plan's own identity/structure
+cannot be trusted - not a new one) - BEFORE any step is ever selected,
+claimed, or executed. This is a pure, deterministic execution-integrity
+check, never a substitute for kernel.task_execution.service.
+run_task_until_blocked()'s own, independent MAX_EXECUTION_ADVANCES loop-
+safety bound (a different concern: preventing unbounded LOOPING through an
+otherwise-valid plan, not validating the plan's own size) - see that
+function's own docstring.
+
 Not implemented here (later milestones): claiming a step, calling
 kernel.tools.SafeTaskExecutor, creating or consuming a confirmation,
 calling a model for a RESPOND step, or advancing task state at all.
@@ -52,7 +72,7 @@ calling a model for a RESPOND step, or advancing task state at all.
 from collections.abc import Sequence
 
 from kernel.employee_tasks import StepStatus, TaskRecord, TaskStepProgress
-from kernel.task_planner import PlanDeserializationError, PlanStep, StepKind, deserialize_plan
+from kernel.task_planner import MAX_PLAN_STEPS, PlanDeserializationError, PlanStep, StepKind, deserialize_plan
 from kernel.task_execution.types import (
     ActionRevalidationFailure,
     AllStepsComplete,
@@ -162,6 +182,11 @@ def resolve_persisted_plan_step(
             detail="persisted plan's task_id does not match the task record"
         )
 
+    if len(plan.steps) > MAX_PLAN_STEPS:
+        return PlanIntegrityFailure(
+            detail="persisted plan exceeds the maximum allowed step count"
+        )
+
     for step in plan.steps:
         if step.position == position:
             return step
@@ -198,6 +223,11 @@ def evaluate_next_step(
     if plan.task_id != task.task_id:
         return PlanIntegrityFailure(
             detail="persisted plan's task_id does not match the task record"
+        )
+
+    if len(plan.steps) > MAX_PLAN_STEPS:
+        return PlanIntegrityFailure(
+            detail="persisted plan exceeds the maximum allowed step count"
         )
 
     progress_by_position = {record.step_position: record for record in step_progress}

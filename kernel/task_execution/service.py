@@ -1,16 +1,24 @@
 """
 advance_task_execution() / approve_task_confirmation() /
 deny_task_confirmation(): Milestone 42 P2's one-step-at-a-time execution
-primitive.
+primitive. run_task_until_blocked() (Milestone 42 P3): the bounded
+autonomous driver over that same primitive.
 
 Mirrors kernel/task_orchestration/service.py's own discipline: no internal
-loop (advance_task_execution() processes exactly one plan step, or one
-confirmation lifecycle event, per call - never more), every dependency
-(TaskRepository, ActionRegistry, ToolsConfig, SafeTaskExecutor) is
-explicitly injected by the caller, never constructed here. This module
-never opens a database connection, never loads kernel/config/tools.yaml,
-never constructs an ActionRegistry/ToolsConfig/SafeTaskExecutor, and never
+loop in advance_task_execution() itself (it processes exactly one plan
+step, or one confirmation lifecycle event, per call - never more), every
+dependency (TaskRepository, ActionRegistry, ToolsConfig, SafeTaskExecutor,
+and - Milestone 42 P3 - a conversational ModelProvider) is explicitly
+injected by the caller, never constructed here. This module never opens a
+database connection, never loads kernel/config/tools.yaml, never
+constructs an ActionRegistry/ToolsConfig/SafeTaskExecutor, and never
 constructs a model provider - callers build all of that and pass it in.
+The injected ModelProvider is never kernel.task_planner's gemma3:12b
+structured-planner provider and is never called to plan or re-plan
+anything - see kernel/task_execution/respond.py's own docstring for the
+full model-role-separation contract; this module only ever passes that
+provider through to synthesize_response(), never calls
+ModelProvider.send_prompt() itself.
 
 kernel.task_execution.eligibility.evaluate_next_step() (Milestone 42 P1)
 remains the sole source of "what step is next and is it currently valid" -
@@ -33,12 +41,31 @@ never execution authority by itself: its action_name/resource_key/
 step_position are correlation/check values only, never the source an
 ActionRequest is built from.
 
-RESPOND steps are not supported yet (Milestone 42 P3): an eligible RESPOND
-step fails the task closed with a fixed code
-(_RESPOND_NOT_SUPPORTED_FAILURE_CODE) and calls no model. No runtime/
-interface/WhatsApp wiring exists here or anywhere in this package -
-nothing calls advance_task_execution()/approve_task_confirmation()/
+RESPOND steps (Milestone 42 P3): an eligible RESPOND step is claimed
+through the exact same claim_step() boundary as a non-sensitive ACTION
+step, then synthesized via kernel.task_execution.respond.synthesize_response()
+using the injected ModelProvider - see that module's own docstring for the
+full input/validation contract. A RESPOND step never requires confirmation
+(eligibility.py always reports currently_sensitive=False for one - see
+that module's own docstring) and is never itself sensitive; its own
+success/failure is persisted through the identical StepObservation/
+task_step_progress mechanism ACTION steps already use (see
+observation.py's build_respond_observation()). No runtime/interface/
+WhatsApp wiring exists here or anywhere in this package - nothing calls
+advance_task_execution()/run_task_until_blocked()/approve_task_confirmation()/
 deny_task_confirmation() from a real request as of this milestone.
+
+run_task_until_blocked() (Milestone 42 P3) performs ALL NORMAL execution
+progression exclusively through advance_task_execution() - it never
+selects a step, never claims a step, never calls SafeTaskExecutor or
+ModelProvider directly, never manages a confirmation, never alters or
+replans the persisted TaskPlan, and never completes a task itself. Its ONE
+permitted direct repository mutation is the code-owned safety failure
+issued when MAX_EXECUTION_ADVANCES is exhausted (RUNNING -> FAILED,
+execution_advance_limit_exceeded) - a bounded-loop safety measure, never
+an execution or planning decision - see that function's own docstring for
+its exact stopping conditions and this one exception to "only
+advance_task_execution()".
 
 CANCELLATION SEMANTICS (see module docstring in
 kernel/employee_tasks/repository.py's claim_step()/propose_confirmation()
@@ -76,12 +103,26 @@ from kernel.employee_tasks import (
     TaskState,
     parse_task_timestamp,
 )
+from kernel.models.base import ModelProvider
 from kernel.task_execution.eligibility import (
     evaluate_next_step,
     resolve_persisted_plan_step,
     revalidate_action,
 )
-from kernel.task_execution.observation import build_action_observation, serialize_observation
+from kernel.task_execution.observation import (
+    ObservationSerializationError,
+    build_action_observation,
+    build_respond_observation,
+    serialize_observation,
+)
+from kernel.task_execution.respond import (
+    RespondContextTooLargeFailure,
+    RespondDependencyFailure,
+    RespondInvalidOutputFailure,
+    RespondProviderFailure,
+    RespondSuccess,
+    synthesize_response,
+)
 from kernel.task_execution.types import (
     ActionRevalidationFailure,
     AllStepsComplete,
@@ -90,11 +131,12 @@ from kernel.task_execution.types import (
     EligibleStep,
     ExecutionAdvanceResult,
     ExecutionAdvanceStatus,
+    MAX_EXECUTION_ADVANCES,
     PlanDeserializationFailure,
     PlanIntegrityFailure,
     TASK_CONFIRMATION_TTL_SECONDS,
 )
-from kernel.task_planner import StepKind
+from kernel.task_planner import PlanStep, StepKind
 from kernel.tools.config import ToolsConfig
 from kernel.tools.executor import SafeTaskExecutor
 from kernel.tools.registry import ActionRegistry
@@ -167,9 +209,29 @@ _ACTION_REVALIDATION_FAILURE_SUMMARY = (
     "The next step's action/resource is no longer valid in the current configuration."
 )
 
-_RESPOND_NOT_SUPPORTED_FAILURE_CODE = "respond_step_not_supported"
-_RESPOND_NOT_SUPPORTED_FAILURE_SUMMARY = (
-    "RESPOND steps are not yet supported by the execution engine."
+_RESPOND_DEPENDENCY_FAILURE_CODE = "respond_dependency_integrity_violation"
+_RESPOND_DEPENDENCY_FAILURE_SUMMARY = (
+    "A dependency this response relies on could not be durably verified."
+)
+
+_RESPOND_PROVIDER_UNAVAILABLE_FAILURE_CODE = "respond_provider_unavailable"
+_RESPOND_PROVIDER_UNAVAILABLE_FAILURE_SUMMARY = (
+    "The response could not be generated because the model provider was unavailable."
+)
+
+_RESPOND_INVALID_OUTPUT_FAILURE_CODE = "respond_invalid_output"
+_RESPOND_INVALID_OUTPUT_FAILURE_SUMMARY = (
+    "The generated response did not meet the required format or size."
+)
+
+_RESPOND_CONTEXT_TOO_LARGE_FAILURE_CODE = "respond_context_too_large"
+_RESPOND_CONTEXT_TOO_LARGE_FAILURE_SUMMARY = (
+    "The combined task/step/dependency context was too large to synthesize a response from."
+)
+
+_EXECUTION_ADVANCE_LIMIT_EXCEEDED_FAILURE_CODE = "execution_advance_limit_exceeded"
+_EXECUTION_ADVANCE_LIMIT_EXCEEDED_FAILURE_SUMMARY = (
+    "Execution stopped after reaching the maximum number of automatic advances."
 )
 
 _CONFIRMATION_PROPOSED_REASON_CODE = "confirmation_proposed"
@@ -229,6 +291,68 @@ def _terminal_result(task: TaskRecord) -> ExecutionAdvanceResult:
     return ExecutionAdvanceResult(task, _TERMINAL_STATUS_BY_STATE[task.state])
 
 
+def _finalize_step_success(
+    task_id: str,
+    repository: TaskRepository,
+    step_position: int,
+    observation_json: str,
+    detail: str | None,
+) -> ExecutionAdvanceResult:
+    """Shared by every already-claimed step's success path, regardless of
+    step kind: persist the step as durably succeeded, then re-fetch the
+    task fresh (never trust a value computed before the step's own work
+    finished, since a concurrent writer may have moved the task to a
+    terminal state while that work was in flight - see module docstring's
+    cancellation-semantics section)."""
+
+    repository.mark_step_succeeded(task_id, step_position, observation_json)
+    current = repository.get_task(task_id)
+    if current.state is TaskState.RUNNING:
+        return ExecutionAdvanceResult(current, ExecutionAdvanceStatus.STEP_SUCCEEDED, detail)
+    # The task moved on (e.g. CANCELLED) while the step's own work was in
+    # flight - the step's own success is still durably recorded above, but
+    # the task's actual current terminal state is what gets reported here,
+    # never a fabricated STEP_SUCCEEDED.
+    return _terminal_result(current)
+
+
+def _finalize_step_failure(
+    task_id: str,
+    repository: TaskRepository,
+    step_position: int,
+    failure_code: str,
+    failure_summary: str,
+    observation_json: str,
+) -> ExecutionAdvanceResult:
+    """Shared by every already-claimed step's failure path, regardless of
+    step kind: atomically fail the step AND the RUNNING task together
+    (fail_running_step()) - unless a concurrent writer already moved the
+    task to a terminal state (e.g. CANCELLED) since the step was claimed,
+    in which case the step's own outcome must still not be lost, but the
+    task itself must never be overwritten (see module docstring's
+    cancellation-semantics section)."""
+
+    try:
+        failed_task = repository.fail_running_step(
+            task_id,
+            step_position,
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+            result_json=observation_json,
+        )
+        return ExecutionAdvanceResult(failed_task, ExecutionAdvanceStatus.TASK_FAILED, failure_code)
+    except TaskAlreadyTerminalError:
+        repository.mark_step_failed(
+            task_id,
+            step_position,
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+            result_json=observation_json,
+        )
+        current = repository.get_task(task_id)
+        return _terminal_result(current)
+
+
 def _finalize_action_step(
     task_id: str,
     repository: TaskRepository,
@@ -237,52 +361,49 @@ def _finalize_action_step(
 ) -> ExecutionAdvanceResult:
     """Shared by the non-sensitive execution path and the post-approval
     execution path: build and persist the step's StepObservation, then
-    propagate success/failure to the task. Always re-fetches the task
-    fresh after mutating - never trusts a value computed before the
-    executor call, since a concurrent writer may have moved the task to a
-    terminal state while SafeTaskExecutor.execute() was in flight (see
-    module docstring's cancellation-semantics section)."""
+    propagate success/failure to the task via the shared
+    _finalize_step_success()/_finalize_step_failure() helpers (Milestone
+    42 P3: these were factored out of what used to be this function's own
+    body so kernel/task_execution/service.py's RESPOND path - see
+    _process_running_task() below - can share the exact same claim/
+    cancellation-safe finalization mechanics, unchanged, rather than
+    duplicating them)."""
 
     completed_at = _now_iso()
     observation = build_action_observation(step_position, result, completed_at)
     observation_json = serialize_observation(observation)
 
     if result.success:
-        repository.mark_step_succeeded(task_id, step_position, observation_json)
-        current = repository.get_task(task_id)
-        if current.state is TaskState.RUNNING:
-            return ExecutionAdvanceResult(current, ExecutionAdvanceStatus.STEP_SUCCEEDED, result.outcome)
-        # The task moved on (e.g. CANCELLED) while the action was
-        # in flight - the step's own success is still durably recorded
-        # above, but the task's actual current terminal state is what
-        # gets reported here, never a fabricated STEP_SUCCEEDED.
-        return _terminal_result(current)
+        return _finalize_step_success(task_id, repository, step_position, observation_json, result.outcome)
+    return _finalize_step_failure(
+        task_id, repository, step_position, result.outcome, result.message, observation_json
+    )
 
-    try:
-        failed_task = repository.fail_running_step(
-            task_id,
-            step_position,
-            failure_code=result.outcome,
-            failure_summary=result.message,
-            result_json=observation_json,
-        )
-        return ExecutionAdvanceResult(failed_task, ExecutionAdvanceStatus.TASK_FAILED, result.outcome)
-    except TaskAlreadyTerminalError:
-        # The task already moved to a terminal state (e.g. CANCELLED) by a
-        # concurrent writer between claim and this point - the
-        # already-authorized action still ran and its outcome must not be
-        # lost, but the task itself must not be overwritten. Finalize just
-        # the step, for audit/recovery, and report the task's actual
-        # (unchanged) terminal state.
-        repository.mark_step_failed(
-            task_id,
-            step_position,
-            failure_code=result.outcome,
-            failure_summary=result.message,
-            result_json=observation_json,
-        )
-        current = repository.get_task(task_id)
-        return _terminal_result(current)
+
+def _finalize_respond_failure(
+    task_id: str,
+    repository: TaskRepository,
+    step_position: int,
+    failure_code: str,
+    failure_summary: str,
+) -> ExecutionAdvanceResult:
+    """Build a RESPOND failure StepObservation from a fixed, code-authored
+    failure_code/failure_summary (never model output or exception text -
+    see respond.py's own docstring on why every RespondOutcome failure
+    variant is mapped to exactly one of a small, fixed set of these), then
+    finalize it through the same shared path every other step failure
+    uses."""
+
+    completed_at = _now_iso()
+    observation = build_respond_observation(
+        step_position,
+        success=False,
+        safe_summary=failure_summary,
+        failure_code=failure_code,
+        completed_at=completed_at,
+    )
+    observation_json = serialize_observation(observation)
+    return _finalize_step_failure(task_id, repository, step_position, failure_code, failure_summary, observation_json)
 
 
 def _process_running_task(
@@ -291,6 +412,7 @@ def _process_running_task(
     registry: ActionRegistry,
     tools_config: ToolsConfig,
     executor: SafeTaskExecutor,
+    model_provider: ModelProvider,
 ) -> ExecutionAdvanceResult:
     """Process exactly one unit of work for a task already RUNNING - never
     more than one plan step (or one confirmation proposal) per call.
@@ -352,18 +474,119 @@ def _process_running_task(
     plan_step = step.step
 
     if plan_step.kind is StepKind.RESPOND:
-        # Milestone 42 P2 does not support RESPOND yet - see module
-        # docstring. No model call. This temporary behavior disappears in
-        # Milestone 42 P3.
-        failed_task = repository.mark_failed(
-            task_id,
-            TaskState.RUNNING,
-            _RESPOND_NOT_SUPPORTED_FAILURE_CODE,
-            _RESPOND_NOT_SUPPORTED_FAILURE_SUMMARY,
-        )
-        return ExecutionAdvanceResult(
-            failed_task, ExecutionAdvanceStatus.TASK_FAILED, _RESPOND_NOT_SUPPORTED_FAILURE_CODE
-        )
+        # Milestone 42 P3: claim first, exactly like the non-sensitive
+        # ACTION path below - claim_step() itself requires the task to
+        # still be RUNNING (P1); if a concurrent writer already moved it
+        # on, this raises and propagates uncaught, and synthesize_response()
+        # is never called (mirrors the ACTION path's own claim-first
+        # discipline - see module docstring's cancellation-semantics
+        # section).
+        repository.claim_step(task_id, plan_step.position)
+
+        # Resolve every declared dependency's PERSISTED PlanStep (never
+        # the durable observation alone) so synthesize_response() can
+        # verify each dependency observation's step_kind against what the
+        # plan actually says - task.plan_json is immutable/write-once
+        # (see kernel.employee_tasks.TaskRepository.persist_plan_and_ready()'s
+        # own docstring), so the `task` already read at the top of this
+        # function is still exactly correct here despite the claim above.
+        dependency_steps: dict[int, PlanStep] = {}
+        for dependency_position in plan_step.depends_on:
+            resolved = resolve_persisted_plan_step(task, dependency_position)
+            if isinstance(resolved, PlanIntegrityFailure):
+                return _finalize_respond_failure(
+                    task_id,
+                    repository,
+                    plan_step.position,
+                    _PLAN_INTEGRITY_FAILURE_CODE,
+                    _PLAN_INTEGRITY_FAILURE_SUMMARY,
+                )
+            if isinstance(resolved, PlanDeserializationFailure):
+                return _finalize_respond_failure(
+                    task_id,
+                    repository,
+                    plan_step.position,
+                    _PLAN_DESERIALIZATION_FAILURE_CODE,
+                    _PLAN_DESERIALIZATION_FAILURE_SUMMARY,
+                )
+            dependency_steps[dependency_position] = resolved
+
+        outcome = synthesize_response(task, plan_step, dependency_steps, step_progress, model_provider)
+
+        if isinstance(outcome, RespondSuccess):
+            completed_at = _now_iso()
+            observation = build_respond_observation(
+                plan_step.position,
+                success=True,
+                safe_summary=outcome.text,
+                failure_code=None,
+                completed_at=completed_at,
+            )
+            # A response that passes respond.py's own raw-text bound
+            # (MAX_RESPOND_TEXT_CHARS) does NOT by itself guarantee the
+            # resulting StepObservation fits inside MAX_STEP_RESULT_JSON_CHARS
+            # once serialized - json.dumps() escaping (quotes, backslashes,
+            # control characters) can expand the serialized length well
+            # past the raw one. serialize_observation() is the
+            # AUTHORITATIVE check for that; a response that fails it here
+            # has no external side effect to undo (the model call already
+            # completed with no side effect of its own - see respond.py's
+            # own docstring), so it is safe to classify as an ordinary,
+            # known RESPOND failure (respond_invalid_output) rather than an
+            # unknown/uncaught error - never left in_progress, never
+            # silently truncated to force a fit.
+            try:
+                observation_json = serialize_observation(observation)
+            except ObservationSerializationError:
+                return _finalize_respond_failure(
+                    task_id,
+                    repository,
+                    plan_step.position,
+                    _RESPOND_INVALID_OUTPUT_FAILURE_CODE,
+                    _RESPOND_INVALID_OUTPUT_FAILURE_SUMMARY,
+                )
+            return _finalize_step_success(
+                task_id, repository, plan_step.position, observation_json, observation.action_outcome
+            )
+
+        if isinstance(outcome, RespondDependencyFailure):
+            return _finalize_respond_failure(
+                task_id,
+                repository,
+                plan_step.position,
+                _RESPOND_DEPENDENCY_FAILURE_CODE,
+                _RESPOND_DEPENDENCY_FAILURE_SUMMARY,
+            )
+
+        if isinstance(outcome, RespondContextTooLargeFailure):
+            return _finalize_respond_failure(
+                task_id,
+                repository,
+                plan_step.position,
+                _RESPOND_CONTEXT_TOO_LARGE_FAILURE_CODE,
+                _RESPOND_CONTEXT_TOO_LARGE_FAILURE_SUMMARY,
+            )
+
+        if isinstance(outcome, RespondProviderFailure):
+            return _finalize_respond_failure(
+                task_id,
+                repository,
+                plan_step.position,
+                _RESPOND_PROVIDER_UNAVAILABLE_FAILURE_CODE,
+                _RESPOND_PROVIDER_UNAVAILABLE_FAILURE_SUMMARY,
+            )
+
+        # outcome is RespondInvalidOutputFailure - the only remaining
+        # member of the closed RespondOutcome union.
+        if isinstance(outcome, RespondInvalidOutputFailure):
+            return _finalize_respond_failure(
+                task_id,
+                repository,
+                plan_step.position,
+                _RESPOND_INVALID_OUTPUT_FAILURE_CODE,
+                _RESPOND_INVALID_OUTPUT_FAILURE_SUMMARY,
+            )
+        raise TypeError(f"synthesize_response() returned an unrecognized outcome: {outcome!r}")
 
     if step.currently_sensitive:
         waiting_task = repository.propose_confirmation(
@@ -435,6 +658,7 @@ def advance_task_execution(
     registry: ActionRegistry,
     tools_config: ToolsConfig,
     executor: SafeTaskExecutor,
+    model_provider: ModelProvider,
 ) -> ExecutionAdvanceResult:
     """The one-step-at-a-time execution primitive. Processes exactly one
     plan step, or one confirmation-related event, per call - never loops
@@ -442,7 +666,15 @@ def advance_task_execution(
     rejection for a wrong starting state, mirroring
     kernel.task_orchestration.service.advance_task_planning()'s own
     doctrine) - every actual decision re-reads fresh state from
-    `repository`."""
+    `repository`.
+
+    `model_provider` (Milestone 42 P3) is injected by the caller, exactly
+    like every other dependency here - this function never constructs one
+    and never calls it directly; it is only ever threaded through to
+    _process_running_task(), which passes it to
+    kernel.task_execution.respond.synthesize_response() if and only if the
+    one step this call processes turns out to be an eligible RESPOND step.
+    An ACTION-only call path never touches it at all."""
 
     if task.state is TaskState.READY:
         running_task = repository.transition_task(
@@ -452,10 +684,14 @@ def advance_task_execution(
             reason_code=_TASK_STARTED_REASON_CODE,
             safe_summary=_TASK_STARTED_SAFE_SUMMARY,
         )
-        return _process_running_task(running_task.task_id, repository, registry, tools_config, executor)
+        return _process_running_task(
+            running_task.task_id, repository, registry, tools_config, executor, model_provider
+        )
 
     if task.state is TaskState.RUNNING:
-        return _process_running_task(task.task_id, repository, registry, tools_config, executor)
+        return _process_running_task(
+            task.task_id, repository, registry, tools_config, executor, model_provider
+        )
 
     if task.state is TaskState.WAITING_FOR_CONFIRMATION:
         return _process_waiting_task(task.task_id, repository)
@@ -466,6 +702,95 @@ def advance_task_execution(
     raise TaskNotReadyOrRunningError(
         f"expected task to be in 'ready', 'running', or 'waiting_for_confirmation' "
         f"but it is in {task.state.value!r}"
+    )
+
+
+# Milestone 42 P3: stopping statuses for run_task_until_blocked() below -
+# every ExecutionAdvanceStatus EXCEPT STEP_SUCCEEDED, which is the only one
+# the bounded runner ever continues past automatically.
+_RUNNER_STOPPING_STATUSES = frozenset(
+    {
+        ExecutionAdvanceStatus.CONFIRMATION_REQUIRED,
+        ExecutionAdvanceStatus.WAITING_FOR_CONFIRMATION,
+        ExecutionAdvanceStatus.TASK_COMPLETED,
+        ExecutionAdvanceStatus.TASK_FAILED,
+        ExecutionAdvanceStatus.TASK_CANCELLED,
+    }
+)
+
+
+def run_task_until_blocked(
+    task: TaskRecord,
+    repository: TaskRepository,
+    registry: ActionRegistry,
+    tools_config: ToolsConfig,
+    executor: SafeTaskExecutor,
+    model_provider: ModelProvider,
+) -> ExecutionAdvanceResult:
+    """Milestone 42 P3's bounded autonomous execution runner.
+
+    Performs ALL NORMAL execution progression exclusively through
+    advance_task_execution(): repeatedly calls it until it reports a
+    stopping status (CONFIRMATION_REQUIRED, WAITING_FOR_CONFIRMATION,
+    TASK_COMPLETED, TASK_FAILED, or TASK_CANCELLED), continuing
+    automatically only past STEP_SUCCEEDED. Returns the
+    ExecutionAdvanceResult of whichever call stopped it. Its ONE permitted
+    direct repository mutation - the only line of this function that
+    touches `repository` itself rather than going through
+    advance_task_execution() - is the code-owned safety failure below when
+    MAX_EXECUTION_ADVANCES is exhausted; see that section's own comment.
+
+    This function never selects a step, never claims a step, never calls
+    SafeTaskExecutor or ModelProvider directly, never manages a
+    confirmation, never constructs or alters a TaskPlan, never replans,
+    and never completes a task itself - every actual execution decision
+    still belongs entirely to advance_task_execution()
+    (-> _process_running_task() -> kernel.task_execution.eligibility.
+    evaluate_next_step()). This is a bounded DRIVER over that one-step
+    primitive, nothing more - it does not even inspect *why* a call
+    succeeded or failed, only whether to call again.
+
+    A sensitive ACTION step's proposed confirmation
+    (CONFIRMATION_REQUIRED/WAITING_FOR_CONFIRMATION) always stops this
+    loop immediately: it never auto-approves, polls, sleeps, or creates
+    another confirmation. A future caller that later calls
+    approve_task_confirmation()/deny_task_confirmation() may invoke this
+    function again afterward to continue - this function itself never
+    calls either of those.
+
+    MAX_EXECUTION_ADVANCES (kernel/task_execution/types.py) is a
+    deterministic, code-owned hard ceiling on how many times this loop may
+    call advance_task_execution() in one invocation - see that constant's
+    own docstring for why it is sized the way it is. Exceeding it fails
+    the task closed (execution_advance_limit_exceeded) rather than ever
+    returning a still-RUNNING task as though execution had finished; this
+    mark_failed() call is the one mutation this function performs
+    directly, and it is a bounded-loop safety measure, never an execution
+    or planning decision. Every successful iteration that continues the
+    loop ends with the task RUNNING (see _finalize_step_success() - a
+    STEP_SUCCEEDED result is only ever returned while the task is RUNNING),
+    so this call is always well-formed if the limit is ever reached."""
+
+    result = advance_task_execution(task, repository, registry, tools_config, executor, model_provider)
+
+    for _ in range(MAX_EXECUTION_ADVANCES - 1):
+        if result.status in _RUNNER_STOPPING_STATUSES:
+            return result
+        result = advance_task_execution(
+            result.task, repository, registry, tools_config, executor, model_provider
+        )
+
+    if result.status in _RUNNER_STOPPING_STATUSES:
+        return result
+
+    failed_task = repository.mark_failed(
+        result.task.task_id,
+        TaskState.RUNNING,
+        _EXECUTION_ADVANCE_LIMIT_EXCEEDED_FAILURE_CODE,
+        _EXECUTION_ADVANCE_LIMIT_EXCEEDED_FAILURE_SUMMARY,
+    )
+    return ExecutionAdvanceResult(
+        failed_task, ExecutionAdvanceStatus.TASK_FAILED, _EXECUTION_ADVANCE_LIMIT_EXCEEDED_FAILURE_CODE
     )
 
 

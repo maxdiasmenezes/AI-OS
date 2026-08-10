@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from kernel.employee_tasks import StepStatus, TaskRecord, TaskState, TaskStepProgress
-from kernel.task_planner import PlanStep, StepKind, TaskPlan, serialize_plan
+from kernel.task_planner import MAX_PLAN_STEPS, PlanStep, StepKind, TaskPlan, serialize_plan
 from kernel.task_execution import (
     ActionRevalidationFailure,
     AllStepsComplete,
@@ -20,6 +20,7 @@ from kernel.task_execution import (
     PlanDeserializationFailure,
     PlanIntegrityFailure,
     evaluate_next_step,
+    resolve_persisted_plan_step,
 )
 from kernel.tools.config import RepoBackupSpec, ToolsConfig
 from kernel.tools.registry import ActionRegistry
@@ -141,6 +142,42 @@ def test_task_id_mismatch_fails_closed(registry, tools_config):
     task = _task_record(plan_json=plan_json)
     outcome = evaluate_next_step(task, [], registry, tools_config)
     assert isinstance(outcome, PlanIntegrityFailure)
+
+
+def test_plan_exceeding_max_plan_steps_fails_closed_before_selecting_any_step(registry, tools_config):
+    """Milestone 42 P3 correction: kernel.task_planner.parser.py's own
+    MAX_PLAN_STEPS bound is enforced only at plan-PARSE time, never by
+    kernel.task_planner.serialization.deserialize_plan() - a hand-crafted
+    or corrupted persisted plan_json (unreachable through the real
+    planner, but not through this module's own deserialization path) could
+    otherwise contain more steps than the planner could ever produce.
+    evaluate_next_step() must reject this BEFORE ever selecting a step -
+    never partially process an oversized plan."""
+
+    steps = tuple(
+        _action_step(position, "system_status", None) for position in range(1, MAX_PLAN_STEPS + 2)
+    )
+    assert len(steps) == MAX_PLAN_STEPS + 1
+    plan_json = _plan_json(_TASK_ID, steps)
+    task = _task_record(plan_json=plan_json)
+
+    outcome = evaluate_next_step(task, [], registry, tools_config)
+
+    assert isinstance(outcome, PlanIntegrityFailure)
+
+
+def test_plan_at_exactly_max_plan_steps_is_not_rejected_for_size(registry, tools_config):
+    """The boundary itself: exactly MAX_PLAN_STEPS steps must NOT be
+    rejected by the new size check - only a plan that exceeds it."""
+
+    steps = tuple(_action_step(position, "system_status", None) for position in range(1, MAX_PLAN_STEPS + 1))
+    plan_json = _plan_json(_TASK_ID, steps)
+    task = _task_record(plan_json=plan_json)
+
+    outcome = evaluate_next_step(task, [], registry, tools_config)
+
+    assert isinstance(outcome, EligibleStep)
+    assert outcome.step.position == 1
 
 
 def test_malformed_plan_json_fails_closed(registry, tools_config):
@@ -398,6 +435,50 @@ def test_respond_step_still_subject_to_dependency_enforcement(registry, tools_co
     outcome = evaluate_next_step(task, [], registry, tools_config)
     assert isinstance(outcome, EligibleStep)
     assert outcome.step.position == 1  # not the RESPOND step yet
+
+
+# --- resolve_persisted_plan_step() -----------------------------------------
+
+
+def test_resolve_persisted_plan_step_returns_the_step_at_position():
+    steps = (_action_step(1, "system_status", None), _respond_step(2, depends_on=(1,)))
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+
+    resolved = resolve_persisted_plan_step(task, 2)
+
+    assert resolved == steps[1]
+
+
+def test_resolve_persisted_plan_step_missing_plan_json_fails_closed():
+    task = _task_record(plan_json=None)
+    resolved = resolve_persisted_plan_step(task, 1)
+    assert isinstance(resolved, PlanIntegrityFailure)
+
+
+def test_resolve_persisted_plan_step_task_id_mismatch_fails_closed():
+    plan_json = _plan_json("some-other-task-id", (_action_step(1, "system_status", None),))
+    task = _task_record(plan_json=plan_json)
+    resolved = resolve_persisted_plan_step(task, 1)
+    assert isinstance(resolved, PlanIntegrityFailure)
+
+
+def test_resolve_persisted_plan_step_rejects_plan_exceeding_max_plan_steps():
+    """Same Milestone 42 P3 correction as evaluate_next_step()'s own test
+    above - resolve_persisted_plan_step() is the other place a persisted
+    plan is trusted for execution (used both by
+    kernel.task_execution.service.approve_task_confirmation() and by the
+    RESPOND dependency-resolution path) and must independently reject an
+    oversized plan too."""
+
+    steps = tuple(
+        _action_step(position, "system_status", None) for position in range(1, MAX_PLAN_STEPS + 2)
+    )
+    plan_json = _plan_json(_TASK_ID, steps)
+    task = _task_record(plan_json=plan_json)
+
+    resolved = resolve_persisted_plan_step(task, 1)
+
+    assert isinstance(resolved, PlanIntegrityFailure)
 
 
 # --- import boundary (no I/O, no execution, no model) --------------------------

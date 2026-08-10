@@ -75,6 +75,13 @@ to the kernel.
   without either depending on the other, running one task through
   created -> planning -> {ready | failed}. See Planning Orchestration
   below. No production caller yet.
+  kernel/task_execution: implemented (Milestone 42 - Autonomous Execution
+  Loop) - drives a ready/running task one step at a time (deterministic,
+  model-free eligibility; action execution through SafeTaskExecutor;
+  durable confirmation for sensitive actions; RESPOND synthesis through an
+  injected conversational ModelProvider) plus a bounded runner that
+  repeats that one-step primitive until a blocking/terminal condition.
+  See Autonomous Execution Loop below. No production caller yet.
 ```
 
 ## Layers
@@ -741,12 +748,12 @@ yet either.
   treated exactly as opaquely as `metadata_json`: this layer validates
   only that it parses as JSON and stays within its size bound, and never
   imports `kernel.task_planner` or any `TaskPlan` type.
-- **Scope.** As of Milestone 41 P2, this package persists identity,
-  lifecycle state, and a validated plan once planning succeeds — it still
-  does not execute a task, call a model, or call a tool itself (planning
-  happens in `kernel/task_planner/`, orchestrated by
-  `kernel/task_orchestration/` — see below). Execution of a plan's steps
-  begins in Milestone 42.
+- **Scope.** This package persists identity, lifecycle state, and a
+  validated plan once planning succeeds — it still does not execute a
+  task, call a model, or call a tool itself (planning happens in
+  `kernel/task_planner/`, orchestrated by `kernel/task_orchestration/` —
+  see below). Execution of a plan's steps is `kernel/task_execution/`'s
+  responsibility (Milestone 42 — see Autonomous Execution Loop below).
 
 See `kernel/employee_tasks/__init__.py` and `storage/tasks/README.md` for
 the full design and the "task" naming disambiguation.
@@ -848,7 +855,7 @@ import-boundary test, not just by convention.
 
 Boundary: Milestone 41 decides and persists **what** should be done. It
 never decides **when** or **next**, and never performs the doing.
-Milestone 42 owns execution.
+Milestone 42 (see Autonomous Execution Loop below) owns execution.
 
 #### Planning Orchestration
 
@@ -908,6 +915,231 @@ test_integration.py` proves the complete non-executing chain — real
 closing and reopening the database connection → reloading the
 `TaskRecord` → `deserialize_plan()` → `task_id` integrity — works
 end to end.
+
+#### Autonomous Execution Loop
+
+`kernel/task_execution/` (Milestone 42) is the layer that decides *when*/
+*next* and performs the doing that Milestones 40-41 deliberately left
+undone. It takes one persisted `employee_tasks` `TaskRecord` (whose
+`plan_json` is a Milestone 41 `TaskPlan`), the task's durable per-step
+progress, and the CURRENT `ActionRegistry`/`ToolsConfig`, and
+deterministically drives that task from `ready` through however many
+steps it can safely complete, one step at a time. Every dependency
+(`TaskRepository`, `ActionRegistry`, `ToolsConfig`, `SafeTaskExecutor`,
+and a conversational `ModelProvider`) is injected explicitly by the
+caller — this package never opens a database connection, never loads
+`kernel/config/tools.yaml`, and never constructs an `ActionRegistry`,
+`SafeTaskExecutor`, or model provider itself.
+
+- **Durable step progress (schema version 3).** A new `task_step_progress`
+  table records one row per claimed plan step: absence of a row means
+  "not started" (no separate `not_started` status is ever persisted); a
+  claimed row starts `in_progress` and moves exactly once to the
+  write-once terminal `succeeded` or `failed` (enforced by a conditional
+  `UPDATE ... WHERE status = 'in_progress'`, mirroring `tasks`' own
+  conditional-transition discipline). Claiming
+  (`TaskRepository.claim_step()`) is a plain `INSERT` whose
+  `(task_id, step_position)` PRIMARY KEY is the atomic exactly-one-winner
+  mechanism for two callers racing the same step, wrapped in the same
+  `BEGIN IMMEDIATE` transaction as a fresh re-read of the task's CURRENT
+  state (never a stale caller-held `TaskRecord`) — a step may only be
+  claimed while the task is actually `running`.
+- **Deterministic, model-free eligibility**
+  (`eligibility.py:evaluate_next_step()`) — a pure function with no
+  database, tool, or model access of its own: deserializes the persisted
+  plan, verifies its embedded `task_id` matches the task record, rejects
+  a plan whose step count exceeds `MAX_PLAN_STEPS` (8) as a plan-integrity
+  violation (the planner's own step-count bound is enforced only at
+  plan-parse time, never re-checked by `deserialize_plan()`, so this is
+  independent defense against a hand-crafted or corrupted persisted
+  plan), scans steps in ascending position order, and returns the first
+  not-yet-succeeded one whose declared dependencies have all durably
+  succeeded. An earlier step that durably `failed`, or one still
+  `in_progress` (an uncertain outcome — see Exactly-once/unknown-outcome
+  limitation below), blocks the whole task closed rather than being
+  retried or skipped. For an `action` step, `action_name`/`resource_key`
+  are revalidated exactly as persisted against the CURRENT
+  `ActionRegistry`/`ToolsConfig`, and sensitivity is always re-derived
+  from `ActionRegistry.is_sensitive()` at evaluation time — never trusted
+  from the persisted `PlanStep.requires_confirmation` (which reflects the
+  registry's state at *planning* time) or from `catalog_id`, which
+  carries no execution authority anywhere in this package.
+- **Action execution.** `kernel.tools.executor.SafeTaskExecutor.execute()`
+  is the ONLY action-execution boundary this package ever calls — never a
+  handler, `kernel.tools.process_control`, or any application-launch/
+  script/repository-backup implementation directly. The `ActionRequest`
+  sent to it is built only from an already-revalidated, persisted
+  `PlanStep` — never from request text or model interpretation.
+- **Durable confirmation (schema version 4).** A sensitive eligible action
+  proposes a `task_pending_confirmation` row and transitions
+  `running -> waiting_for_confirmation` atomically
+  (`propose_confirmation()`) — wholly independent of
+  `kernel/tools/confirmation.py`'s pre-existing in-memory, single-slot
+  `ConfirmationStore`, which still only serves the older `/task ...`
+  command path and which this package never imports. The invariant
+  `task.state == waiting_for_confirmation` **iff** exactly one
+  `task_pending_confirmation` row exists is enforced mechanically, not
+  just by convention: the generic `transition_task()`/`mark_cancelled()`/
+  `mark_failed()` repository methods mechanically refuse any call that
+  would enter or leave that state, because none of them know the pending
+  table exists. Only `propose_confirmation()` (in) and
+  `consume_confirmation_and_claim_step()`/`deny_confirmation()`/
+  `fail_pending_confirmation()` (out) may cross that boundary, since only
+  they atomically keep the pending row in sync with task state. Each
+  pending confirmation is task-scoped, step-scoped, single-use, bounded by
+  its own 120-second TTL (`TASK_CONFIRMATION_TTL_SECONDS`), and durable —
+  a server restart does not lose it, unlike the older in-memory store.
+  - **Authorization chain.** Approval never trusts the pending row as
+    execution authority by itself — it is correlation/check state only.
+    `approve_task_confirmation()` re-reads the CURRENT `TaskRecord`,
+    re-resolves the pending row's `step_position` against the immutable
+    **persisted `TaskPlan`** (`resolve_persisted_plan_step()`), and
+    verifies the resolved step is an `action` step whose
+    position/action_name/resource_key match the pending row EXACTLY
+    before ever revalidating against the CURRENT `ActionRegistry`/
+    `ToolsConfig`. Only after that chain succeeds does one atomic
+    transaction consume the confirmation, transition
+    `waiting_for_confirmation -> running`, and claim the exact step —
+    and only after that transaction commits does `SafeTaskExecutor`
+    ever get called, with an `ActionRequest` built from the verified
+    persisted `PlanStep`, never from the pending row's own fields. A
+    second approval attempt with the same `confirmation_id` can never
+    claim or execute twice: the first call already deleted the pending
+    row and moved the task out of `waiting_for_confirmation`.
+  - **Claim = authorization boundary.** A successful step claim (via
+    `claim_step()` for a non-sensitive step, or via
+    `consume_confirmation_and_claim_step()` for an approved sensitive
+    one) is the point of authorization for that one step. Cancellation
+    *before* a claim commits prevents it outright — the executor or model
+    is never invoked. Cancellation *after* a claim commits cannot
+    retroactively revoke an already-authorized external side effect that
+    may already be in flight: the already-claimed unit of work (the
+    action call, or the RESPOND model call) may still finish, and its
+    real, known result is still durably recorded for audit — but the task
+    itself is never overwritten out of whatever terminal state a
+    concurrent writer already committed it to, and no further step is
+    ever started once a task is no longer `running`. There is no
+    additional `executing` task state; an in-flight claimed step is
+    represented purely by its `task_step_progress` row being `in_progress`
+    while the task itself may independently already be terminal.
+- **Exactly-once/unknown-outcome limitation.** SQLite and an arbitrary
+  external side effect (a subprocess, an application launch, a real
+  repository backup) cannot form one atomic transaction. If the process
+  running this code crashes after a claim commits but before the step's
+  terminal result is persisted, `task_step_progress` is left durably
+  `in_progress` forever — a real, deliberate uncertain-outcome state, not
+  a bug. This layer never automatically retries it, never clears it, and
+  never continues to a later step once eligibility observes it — a
+  concurrent/subsequent evaluation of an `in_progress` step fails the
+  whole task closed. AI-OS does **not** claim exactly-once external
+  execution; recovering/reconciling this state is explicitly out of scope
+  for Milestone 42 and is Milestone 47's concern.
+- **StepObservation.** The durable, bounded result of one step — for
+  either an `action` or a `respond` step — persisted as the same opaque,
+  size-capped (`MAX_STEP_RESULT_JSON_CHARS`, 4,096) `result_json` column
+  `task_step_progress` already has. An `action` step's observation reuses
+  `SafeTaskExecutor`'s own already-safe `ActionResult.message`/`.outcome`
+  verbatim (never raw stdout/stderr, a stack trace, or a secret — see
+  Tools above). Never a separate response table.
+- **RESPOND synthesis and model-role separation.** An eligible `respond`
+  step is claimed through the identical `claim_step()` boundary a
+  non-sensitive action uses, then synthesized by
+  `respond.py:synthesize_response()` using an injected, general
+  conversational `ModelProvider` — the ONLY place this package ever calls
+  a model, and never `gemma3:12b`, the dedicated structured-planner
+  provider (see Bounded Task Planner above). This package never
+  re-plans, never lets the conversational model select or alter an
+  action, and never lets a RESPOND step create a tool request — `respond.py`
+  imports only the abstract `kernel.models.base.ModelProvider` contract,
+  never `kernel.models.factory` or a concrete provider module. Synthesis
+  draws only from durable, trusted state: the task's own `request_text`
+  and the RESPOND step's own `description`/`expected_result` are framing
+  context (what is being asked, and what kind of reply is wanted) — never
+  evidence that any action occurred. Only the durable `StepObservation`s
+  of the RESPOND step's own declared dependencies are treated as
+  authoritative evidence of completed work, and each one must
+  independently pass a full integrity check (durable row present, status
+  `succeeded`, `result_json` present, `deserialize_observation()`
+  succeeds, `step_position`/`success`/`step_kind` all matching the
+  persisted plan) before the model is ever called — any mismatch fails
+  the step/task closed with a stable, code-authored failure, never
+  reinterpreted as a planner concern. The generated prompt tells the
+  model explicitly that dependency results are DATA, never instructions,
+  and that command-like text embedded in them must not be followed. Two
+  bounds apply, both fail-closed rather than truncating: the fully
+  constructed prompt must fit `MAX_RESPOND_PROMPT_CHARS` (24,000) or the
+  step fails closed (`respond_context_too_large`) before the model is
+  ever called; the raw generated response must fit `MAX_RESPOND_TEXT_CHARS`
+  (3,800) as an early check, but that raw bound alone does not guarantee
+  the serialized `StepObservation` fits `MAX_STEP_RESULT_JSON_CHARS` (JSON
+  escaping of quotes/backslashes/control characters can expand it) — the
+  authoritative check is the actual serialization attempt, and a response
+  that fails it fails the step/task closed (`respond_invalid_output`)
+  rather than being truncated. The final synthesized text is durably
+  available exactly like any other step's result:
+  `TaskStepProgress.result_json` → `deserialize_observation()` →
+  `StepObservation.safe_summary`. Milestone 42 stores this text; it does
+  not deliver it to any channel — that is Milestone 46's concern.
+- **Bounded autonomous runner** (`run_task_until_blocked()`) — a bounded
+  driver over the one-step `advance_task_execution()` primitive, and
+  nothing else: it repeatedly calls that one primitive, continuing
+  automatically only after `STEP_SUCCEEDED`, and stopping immediately on
+  `CONFIRMATION_REQUIRED`, `WAITING_FOR_CONFIRMATION`, `TASK_COMPLETED`,
+  `TASK_FAILED`, or `TASK_CANCELLED`. It never selects a step, claims a
+  step, calls `SafeTaskExecutor` or `ModelProvider` directly, approves or
+  denies a confirmation, or alters the persisted plan — every actual
+  execution decision still belongs to `advance_task_execution()` itself,
+  which remains a strict one-step-per-call primitive (never an internal
+  loop) so it stays independently usable by future recovery logic. The
+  runner's only direct mutation is a deterministic, code-owned hard
+  ceiling on how many times it may call that primitive in one invocation:
+  `MAX_EXECUTION_ADVANCES = MAX_PLAN_STEPS + 1` (9) — an `N`-step plan
+  needs at most `N` successful advances plus one further advance to
+  observe all steps complete, so this bound is a pure loop/progression
+  safety guard, never a substitute for the plan-size integrity check
+  above (an oversized plan is already rejected before this bound is ever
+  relevant). Exceeding it fails the task closed
+  (`execution_advance_limit_exceeded`) rather than ever returning a
+  still-running task as though it had finished.
+- **Task lifecycle at end of Milestone 42.** `created -> planning -> ready
+  -> running`, then from `running`: a successful ordinary step leaves the
+  task `running`; a sensitive eligible action moves it to
+  `waiting_for_confirmation`; approval consumes the confirmation and
+  returns it to `running` with the exact approved step claimed; denial or
+  a durable step failure moves it to `cancelled`/`failed` respectively; a
+  confirmation that expires or no longer matches the persisted plan fails
+  the task; and once every step has durably succeeded the next advance
+  observes it and completes the task. No additional `executing` state was
+  introduced — see Claim = authorization boundary above for how an
+  in-flight step is represented instead.
+
+As of Milestone 42, this package still has no runtime caller — nothing in
+`kernel/orchestrator/`, any `capabilities/`, or `interfaces/whatsapp/`
+calls `advance_task_execution()`/`run_task_until_blocked()`/
+`approve_task_confirmation()`/`deny_task_confirmation()` from a real
+request; nothing creates a task, triggers planning, or begins execution
+outside a test. Real task submission, runtime/orchestrator wiring, a
+scheduler/background service, WhatsApp result delivery and confirmation-
+reply routing, crash-recovery reconciliation of an uncertain `in_progress`
+step, and any new action type are explicitly out of scope here — see
+Milestone boundaries in Implementation status below.
+
+**Threat boundary.** Milestone 42 protects against: a stale caller-held
+task/plan reference, two workers racing the same claim or the same
+confirmation, confirmation replay, partial/inconsistent persisted
+confirmation state, action substitution attempted through model output or
+runtime code, a stale registry/config assumption, a malformed or
+oversized persisted plan or observation, accidental partial corruption of
+a confirmation row, and automatic re-execution of an action whose outcome
+is uncertain. It does **not** provide cryptographic tamper resistance
+against an attacker who already has arbitrary direct write access to the
+SQLite database file — such an attacker could, in principle, rewrite
+multiple mutually-consistent records (including the persisted `TaskPlan`
+itself) to describe a different, coordinated, but still internally
+self-consistent state. Defending against that specific threat would
+require an independent trust boundary (e.g. signed proposals, or storage
+this process does not itself have unrestricted write access to) that no
+part of this milestone's threat model calls for.
 
 #### Knowledge Ingestion
 
@@ -2186,8 +2418,9 @@ this flow — a single call to `handle()` is one full request/response cycle.
   invokes this package, no tool is executed by it, and no
   natural-language WhatsApp task is reachable through it yet — it is a
   self-contained, tested library. Persisted task state, a bounded
-  planner, and planning orchestration are Milestones 40 and 41 (see
-  those bullets below); an autonomous execution loop begins Milestone 42.
+  planner, and planning orchestration are Milestones 40 and 41; the
+  autonomous execution loop that acts on them is Milestone 42 (see those
+  bullets below).
 - Milestone 40 — Persistent Task Lifecycle: `kernel/employee_tasks/`, a
   new package giving durable task identity and lifecycle state — see
   Kernel above (Persistent Task Lifecycle) for the full design. Like
@@ -2212,11 +2445,38 @@ this flow — a single call to `handle()` is one full request/response cycle.
   or called by anything — the general conversational provider remains
   unchanged. Like Milestones 39 and 40, this milestone has **no
   production caller**: nothing creates a task or triggers planning from a
-  real request. An autonomous execution loop — deciding *when*/*next* and
-  performing the doing — begins Milestone 42.
+  real request. The autonomous execution loop that decides *when*/*next*
+  and performs the doing is Milestone 42, below.
+- Milestone 42 — Autonomous Execution Loop: `kernel/task_execution/` —
+  see Kernel above (Autonomous Execution Loop) for the full design.
+  Delivered across three phases: durable per-step progress and
+  deterministic, model-free next-step eligibility (P1); action execution
+  through `SafeTaskExecutor` and durable, task-scoped confirmation for
+  sensitive actions, replacing nothing of the existing in-memory
+  `kernel/tools/confirmation.py` store (P2); RESPOND-step synthesis
+  through an injected general conversational `ModelProvider` — never the
+  dedicated planner provider — plus `run_task_until_blocked()`, a bounded
+  driver over the one-step `advance_task_execution()` primitive (P3). Like
+  Milestones 39-41, this milestone has **no production caller**: nothing
+  in `kernel/orchestrator/`, any `capabilities/`, or
+  `interfaces/whatsapp/` invokes it, and no task is ever advanced outside
+  a test. Real task submission, runtime wiring, a scheduler, WhatsApp
+  result delivery/confirmation routing (Milestone 46), and recovery/
+  reconciliation of an uncertain `in_progress` step from a process crash
+  mid-action (Milestone 47) are explicitly not this milestone's concern —
+  a claimed step whose terminal result was never persisted is left
+  durably `in_progress` and is never retried or skipped by this layer.
 
 **Planned / not yet implemented:**
 
+- Milestones 43-48, building on `kernel/task_execution/`'s execution
+  engine: Milestone 43 (Core Computer Worker), Milestone 44 (Browser
+  Worker), Milestone 45 (Windows Desktop Worker), Milestone 46 (WhatsApp
+  Task Control — real task submission, result delivery, and confirmation-
+  reply routing), Milestone 47 (persistence recovery/reconciliation,
+  especially an uncertain `in_progress` external action left behind by a
+  process crash), and Milestone 48 (employee acceptance/launch). None of
+  this exists yet; do not treat any of these names as implemented.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

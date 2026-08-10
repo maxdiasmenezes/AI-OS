@@ -295,11 +295,18 @@ def test_full_happy_path_lifecycle(repo):
     started_at = record.started_at
     assert record.version == 4
 
-    record = repo.transition_task(tid, "running", "waiting_for_confirmation")
+    # Milestone 42 P2: entering/leaving waiting_for_confirmation goes
+    # through the dedicated confirmation operations, never a generic
+    # transition_task() call - see
+    # test_generic_transition_task_rejects_waiting_for_confirmation_edges().
+    record = repo.propose_confirmation(tid, 1, "repository_backup", "ai_os", ttl_seconds=120)
     assert record.state == TaskState.WAITING_FOR_CONFIRMATION
     assert record.version == 5
 
-    record = repo.transition_task(tid, "waiting_for_confirmation", "running")
+    pending = repo.get_pending_confirmation(tid)
+    record = repo.consume_confirmation_and_claim_step(
+        tid, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
     assert record.state == TaskState.RUNNING
     assert record.started_at == started_at  # must not be overwritten
     assert record.version == 6
@@ -322,16 +329,21 @@ def test_full_happy_path_lifecycle(repo):
         ("ready", "running"),
         ("ready", "cancelled"),
         ("ready", "failed"),
-        ("running", "waiting_for_confirmation"),
         ("running", "completed"),
         ("running", "failed"),
         ("running", "cancelled"),
-        ("waiting_for_confirmation", "running"),
-        ("waiting_for_confirmation", "cancelled"),
-        ("waiting_for_confirmation", "failed"),
     ],
 )
 def test_every_allowed_edge(repo, expected_state, new_state):
+    """Every edge here is reachable through the generic transition_task().
+    The four edges into/out of waiting_for_confirmation are deliberately
+    NOT included - see
+    test_generic_transition_task_rejects_waiting_for_confirmation_edges()
+    below: they remain valid in ALLOWED_TRANSITIONS (the abstract
+    lifecycle graph is unchanged), but Milestone 42 P2 requires them to go
+    through the dedicated confirmation operations instead, never this
+    generic method."""
+
     record = repo.create_task("request", "whatsapp")
     tid = record.task_id
     _drive_to_state(repo, tid, expected_state)
@@ -340,22 +352,52 @@ def test_every_allowed_edge(repo, expected_state, new_state):
     assert result.state == TaskState(new_state)
 
 
+@pytest.mark.parametrize(
+    "expected_state,new_state",
+    [
+        ("running", "waiting_for_confirmation"),
+        ("waiting_for_confirmation", "running"),
+        ("waiting_for_confirmation", "cancelled"),
+        ("waiting_for_confirmation", "failed"),
+    ],
+)
+def test_generic_transition_task_rejects_waiting_for_confirmation_edges(
+    repo, expected_state, new_state
+):
+    """Milestone 42 P2: these four edges remain valid in
+    ALLOWED_TRANSITIONS, but transition_task() must mechanically refuse
+    all of them - only propose_confirmation() (in) and
+    consume_confirmation_and_claim_step()/deny_confirmation()/
+    fail_pending_confirmation() (out) may enter/leave
+    waiting_for_confirmation, since only they keep the durable
+    task_pending_confirmation row synchronized with task state."""
+
+    record = repo.create_task("request", "whatsapp")
+    tid = record.task_id
+    _drive_to_state(repo, tid, expected_state)
+
+    with pytest.raises(InvalidTransitionError):
+        repo.transition_task(tid, expected_state, new_state)
+
+
 def _drive_to_state(repo, task_id, state: str) -> None:
     """Walk a freshly created task ("created") to `state` via one
     conservative allowed path, for tests that only care about the edge
-    starting at `state`."""
+    starting at `state`. Reaching "waiting_for_confirmation" goes through
+    propose_confirmation() (Milestone 42 P2) - never a generic
+    transition_task() call, which correctly refuses that edge (see
+    _reject_generic_waiting_for_confirmation() in repository.py)."""
+
+    if state == "waiting_for_confirmation":
+        _drive_to_state(repo, task_id, "running")
+        repo.propose_confirmation(task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+        return
 
     path = {
         "created": [],
         "planning": ["planning"],
         "ready": ["planning", "ready"],
         "running": ["planning", "ready", "running"],
-        "waiting_for_confirmation": [
-            "planning",
-            "ready",
-            "running",
-            "waiting_for_confirmation",
-        ],
     }[state]
     current = "created"
     for step in path:
@@ -445,8 +487,13 @@ def test_started_at_set_once(repo):
     first_started_at = record.started_at
     assert first_started_at is not None
 
-    record = repo.transition_task(tid, "running", "waiting_for_confirmation")
-    record = repo.transition_task(tid, "waiting_for_confirmation", "running")
+    # Milestone 42 P2: RUNNING <-> WAITING_FOR_CONFIRMATION goes through
+    # the dedicated confirmation operations, never transition_task().
+    repo.propose_confirmation(tid, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(tid)
+    record = repo.consume_confirmation_and_claim_step(
+        tid, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
     assert record.started_at == first_started_at
 
 

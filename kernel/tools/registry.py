@@ -1,19 +1,31 @@
 """
 ActionRegistry: the fixed allowlist of computer actions kernel/tools will
-ever execute. This list of six action names is not user- or
+ever execute. This list of action names is not user- or
 machine-configurable - only which *resources* (directories, applications,
-scripts, repositories) each action may touch is configurable, via
+scripts, repositories, files) each action may touch is configurable, via
 kernel/config/tools.yaml (see kernel/tools/config.py). Nothing outside
-these six names is reachable through kernel/tools, no matter what a
-caller asks for.
+these names is reachable through kernel/tools, no matter what a caller
+asks for.
+
+Milestone 43 P1 (Core Computer Worker - Read-Only Inspection) adds three
+read-only actions: file_metadata, read_text_file, and list_processes -
+none of them added to _SENSITIVE_ACTIONS. Milestone 43 P2 (Bounded File
+Mutations) adds two write actions - create_directory and copy_file - both
+added to _SENSITIVE_ACTIONS, since both write a new filesystem entry
+(matching repository_backup's own precedent).
 """
 
 from dataclasses import dataclass
 from enum import Enum
 
 from kernel.tools.handlers import (
+    copy_file,
+    create_directory,
+    file_metadata,
     list_files,
+    list_processes,
     open_application,
+    read_text_file,
     repo_health,
     repository_backup,
     run_registered_script,
@@ -25,8 +37,18 @@ from kernel.tools.handlers import (
 # they run. Read-only/informational actions do not - repo_health is
 # read-only (Milestone 34) and is deliberately not in this set.
 # repository_backup (Milestone 35) writes a file, so it is sensitive.
+# file_metadata/read_text_file/list_processes (Milestone 43 P1) are all
+# read-only and deliberately not in this set either. create_directory/
+# copy_file (Milestone 43 P2) both write a new filesystem entry, so both
+# are sensitive.
 _SENSITIVE_ACTIONS = frozenset(
-    {"open_application", "run_registered_script", "repository_backup"}
+    {
+        "open_application",
+        "run_registered_script",
+        "repository_backup",
+        "create_directory",
+        "copy_file",
+    }
 )
 
 _HANDLERS = {
@@ -36,6 +58,11 @@ _HANDLERS = {
     "run_registered_script": run_registered_script.run,
     "repo_health": repo_health.run,
     "repository_backup": repository_backup.run,
+    "file_metadata": file_metadata.run,
+    "read_text_file": read_text_file.run,
+    "list_processes": list_processes.run,
+    "create_directory": create_directory.run,
+    "copy_file": copy_file.run,
 }
 
 
@@ -82,6 +109,14 @@ _RESOURCE_KEY_REQUIREMENTS = {
     "run_registered_script": (ResourceKeyRequirement.REQUIRED, "the registered script key to run"),
     "repo_health": (ResourceKeyRequirement.REQUIRED, "the registered repository key to check"),
     "repository_backup": (ResourceKeyRequirement.REQUIRED, "the registered repository key to back up"),
+    "file_metadata": (ResourceKeyRequirement.REQUIRED, "the registered file key to inspect"),
+    "read_text_file": (ResourceKeyRequirement.REQUIRED, "the registered file key to read"),
+    "list_processes": (ResourceKeyRequirement.FORBIDDEN, None),
+    "create_directory": (
+        ResourceKeyRequirement.REQUIRED,
+        "the registered directory-creation operation key",
+    ),
+    "copy_file": (ResourceKeyRequirement.REQUIRED, "the registered file-copy operation key"),
 }
 
 
@@ -101,7 +136,9 @@ class ActionRegistry:
         """Every known action as an immutable ActionDescriptor, in the
         same fixed order as _HANDLERS (declaration order - system_status,
         list_files, open_application, run_registered_script, repo_health,
-        repository_backup) - deterministic across calls and processes,
+        repository_backup, file_metadata, read_text_file, list_processes,
+        create_directory, copy_file) - deterministic across calls and
+        processes,
         never dependent on dict iteration happening to match by chance."""
 
         return tuple(

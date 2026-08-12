@@ -100,6 +100,10 @@ _RESOURCE_FIELD_BY_ACTION = {
     "run_registered_script": "approved_scripts",
     "repo_health": "approved_repositories",
     "repository_backup": "approved_backups",
+    "file_metadata": "approved_files",
+    "read_text_file": "approved_files",
+    "create_directory": "approved_directory_creations",
+    "copy_file": "approved_copies",
 }
 
 

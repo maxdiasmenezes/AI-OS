@@ -440,20 +440,26 @@ abandoned mid-processing.
   rejected before any HTTP request is made.
 - **tools** — reusable tools (actions, integrations, lookups) that
   capabilities could invoke. Implemented (Milestone 33; extended in
-  Milestone 34; extended again in Milestone 35): the safe computer task
-  execution layer, transport-agnostic and consumed today only by
+  Milestone 34; extended again in Milestone 35; extended again in
+  Milestone 43): the safe computer task execution layer, transport-agnostic
+  and consumed today only by
   `capabilities/tasks/TasksCapability` — see Capabilities below for the
   full command surface. `kernel/tools/types.py` defines `ActionRequest`
   (an action name plus an optional symbolic `resource_key` — never a raw
   path or argument list) and `ActionResult`. `kernel/tools/registry.py`'s
   `ActionRegistry` is the fixed, non-configurable allowlist of exactly
-  six actions (`system_status`, `list_files`, `open_application`,
-  `run_registered_script`, `repo_health`, `repository_backup`) and which
-  three of them are sensitive (`open_application`, `run_registered_script`,
-  `repository_backup`) — `repo_health` is read-only and, like
-  `system_status`/`list_files`, is not sensitive; `repository_backup`
-  writes a file, so it is sensitive; no seventh action is ever reachable,
-  no matter what a caller asks for. `kernel/tools/git_safety.py`
+  eleven actions (`system_status`, `list_files`, `open_application`,
+  `run_registered_script`, `repo_health`, `repository_backup`, —
+  Milestone 43 P1 — `file_metadata`, `read_text_file`, `list_processes`,
+  and — Milestone 43 P2 — `create_directory`, `copy_file`) and which five
+  of them are sensitive (`open_application`, `run_registered_script`,
+  `repository_backup`, `create_directory`, `copy_file`) — `repo_health` is
+  read-only and, like `system_status`/`list_files`, is not sensitive;
+  `repository_backup`/`create_directory`/`copy_file` each write a new
+  filesystem entry, so all three are sensitive; the three Milestone 43 P1
+  actions are all read-only and not sensitive either; no action beyond
+  these eleven is ever reachable, no matter what a caller asks for.
+  `kernel/tools/git_safety.py`
   (Milestone 35) holds the local git-execution hardening shared by
   `repo_health.py` and `repository_backup.py` — `GIT_SAFE_PREFIX` and
   `sanitized_git_env()`, extracted out of `repo_health.py` (which
@@ -2466,17 +2472,59 @@ this flow — a single call to `handle()` is one full request/response cycle.
   mid-action (Milestone 47) are explicitly not this milestone's concern —
   a claimed step whose terminal result was never persisted is left
   durably `in_progress` and is never retried or skipped by this layer.
+- Milestone 43 — Core Computer Worker: **implemented**. Adds five
+  registered actions to `kernel/tools/registry.py` — `ActionRegistry` now
+  holds eleven actions in total. P1 (Read-Only Inspection) adds three
+  non-sensitive actions — `file_metadata`, `read_text_file`,
+  `list_processes` — plus a new exact-file `approved_files` resource
+  section on `ToolsConfig` (`kernel/tools/config.py`,
+  `kernel/tools/file_safety.py`). P2 (Bounded File Mutations) adds two
+  sensitive, create-only actions — `create_directory` and `copy_file` —
+  each authorized by one pre-configured composite `resource_key`
+  (`create_directory.approved_directory_creations`,
+  `copy_file.approved_copies`) naming an entire operation (parent
+  directory + child name, or source + destination directory + destination
+  name) by reference to already-approved `approved_directories`/
+  `approved_files` entries — never a caller/model-supplied path,
+  filename, or overwrite flag — and reusing `kernel/tools/
+  atomic_finalize.py`'s existing no-replace finalize and
+  `kernel/tools/file_safety.py`'s symlink/reparse-point rejection rather
+  than introducing new safety primitives. Both flow through M42's
+  existing durable confirmation unchanged. P3 (Integration, Security
+  Acceptance, and Closure) adds no new registered action: it consists of
+  whole-milestone acceptance and security regression tests proving the
+  P1+P2 capability set is correctly bounded, planner-visible,
+  execution-safe, confirmation-safe, config-authorized, persistence-safe,
+  and audit-private as one coherent milestone, plus this documentation
+  closure.
+
+  **Process termination/control was deliberately evaluated and excluded**
+  from Milestone 43 (see the P3 design pass): `list_processes` remains
+  informational only, carrying no execution authority; AI-OS retains no
+  durable process-launch provenance (`open_application` discards the PID
+  it receives, so a later "process matching this approved application" is
+  never provably the instance AI-OS itself launched rather than one the
+  user opened); on Windows, `psutil`'s `terminate()` is documented as an
+  alias for `kill()` — an immediate, forceful termination with no
+  cooperative graceful-shutdown path an application could use to save
+  unsaved state; and terminating an arbitrary application could destroy
+  pre-existing user work with no undo. Safe launch ownership and
+  reconciliation would require a broader lifecycle design outside this
+  milestone's scope. Explicitly deferred, not part of Milestone 43:
+  process termination/control, rename, move, delete/trash, arbitrary
+  text/file writing, arbitrary shell/PowerShell, browser automation, and
+  native GUI automation.
 
 **Planned / not yet implemented:**
 
-- Milestones 43-48, building on `kernel/task_execution/`'s execution
-  engine: Milestone 43 (Core Computer Worker), Milestone 44 (Browser
-  Worker), Milestone 45 (Windows Desktop Worker), Milestone 46 (WhatsApp
-  Task Control — real task submission, result delivery, and confirmation-
-  reply routing), Milestone 47 (persistence recovery/reconciliation,
-  especially an uncertain `in_progress` external action left behind by a
-  process crash), and Milestone 48 (employee acceptance/launch). None of
-  this exists yet; do not treat any of these names as implemented.
+- Milestones 44-48, building on `kernel/task_execution/`'s execution
+  engine: Milestone 44 (Browser Worker), Milestone 45 (Windows Desktop
+  Worker), Milestone 46 (WhatsApp Task Control — real task submission,
+  result delivery, and confirmation-reply routing), Milestone 47
+  (persistence recovery/reconciliation, especially an uncertain
+  `in_progress` external action left behind by a process crash), and
+  Milestone 48 (employee acceptance/launch). None of this exists yet; do
+  not treat any of these names as implemented.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

@@ -12,10 +12,15 @@ _ALL_ACTIONS = (
     "run_registered_script",
     "repo_health",
     "repository_backup",
+    "file_metadata",
+    "read_text_file",
+    "list_processes",
+    "create_directory",
+    "copy_file",
 )
 
 
-def test_exactly_the_six_milestone_actions_are_known():
+def test_exactly_the_eleven_milestone_actions_are_known():
     registry = ActionRegistry()
 
     for action in _ALL_ACTIONS:
@@ -33,12 +38,27 @@ def test_open_application_run_registered_script_and_repository_backup_are_sensit
     assert registry.is_sensitive("repository_backup") is True
 
 
+def test_milestone_43_p2_write_actions_are_sensitive():
+    registry = ActionRegistry()
+
+    assert registry.is_sensitive("create_directory") is True
+    assert registry.is_sensitive("copy_file") is True
+
+
 def test_system_status_list_files_and_repo_health_are_not_sensitive():
     registry = ActionRegistry()
 
     assert registry.is_sensitive("system_status") is False
     assert registry.is_sensitive("list_files") is False
     assert registry.is_sensitive("repo_health") is False
+
+
+def test_milestone_43_p1_read_only_actions_are_not_sensitive():
+    registry = ActionRegistry()
+
+    assert registry.is_sensitive("file_metadata") is False
+    assert registry.is_sensitive("read_text_file") is False
+    assert registry.is_sensitive("list_processes") is False
 
 
 def test_unknown_action_is_not_sensitive_and_has_no_handler():
@@ -72,10 +92,15 @@ _EXPECTED_REQUIREMENTS = {
     "run_registered_script": ResourceKeyRequirement.REQUIRED,
     "repo_health": ResourceKeyRequirement.REQUIRED,
     "repository_backup": ResourceKeyRequirement.REQUIRED,
+    "file_metadata": ResourceKeyRequirement.REQUIRED,
+    "read_text_file": ResourceKeyRequirement.REQUIRED,
+    "list_processes": ResourceKeyRequirement.FORBIDDEN,
+    "create_directory": ResourceKeyRequirement.REQUIRED,
+    "copy_file": ResourceKeyRequirement.REQUIRED,
 }
 
 
-def test_descriptors_cover_exactly_the_six_known_actions():
+def test_descriptors_cover_exactly_the_eleven_known_actions():
     registry = ActionRegistry()
     names = tuple(d.name for d in registry.descriptors())
 
@@ -113,6 +138,13 @@ def test_system_status_descriptor_has_no_resource_key_description():
     by_name = {d.name: d for d in registry.descriptors()}
 
     assert by_name["system_status"].resource_key_description is None
+
+
+def test_list_processes_descriptor_has_no_resource_key_description():
+    registry = ActionRegistry()
+    by_name = {d.name: d for d in registry.descriptors()}
+
+    assert by_name["list_processes"].resource_key_description is None
 
 
 def test_required_descriptors_have_a_resource_key_description():

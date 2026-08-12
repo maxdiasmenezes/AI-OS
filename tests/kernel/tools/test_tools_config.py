@@ -1,16 +1,22 @@
 """Tests for kernel/tools/config.py: load_tools_config()'s fail-closed rules."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from kernel.tools.config import (
+    MAX_SYMBOLIC_NAME_LENGTH,
     ApplicationSpec,
+    DirectoryCreationSpec,
+    FileCopySpec,
+    FileSpec,
     RepoBackupSpec,
     RepoSpec,
     ScriptSpec,
     ToolsConfigError,
     is_valid_backup_key,
+    is_valid_child_name,
     is_valid_git_branch_name,
     load_tools_config,
 )
@@ -727,3 +733,950 @@ def test_full_valid_configuration_parses_all_five_sections(tmp_path):
     assert config.approved_scripts["backup"].timeout_seconds == 60.0
     assert config.approved_repositories["ai_os"] == RepoSpec(path="C:/AI-OS", main_branch="main")
     assert config.approved_backups["ai_os"] == RepoBackupSpec(destination_directory="D:/AI-OS-Backups")
+
+
+# --- approved_files (Milestone 43 P1) ---------------------------------------
+
+
+def test_missing_approved_files_section_yields_an_empty_dict(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n  approved_directories:\n    documents: C:/Users/Example/Documents\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_files == {}
+
+
+def test_valid_approved_files_entry_parses(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        "  resume_pdf:\n"
+        "    path: C:/Users/Example/Documents/resume.pdf\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_files == {
+        "resume_pdf": FileSpec(path="C:/Users/Example/Documents/resume.pdf")
+    }
+
+
+def test_multiple_approved_files_keys_parse(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        "  resume_pdf:\n"
+        "    path: C:/Users/Example/Documents/resume.pdf\n"
+        "  notes_txt:\n"
+        "    path: C:/Users/Example/Documents/notes.txt\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert set(config.approved_files) == {"resume_pdf", "notes_txt"}
+    assert config.approved_files["notes_txt"] == FileSpec(
+        path="C:/Users/Example/Documents/notes.txt"
+    )
+
+
+def test_approved_files_duplicate_yaml_key_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        "  resume_pdf:\n"
+        "    path: C:/one/resume.pdf\n"
+        "  resume_pdf:\n"
+        "    path: C:/two/resume.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_case_insensitive_duplicate_key_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        "  Resume_Pdf:\n"
+        "    path: C:/one/resume.pdf\n"
+        "  resume_pdf:\n"
+        "    path: C:/two/resume.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_relative_path_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n  resume_pdf:\n    path: relative/resume.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_missing_required_field_raises(tmp_path):
+    path = _write(tmp_path, "approved_files:\n  resume_pdf: {}\n")
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_unsupported_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        "  resume_pdf:\n"
+        "    path: C:/Users/Example/Documents/resume.pdf\n"
+        "    extra_field: nope\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_non_mapping_entry_raises(tmp_path):
+    path = _write(tmp_path, "approved_files:\n  resume_pdf: C:/Users/Example/resume.pdf\n")
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_non_mapping_section_raises(tmp_path):
+    path = _write(tmp_path, "approved_files:\n  - not\n  - a\n  - mapping\n")
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_path_with_nul_raises(tmp_path):
+    # A raw NUL byte cannot round-trip through plain YAML scalar syntax in
+    # the same way as tab/backslash - written via a double-quoted YAML
+    # escape instead, which PyYAML decodes to an actual NUL character.
+    path = _write(
+        tmp_path,
+        'approved_files:\n  resume_pdf:\n    path: "C:/Users/Example/resume\\0.pdf"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_full_valid_configuration_parses_all_six_sections(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "open_application:\n"
+        "  approved_applications:\n"
+        "    notepad:\n"
+        "      executable: C:/Windows/System32/notepad.exe\n"
+        "      cwd: C:/Windows/System32\n"
+        "run_registered_script:\n"
+        "  approved_scripts:\n"
+        "    backup:\n"
+        "      interpreter: C:/python.exe\n"
+        "      script_path: C:/AI-OS/scripts/backup.py\n"
+        "      cwd: C:/AI-OS\n"
+        "      timeout_seconds: 60\n"
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: C:/AI-OS\n"
+        "repository_backup:\n"
+        "  approved_backups:\n"
+        "    ai_os:\n"
+        "      destination_directory: D:/AI-OS-Backups\n"
+        "approved_files:\n"
+        "  resume_pdf:\n"
+        "    path: C:/Users/Example/Documents/resume.pdf\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_directories == {"documents": "C:/Users/Example/Documents"}
+    assert "notepad" in config.approved_applications
+    assert config.approved_scripts["backup"].timeout_seconds == 60.0
+    assert config.approved_repositories["ai_os"] == RepoSpec(path="C:/AI-OS", main_branch="main")
+    assert config.approved_backups["ai_os"] == RepoBackupSpec(destination_directory="D:/AI-OS-Backups")
+    assert config.approved_files["resume_pdf"] == FileSpec(
+        path="C:/Users/Example/Documents/resume.pdf"
+    )
+
+
+# --- the real, committed kernel/config/tools.example.yaml (never the
+# --- machine-local, gitignored tools.yaml) ----------------------------------
+
+# tests/kernel/tools/test_tools_config.py -> tests/kernel/tools -> tests/kernel
+# -> tests -> project root.
+_EXAMPLE_CONFIG_PATH = (
+    Path(__file__).resolve().parents[3] / "kernel" / "config" / "tools.example.yaml"
+)
+
+
+def test_committed_example_configuration_loads_without_error():
+    config = load_tools_config(_EXAMPLE_CONFIG_PATH)
+
+    assert config.approved_directories
+    assert config.approved_applications
+    assert config.approved_scripts
+    assert config.approved_repositories
+    assert config.approved_backups
+    assert config.approved_files
+    assert config.approved_directory_creations
+    assert config.approved_copies
+
+
+def test_committed_example_configuration_p2_sections_are_genuine_top_level_sections():
+    """Regression: create_directory/copy_file must be their own top-level
+    YAML sections - mirrors
+    test_committed_example_configuration_approved_files_is_a_genuine_top_level_section
+    above for the same reason (a nesting mistake would silently make a
+    section unreachable rather than loading it at all)."""
+
+    config = load_tools_config(_EXAMPLE_CONFIG_PATH)
+
+    assert config.approved_directory_creations == {
+        "project_exports": DirectoryCreationSpec(
+            parent_directory_key="documents", directory_name="exports"
+        )
+    }
+    assert config.approved_copies == {
+        "resume_backup": FileCopySpec(
+            source_file_key="resume_pdf",
+            destination_directory_key="downloads",
+            destination_name="resume_backup.pdf",
+        )
+    }
+
+
+def test_committed_example_configuration_approved_files_is_a_genuine_top_level_section():
+    """Regression: approved_files must be its own top-level YAML section,
+    not accidentally nested under repository_backup (or any other
+    section) - a nesting mistake would silently make it unreachable
+    (rejected as an unrecognized field of whatever it was nested under, or
+    simply never parsed) rather than loading as approved_files at all."""
+
+    config = load_tools_config(_EXAMPLE_CONFIG_PATH)
+
+    assert config.approved_files == {
+        "resume_pdf": FileSpec(path="C:/Users/REPLACE_ME/Documents/resume.pdf"),
+        "notes_txt": FileSpec(path="C:/Users/REPLACE_ME/Documents/notes.txt"),
+    }
+
+
+# --- is_valid_child_name() (Milestone 43 P2) --------------------------------
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        None,
+        123,
+        "",
+        ".",
+        "..",
+        "a\x00b",
+        "a/b",
+        "a\\b",
+        "/etc/passwd",
+        "C:/Windows",
+        "C:\\Windows",
+        "C:",
+        "\\\\server\\share",
+        "name:stream",
+        " leading",
+        "trailing ",
+        " both ",
+        "trailing.",
+        "CON",
+        "con",
+        "CON.txt",
+        "con.TXT",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "com9",
+        "LPT1",
+        "lpt9.log",
+    ],
+)
+def test_is_valid_child_name_rejects(invalid_name):
+    assert is_valid_child_name(invalid_name) is False
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "exports",
+        "monthly_report.pdf",
+        "Report Archive",
+        "a",
+        "CONTACT",  # contains "CON" but is not equal to it
+        "NULLABLE",  # contains "NUL" but is not equal to it
+        "report.tar.gz",
+        "résumé.pdf",
+    ],
+)
+def test_is_valid_child_name_accepts(valid_name):
+    assert is_valid_child_name(valid_name) is True
+
+
+# --- create_directory (Milestone 43 P2) -------------------------------------
+
+
+def test_valid_create_directory_section_parses(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_directory_creations == {
+        "project_exports": DirectoryCreationSpec(
+            parent_directory_key="documents", directory_name="exports"
+        )
+    }
+
+
+def test_multiple_create_directory_operations_parse(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "    downloads: C:/Users/Example/Downloads\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n"
+        "    download_archive:\n"
+        "      parent_directory: downloads\n"
+        "      directory_name: archive\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert set(config.approved_directory_creations) == {"project_exports", "download_archive"}
+
+
+def test_missing_create_directory_section_yields_an_empty_dict(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n  approved_directories:\n    documents: C:/Users/Example/Documents\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_directory_creations == {}
+
+
+def test_create_directory_unsupported_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n"
+        "      extra_field: nope\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_missing_required_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_non_mapping_section_raises(tmp_path):
+    path = _write(tmp_path, "create_directory:\n  - not\n  - a\n  - mapping\n")
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_duplicate_key_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    Project_Exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: one\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: two\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_unknown_parent_directory_reference_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: not_registered\n"
+        "      directory_name: exports\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_reference_without_any_list_files_section_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_parent_directory_reference_is_case_insensitive(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    Documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: DOCUMENTS\n"
+        "      directory_name: exports\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_directory_creations["project_exports"].parent_directory_key == "documents"
+
+
+@pytest.mark.parametrize("unsafe_name", ["..", "a/b", "a\\b", "CON", "trailing."])
+def test_create_directory_unsafe_directory_name_raises_at_config_load(tmp_path, unsafe_name):
+    quoted = json.dumps(unsafe_name)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        f"      directory_name: {quoted}\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+# --- copy_file (Milestone 43 P2) --------------------------------------------
+
+
+def test_valid_copy_file_section_parses(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_copies == {
+        "monthly_report_archive": FileCopySpec(
+            source_file_key="monthly_report",
+            destination_directory_key="archive",
+            destination_name="monthly_report.pdf",
+        )
+    }
+
+
+def test_missing_copy_file_section_yields_an_empty_dict(tmp_path):
+    path = _write(tmp_path, "list_files:\n  approved_directories:\n    archive: D:/Archive\n")
+
+    config = load_tools_config(path)
+
+    assert config.approved_copies == {}
+
+
+def test_copy_file_unsupported_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        "      destination_name: monthly_report.pdf\n"
+        "      extra_field: nope\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_copy_file_missing_required_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_copy_file_non_mapping_section_raises(tmp_path):
+    path = _write(tmp_path, "copy_file:\n  - not\n  - a\n  - mapping\n")
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_copy_file_duplicate_key_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    Monthly_Report_Archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        "      destination_name: one.pdf\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        "      destination_name: two.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_copy_file_unknown_source_file_reference_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: not_registered\n"
+        "      destination_directory: archive\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_copy_file_unknown_destination_directory_reference_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: not_registered\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_copy_file_references_are_case_insensitive(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    Archive: D:/Archive\n"
+        "approved_files:\n"
+        "  Monthly_Report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: MONTHLY_REPORT\n"
+        "      destination_directory: ARCHIVE\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    config = load_tools_config(path)
+
+    spec = config.approved_copies["monthly_report_archive"]
+    assert spec.source_file_key == "monthly_report"
+    assert spec.destination_directory_key == "archive"
+
+
+@pytest.mark.parametrize("unsafe_name", ["..", "a/b", "a\\b", "CON", "trailing."])
+def test_copy_file_unsafe_destination_name_raises_at_config_load(tmp_path, unsafe_name):
+    quoted = json.dumps(unsafe_name)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        f"      destination_name: {quoted}\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+# --- MAX_SYMBOLIC_NAME_LENGTH (Milestone 43 P2 correction) ------------------
+# A successful create_directory/copy_file ActionResult.message echoes the
+# composite operation key and every reference field verbatim - all must be
+# bounded so a successful result can never exceed the M42 persistence
+# bound, discovered only AFTER the real side effect already happened.
+
+
+def test_oversized_create_directory_operation_key_raises_at_config_load(tmp_path):
+    long_key = "k" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        f"    {long_key}:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_create_directory_operation_key_at_exactly_the_length_limit_parses(tmp_path):
+    exact_key = "k" * MAX_SYMBOLIC_NAME_LENGTH
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        f"    {exact_key}:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert exact_key in config.approved_directory_creations
+
+
+def test_oversized_approved_files_key_raises_at_config_load(tmp_path):
+    """Milestone 43 P3 pre-push review correction: a successful
+    file_metadata/read_text_file ActionResult.message echoes the
+    approved_files key verbatim (see kernel/tools/handlers/file_metadata.py,
+    read_text_file.py), so it must be bounded exactly like
+    create_directory/copy_file's own composite keys - previously this was
+    the one M43 symbolic identifier MAX_SYMBOLIC_NAME_LENGTH did not cover,
+    letting a real (not merely hand-built) tools.yaml load successfully and
+    then overflow the M42 persistence bound at execution time."""
+
+    long_key = "k" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        f"  {long_key}:\n"
+        "    path: C:/Users/Example/notes.txt\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_approved_files_key_at_exactly_the_length_limit_parses(tmp_path):
+    exact_key = "k" * MAX_SYMBOLIC_NAME_LENGTH
+    path = _write(
+        tmp_path,
+        "approved_files:\n"
+        f"  {exact_key}:\n"
+        "    path: C:/Users/Example/notes.txt\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert exact_key in config.approved_files
+
+
+def test_oversized_create_directory_parent_reference_raises_at_config_load(tmp_path):
+    long_parent_key = "p" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        f"    {long_parent_key}: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        f"      parent_directory: {long_parent_key}\n"
+        "      directory_name: exports\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_oversized_directory_name_raises_at_config_load(tmp_path):
+    long_name = "e" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        f"      directory_name: {long_name}\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_oversized_copy_file_operation_key_raises_at_config_load(tmp_path):
+    long_key = "k" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        f"    {long_key}:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_oversized_copy_file_source_reference_raises_at_config_load(tmp_path):
+    long_source_key = "s" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        f"  {long_source_key}:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        f"      source_file: {long_source_key}\n"
+        "      destination_directory: archive\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_oversized_copy_file_destination_directory_reference_raises_at_config_load(tmp_path):
+    long_dest_key = "d" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        f"    {long_dest_key}: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        f"      destination_directory: {long_dest_key}\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_oversized_destination_name_raises_at_config_load(tmp_path):
+    long_name = "n" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    archive: D:/Archive\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        f"      destination_name: {long_name}\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_is_valid_child_name_rejects_a_name_over_the_length_limit():
+    assert is_valid_child_name("a" * (MAX_SYMBOLIC_NAME_LENGTH + 1)) is False
+
+
+def test_is_valid_child_name_accepts_a_name_at_exactly_the_length_limit():
+    assert is_valid_child_name("a" * MAX_SYMBOLIC_NAME_LENGTH) is True
+
+
+def test_full_valid_configuration_parses_all_eight_sections(tmp_path):
+    path = _write(
+        tmp_path,
+        "list_files:\n"
+        "  approved_directories:\n"
+        "    documents: C:/Users/Example/Documents\n"
+        "    archive: D:/Archive\n"
+        "open_application:\n"
+        "  approved_applications:\n"
+        "    notepad:\n"
+        "      executable: C:/Windows/System32/notepad.exe\n"
+        "      cwd: C:/Windows/System32\n"
+        "run_registered_script:\n"
+        "  approved_scripts:\n"
+        "    backup:\n"
+        "      interpreter: C:/python.exe\n"
+        "      script_path: C:/AI-OS/scripts/backup.py\n"
+        "      cwd: C:/AI-OS\n"
+        "repo_health:\n"
+        "  approved_repositories:\n"
+        "    ai_os:\n"
+        "      path: C:/AI-OS\n"
+        "repository_backup:\n"
+        "  approved_backups:\n"
+        "    ai_os:\n"
+        "      destination_directory: D:/AI-OS-Backups\n"
+        "approved_files:\n"
+        "  monthly_report:\n"
+        "    path: C:/Users/Example/Documents/report.pdf\n"
+        "create_directory:\n"
+        "  approved_directory_creations:\n"
+        "    project_exports:\n"
+        "      parent_directory: documents\n"
+        "      directory_name: exports\n"
+        "copy_file:\n"
+        "  approved_copies:\n"
+        "    monthly_report_archive:\n"
+        "      source_file: monthly_report\n"
+        "      destination_directory: archive\n"
+        "      destination_name: monthly_report.pdf\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_directory_creations == {
+        "project_exports": DirectoryCreationSpec(
+            parent_directory_key="documents", directory_name="exports"
+        )
+    }
+    assert config.approved_copies == {
+        "monthly_report_archive": FileCopySpec(
+            source_file_key="monthly_report",
+            destination_directory_key="archive",
+            destination_name="monthly_report.pdf",
+        )
+    }

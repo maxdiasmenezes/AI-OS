@@ -38,6 +38,10 @@ _RESOURCE_FIELD_BY_ACTION = {
     "run_registered_script": "approved_scripts",
     "repo_health": "approved_repositories",
     "repository_backup": "approved_backups",
+    "file_metadata": "approved_files",
+    "read_text_file": "approved_files",
+    "create_directory": "approved_directory_creations",
+    "copy_file": "approved_copies",
 }
 
 _SUMMARY_TEMPLATES = {
@@ -47,6 +51,11 @@ _SUMMARY_TEMPLATES = {
     "run_registered_script": lambda key: f"Run the registered '{key}' script.",
     "repo_health": lambda key: f"Check the health of the registered '{key}' repository.",
     "repository_backup": lambda key: f"Back up the registered '{key}' repository.",
+    "file_metadata": lambda key: f"Check metadata for the registered '{key}' file.",
+    "read_text_file": lambda key: f"Read the contents of the registered '{key}' file.",
+    "list_processes": lambda key: "List currently running processes.",
+    "create_directory": lambda key: f"Create the registered '{key}' directory.",
+    "copy_file": lambda key: f"Copy the registered '{key}' file.",
 }
 
 # Actions whose resource_key names one specific, narrowly-purposed
@@ -57,8 +66,28 @@ _SUMMARY_TEMPLATES = {
 # docstring in types.py for the reasoning). A fixed, catalog-owned contract
 # property - never derived from request text or model output, and never
 # grown to cover a new action without the same species-vs-genus reasoning
-# applying to it.
-_NAMED_CAPABILITY_ACTIONS = frozenset({"open_application", "run_registered_script"})
+# applying to it. file_metadata/read_text_file (Milestone 43 P1) join this
+# set for the same reason open_application/run_registered_script do: an
+# approved_files key names one specific, exact file (a SPECIES, not a
+# location/category) - "read the file" without the request itself naming
+# which one must never silently authorize a specifically-named file the
+# request never mentioned, exactly like an unnamed script/application.
+# create_directory/copy_file (Milestone 43 P2) join for the identical
+# reason: each resource_key names one complete, pre-authorized composite
+# operation (a specific parent+child pair, or a specific source+
+# destination+name triple) - "create a directory" or "copy the file"
+# without the request naming which preconfigured operation must never
+# silently authorize one the request never identified.
+_NAMED_CAPABILITY_ACTIONS = frozenset(
+    {
+        "open_application",
+        "run_registered_script",
+        "file_metadata",
+        "read_text_file",
+        "create_directory",
+        "copy_file",
+    }
+)
 
 
 def _requires_grounding(action_name: str, configured_resource_count: int) -> bool:

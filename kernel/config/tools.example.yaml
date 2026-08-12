@@ -37,6 +37,28 @@
 #     filename-safe: lowercase ASCII letters, digits, "_", and "-" only,
 #     starting with a letter or digit, at most 64 characters - it is used
 #     directly inside the generated backup filename.
+#   - approved_files (Milestone 43 P1: file_metadata/read_text_file) names
+#     EXACTLY ONE approved file per key - never a directory and never a
+#     pattern. Approving a directory elsewhere (list_files) does not imply
+#     permission to read or inspect every file inside it; each file that
+#     file_metadata/read_text_file may touch must be registered here
+#     individually, by its own exact absolute path.
+#   - create_directory.approved_directory_creations[*] (Milestone 43 P2)
+#     names ONE complete, pre-authorized (parent, child name) pair -
+#     parent_directory must already exist as a list_files.approved_directories
+#     key (never a duplicated raw path), and directory_name must be a
+#     single, safe path component (no path separator, no "." or "..", no
+#     drive/UNC syntax, no trailing dot/space, not a Windows reserved
+#     device name). Create-only: an existing target of any kind (file,
+#     directory, or symlink) is never overwritten.
+#   - copy_file.approved_copies[*] (Milestone 43 P2) names ONE complete,
+#     pre-authorized (source, destination directory, destination name)
+#     triple - source_file must already exist as an approved_files key and
+#     destination_directory must already exist as a
+#     list_files.approved_directories key (never duplicated raw paths);
+#     destination_name follows the same safe-path-component rule
+#     directory_name does above. Create-only: an existing destination is
+#     never overwritten.
 
 list_files:
   approved_directories:
@@ -67,3 +89,22 @@ repository_backup:
   approved_backups:
     ai_os:
       destination_directory: "D:/REPLACE_ME/AI-OS-Backups"
+
+approved_files:
+  resume_pdf:
+    path: "C:/Users/REPLACE_ME/Documents/resume.pdf"
+  notes_txt:
+    path: "C:/Users/REPLACE_ME/Documents/notes.txt"
+
+create_directory:
+  approved_directory_creations:
+    project_exports:
+      parent_directory: documents
+      directory_name: exports
+
+copy_file:
+  approved_copies:
+    resume_backup:
+      source_file: resume_pdf
+      destination_directory: downloads
+      destination_name: resume_backup.pdf

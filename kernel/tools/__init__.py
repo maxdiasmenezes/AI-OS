@@ -10,12 +10,16 @@ public surface.
 
 from kernel.tools.config import (
     ApplicationSpec,
+    DirectoryCreationSpec,
+    FileCopySpec,
+    FileSpec,
     RepoBackupSpec,
     RepoSpec,
     ScriptSpec,
     ToolsConfig,
     ToolsConfigError,
     is_valid_backup_key,
+    is_valid_child_name,
     load_tools_config,
 )
 from kernel.tools.confirmation import ConfirmationStore, PendingAction, default_store
@@ -25,12 +29,16 @@ from kernel.tools.types import ActionRequest, ActionResult
 
 __all__ = [
     "ApplicationSpec",
+    "DirectoryCreationSpec",
+    "FileCopySpec",
+    "FileSpec",
     "RepoBackupSpec",
     "RepoSpec",
     "ScriptSpec",
     "ToolsConfig",
     "ToolsConfigError",
     "is_valid_backup_key",
+    "is_valid_child_name",
     "load_tools_config",
     "ConfirmationStore",
     "PendingAction",

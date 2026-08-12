@@ -7,6 +7,9 @@ import pytest
 from kernel.task_planner.catalog import build_catalog
 from kernel.tools.config import (
     ApplicationSpec,
+    DirectoryCreationSpec,
+    FileCopySpec,
+    FileSpec,
     RepoBackupSpec,
     RepoSpec,
     ScriptSpec,
@@ -46,8 +49,9 @@ def test_catalog_covers_every_configured_resource(registry, full_tools_config):
         ("run_registered_script", "daily_report"),
         ("repo_health", "ai-os"),
         ("repository_backup", "ai-os"),
+        ("list_processes", None),
     }
-    assert len(catalog) == 7
+    assert len(catalog) == 8
 
 
 def test_system_status_gets_exactly_one_entry_with_no_resource_key(registry, full_tools_config):
@@ -83,9 +87,10 @@ def test_empty_config_sections_yield_no_entries_for_that_action(registry):
         approved_backups={},
     )
     catalog = build_catalog(registry, empty)
-    # Only system_status (FORBIDDEN resource key) survives an entirely
-    # empty configuration - every other action needs a configured key.
-    assert [e.action_name for e in catalog] == ["system_status"]
+    # Only the two FORBIDDEN-resource-key actions (system_status,
+    # list_processes) survive an entirely empty configuration - every
+    # other action needs a configured key.
+    assert [e.action_name for e in catalog] == ["system_status", "list_processes"]
 
 
 def test_catalog_never_exposes_a_path_or_executable(registry, full_tools_config):
@@ -115,6 +120,7 @@ def test_catalog_order_follows_registry_declaration_order_then_config_order(
         "run_registered_script",
         "repo_health",
         "repository_backup",
+        "list_processes",
     ]
     list_files_keys = [e.resource_key for e in catalog if e.action_name == "list_files"]
     assert list_files_keys == ["documents", "downloads"]
@@ -197,3 +203,232 @@ def test_system_status_never_requires_grounding(registry, full_tools_config):
     catalog = build_catalog(registry, full_tools_config)
     status_entry = next(e for e in catalog if e.action_name == "system_status")
     assert status_entry.requires_capability_grounding is False
+
+
+# --- Milestone 43 P1: file_metadata / read_text_file / list_processes -------
+
+
+@pytest.fixture
+def full_tools_config_with_files(full_tools_config):
+    return ToolsConfig(
+        approved_directories=full_tools_config.approved_directories,
+        approved_applications=full_tools_config.approved_applications,
+        approved_scripts=full_tools_config.approved_scripts,
+        approved_repositories=full_tools_config.approved_repositories,
+        approved_backups=full_tools_config.approved_backups,
+        approved_files={
+            "resume_pdf": FileSpec(path="/f/resume.pdf"),
+            "notes_txt": FileSpec(path="/f/notes.txt"),
+        },
+    )
+
+
+def test_catalog_covers_file_metadata_and_read_text_file_per_approved_files_key(
+    registry, full_tools_config_with_files
+):
+    catalog = build_catalog(registry, full_tools_config_with_files)
+    pairs = {(e.action_name, e.resource_key) for e in catalog}
+
+    assert ("file_metadata", "resume_pdf") in pairs
+    assert ("file_metadata", "notes_txt") in pairs
+    assert ("read_text_file", "resume_pdf") in pairs
+    assert ("read_text_file", "notes_txt") in pairs
+
+    file_metadata_entries = [e for e in catalog if e.action_name == "file_metadata"]
+    read_text_file_entries = [e for e in catalog if e.action_name == "read_text_file"]
+    assert len(file_metadata_entries) == 2
+    assert len(read_text_file_entries) == 2
+
+
+def test_list_processes_gets_exactly_one_entry_with_no_resource_key(
+    registry, full_tools_config_with_files
+):
+    catalog = build_catalog(registry, full_tools_config_with_files)
+    process_entries = [e for e in catalog if e.action_name == "list_processes"]
+
+    assert len(process_entries) == 1
+    assert process_entries[0].resource_key is None
+    assert process_entries[0].sensitive is False
+    assert process_entries[0].requires_capability_grounding is False
+
+
+def test_list_processes_has_exactly_one_candidate_even_with_no_config_at_all(registry):
+    empty = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+        approved_files={},
+    )
+    catalog = build_catalog(registry, empty)
+    process_entries = [e for e in catalog if e.action_name == "list_processes"]
+
+    assert len(process_entries) == 1
+    assert process_entries[0].resource_key is None
+
+
+def test_file_metadata_and_read_text_file_are_non_sensitive_in_the_catalog(
+    registry, full_tools_config_with_files
+):
+    catalog = build_catalog(registry, full_tools_config_with_files)
+    by_action = {e.action_name: e.sensitive for e in catalog}
+
+    assert by_action["file_metadata"] is False
+    assert by_action["read_text_file"] is False
+    assert by_action["list_processes"] is False
+
+
+def test_file_actions_require_grounding_even_with_a_single_configured_file(registry):
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+        approved_files={"resume_pdf": FileSpec(path="/f/resume.pdf")},
+    )
+    catalog = build_catalog(registry, config)
+    by_action = {e.action_name: e for e in catalog}
+
+    # Exactly one configured file - a "genus" action with a single resource
+    # would not require grounding (see the repo_health precedent above),
+    # but an exact-file action is intrinsically a SPECIES (like
+    # open_application/run_registered_script) - naming the sole registered
+    # file is still a narrowing "read the file" alone never justifies.
+    assert by_action["file_metadata"].requires_capability_grounding is True
+    assert by_action["read_text_file"].requires_capability_grounding is True
+
+
+def test_catalog_never_exposes_a_path_for_file_actions(registry, full_tools_config_with_files):
+    catalog = build_catalog(registry, full_tools_config_with_files)
+    for entry in catalog:
+        if entry.action_name in ("file_metadata", "read_text_file"):
+            assert "/f/" not in entry.summary
+            assert ".pdf" not in entry.summary
+            assert ".txt" not in entry.summary
+
+
+def test_catalog_ids_remain_opaque_and_sequential_with_file_actions_included(
+    registry, full_tools_config_with_files
+):
+    catalog = build_catalog(registry, full_tools_config_with_files)
+    assert [e.catalog_id for e in catalog] == [f"action_{i}" for i in range(1, len(catalog) + 1)]
+
+
+# --- Milestone 43 P2: create_directory / copy_file ---------------------------
+
+
+@pytest.fixture
+def full_tools_config_with_p2(full_tools_config_with_files):
+    base = full_tools_config_with_files
+    return ToolsConfig(
+        approved_directories=base.approved_directories,
+        approved_applications=base.approved_applications,
+        approved_scripts=base.approved_scripts,
+        approved_repositories=base.approved_repositories,
+        approved_backups=base.approved_backups,
+        approved_files=base.approved_files,
+        approved_directory_creations={
+            "project_exports": DirectoryCreationSpec(
+                parent_directory_key="documents", directory_name="exports"
+            )
+        },
+        approved_copies={
+            "monthly_report_archive": FileCopySpec(
+                source_file_key="resume_pdf",
+                destination_directory_key="downloads",
+                destination_name="resume.pdf",
+            )
+        },
+    )
+
+
+def test_catalog_covers_create_directory_and_copy_file_per_configured_operation(
+    registry, full_tools_config_with_p2
+):
+    catalog = build_catalog(registry, full_tools_config_with_p2)
+    pairs = {(e.action_name, e.resource_key) for e in catalog}
+
+    assert ("create_directory", "project_exports") in pairs
+    assert ("copy_file", "monthly_report_archive") in pairs
+
+    create_directory_entries = [e for e in catalog if e.action_name == "create_directory"]
+    copy_file_entries = [e for e in catalog if e.action_name == "copy_file"]
+    assert len(create_directory_entries) == 1
+    assert len(copy_file_entries) == 1
+
+
+def test_create_directory_and_copy_file_are_sensitive_in_the_catalog(
+    registry, full_tools_config_with_p2
+):
+    catalog = build_catalog(registry, full_tools_config_with_p2)
+    by_action = {e.action_name: e.sensitive for e in catalog}
+
+    assert by_action["create_directory"] is True
+    assert by_action["copy_file"] is True
+
+
+def test_create_directory_and_copy_file_require_grounding_even_with_a_single_configured_operation(
+    registry,
+):
+    config = ToolsConfig(
+        approved_directories={"documents": "/x/documents"},
+        approved_applications={},
+        approved_scripts={},
+        approved_files={"resume_pdf": FileSpec(path="/f/resume.pdf")},
+        approved_directory_creations={
+            "project_exports": DirectoryCreationSpec(
+                parent_directory_key="documents", directory_name="exports"
+            )
+        },
+        approved_copies={
+            "monthly_report_archive": FileCopySpec(
+                source_file_key="resume_pdf",
+                destination_directory_key="documents",
+                destination_name="resume.pdf",
+            )
+        },
+    )
+    catalog = build_catalog(registry, config)
+    by_action = {e.action_name: e for e in catalog}
+
+    # Exactly one configured operation each - a "genus" action with a
+    # single resource would not require grounding, but a pre-authorized
+    # composite operation is intrinsically a SPECIES (like
+    # open_application/file_metadata) - naming the sole registered
+    # operation is still a narrowing "create a directory"/"copy the file"
+    # alone never justifies.
+    assert by_action["create_directory"].requires_capability_grounding is True
+    assert by_action["copy_file"].requires_capability_grounding is True
+
+
+def test_catalog_never_exposes_a_path_for_create_directory_or_copy_file(
+    registry, full_tools_config_with_p2
+):
+    catalog = build_catalog(registry, full_tools_config_with_p2)
+    for entry in catalog:
+        if entry.action_name in ("create_directory", "copy_file"):
+            # Only the composite operation's own key ("project_exports",
+            # "monthly_report_archive") may appear - never any nested
+            # field the spec references (parent/destination directory
+            # key, directory/destination name) or a raw path.
+            assert "/x/" not in entry.summary
+            assert "/f/" not in entry.summary
+            assert "documents" not in entry.summary
+            assert "downloads" not in entry.summary
+            assert "resume_pdf" not in entry.summary
+            assert ".pdf" not in entry.summary
+
+
+def test_create_directory_has_no_entries_when_unconfigured(registry, full_tools_config):
+    catalog = build_catalog(registry, full_tools_config)
+    assert [e for e in catalog if e.action_name == "create_directory"] == []
+    assert [e for e in catalog if e.action_name == "copy_file"] == []
+
+
+def test_catalog_ids_remain_opaque_and_sequential_with_p2_actions_included(
+    registry, full_tools_config_with_p2
+):
+    catalog = build_catalog(registry, full_tools_config_with_p2)
+    assert [e.catalog_id for e in catalog] == [f"action_{i}" for i in range(1, len(catalog) + 1)]

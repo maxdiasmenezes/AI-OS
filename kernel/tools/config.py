@@ -27,6 +27,8 @@ from pathlib import Path
 
 import yaml
 
+from kernel.tools import browser_safety
+
 # kernel/tools/config.py -> kernel/tools -> kernel -> project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TOOLS_YAML_PATH = _PROJECT_ROOT / "kernel" / "config" / "tools.yaml"
@@ -43,6 +45,7 @@ _TOP_LEVEL_KEYS = {
     "approved_files",
     "create_directory",
     "copy_file",
+    "approved_pages",
 }
 _LIST_FILES_KEYS = {"approved_directories"}
 _OPEN_APPLICATION_KEYS = {"approved_applications"}
@@ -60,6 +63,8 @@ _BACKUP_REQUIRED_FIELDS = {"destination_directory"}
 _BACKUP_ALL_FIELDS = _BACKUP_REQUIRED_FIELDS
 _APPROVED_FILE_REQUIRED_FIELDS = {"path"}
 _APPROVED_FILE_ALL_FIELDS = _APPROVED_FILE_REQUIRED_FIELDS
+_APPROVED_PAGE_REQUIRED_FIELDS = {"url"}
+_APPROVED_PAGE_ALL_FIELDS = _APPROVED_PAGE_REQUIRED_FIELDS | {"allowed_stylesheet_origins"}
 _DIRECTORY_CREATION_REQUIRED_FIELDS = {"parent_directory", "directory_name"}
 _DIRECTORY_CREATION_ALL_FIELDS = _DIRECTORY_CREATION_REQUIRED_FIELDS
 _FILE_COPY_REQUIRED_FIELDS = {"source_file", "destination_directory", "destination_name"}
@@ -299,6 +304,27 @@ class FileSpec:
 
 
 @dataclass(frozen=True)
+class ApprovedPageSpec:
+    """One exact, individually-approved browser page (Milestone 44 P1) -
+    the resource kernel/tools/handlers/browser_read_page.py resolves a
+    resource_key against. `url` is the exact, config-authored, already
+    HTTPS-validated and normalized canonical page URL (path/query
+    preserved, fragment dropped - see kernel/tools/browser_safety.py's
+    parse_https_url()) - never a directory, never a pattern, never
+    combined with any caller-supplied path/query. `allowed_stylesheet_origins`
+    is a small, explicit tuple of already-validated, normalized HTTPS
+    origin strings (kernel/tools/browser_safety.py's parse_https_origin())
+    authorizing GET stylesheet requests ONLY - it never authorizes a
+    document request, on that origin or any other, even the page's own
+    origin (see browser_safety.py's AUTHORITY MODEL docstring section: an
+    admin who wants the page's own origin to also serve stylesheets must
+    list it explicitly - it is never implied)."""
+
+    url: str
+    allowed_stylesheet_origins: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class DirectoryCreationSpec:
     """One exact, pre-authorized directory-creation operation (Milestone
     43 P2) - the resource kernel/tools/handlers/create_directory.py
@@ -339,6 +365,7 @@ class ToolsConfig:
     approved_files: dict = field(default_factory=dict)
     approved_directory_creations: dict = field(default_factory=dict)
     approved_copies: dict = field(default_factory=dict)
+    approved_pages: dict = field(default_factory=dict)
 
 
 EMPTY_TOOLS_CONFIG = ToolsConfig(
@@ -350,6 +377,7 @@ EMPTY_TOOLS_CONFIG = ToolsConfig(
     approved_files={},
     approved_directory_creations={},
     approved_copies={},
+    approved_pages={},
 )
 
 
@@ -618,6 +646,76 @@ def _parse_approved_files(section) -> dict:
     return result
 
 
+def _parse_approved_pages(section) -> dict:
+    """approved_pages (Milestone 44 P1): a flat, top-level mapping of
+    symbolic key -> ApprovedPageSpec, matching approved_files' own
+    precedent - the top-level "approved_pages" key IS the resource
+    mapping, not further nested under its own "approved_X" sub-key. Each
+    entry names exactly one canonical HTTPS page URL plus an optional,
+    small, explicit list of additional HTTPS origins authorized for
+    stylesheet GET requests only - see kernel/tools/browser_safety.py's
+    module docstring (AUTHORITY MODEL) for why stylesheet authority never
+    implies document authority, even on the page's own origin."""
+
+    if not isinstance(section, dict):
+        raise ToolsConfigError("approved_pages must be a mapping")
+
+    result = {}
+    seen: dict = {}
+    for raw_key, spec in section.items():
+        key = _casefolded_unique_key(
+            raw_key, seen, "approved_pages", max_length=MAX_SYMBOLIC_NAME_LENGTH
+        )
+        if not isinstance(spec, dict):
+            raise ToolsConfigError(f"approved_pages[{raw_key!r}] must be a mapping")
+        context = f"approved_pages[{raw_key!r}]"
+        _reject_unknown_fields(set(spec), _APPROVED_PAGE_ALL_FIELDS, context)
+        missing = _APPROVED_PAGE_REQUIRED_FIELDS - set(spec)
+        if missing:
+            raise ToolsConfigError(f"{context} missing required field(s): {sorted(missing)}")
+
+        try:
+            normalized_url, _ = browser_safety.parse_https_url(
+                spec["url"], field_name=f"{context}.url"
+            )
+        except browser_safety.BrowserSafetyError as exc:
+            raise ToolsConfigError(str(exc)) from exc
+
+        raw_origins = spec.get("allowed_stylesheet_origins", [])
+        if not isinstance(raw_origins, list):
+            raise ToolsConfigError(f"{context}.allowed_stylesheet_origins must be a list")
+        if len(raw_origins) > browser_safety.MAX_STYLESHEET_ORIGINS:
+            raise ToolsConfigError(
+                f"{context}.allowed_stylesheet_origins exceeds the maximum count "
+                f"({browser_safety.MAX_STYLESHEET_ORIGINS})"
+            )
+
+        normalized_origins = []
+        seen_origins: set = set()
+        for index, raw_origin in enumerate(raw_origins):
+            try:
+                origin = browser_safety.parse_https_origin(
+                    raw_origin,
+                    field_name=f"{context}.allowed_stylesheet_origins[{index}]",
+                )
+            except browser_safety.BrowserSafetyError as exc:
+                raise ToolsConfigError(str(exc)) from exc
+            origin_str = str(origin)
+            if origin_str in seen_origins:
+                raise ToolsConfigError(
+                    f"{context}.allowed_stylesheet_origins contains a duplicate "
+                    f"origin (after normalization): {raw_origin!r}"
+                )
+            seen_origins.add(origin_str)
+            normalized_origins.append(origin_str)
+
+        result[key] = ApprovedPageSpec(
+            url=normalized_url,
+            allowed_stylesheet_origins=tuple(normalized_origins),
+        )
+    return result
+
+
 def _parse_create_directory(section, known_directory_keys: set) -> dict:
     """create_directory (Milestone 43 P2): each entry is one complete,
     pre-authorized (parent directory key, child directory name) pair -
@@ -781,6 +879,9 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
         if "copy_file" in data
         else {}
     )
+    approved_pages = (
+        _parse_approved_pages(data["approved_pages"]) if "approved_pages" in data else {}
+    )
 
     return ToolsConfig(
         approved_directories=approved_directories,
@@ -791,4 +892,5 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
         approved_files=approved_files,
         approved_directory_creations=approved_directory_creations,
         approved_copies=approved_copies,
+        approved_pages=approved_pages,
     )

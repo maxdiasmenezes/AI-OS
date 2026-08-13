@@ -353,6 +353,45 @@ def test_action_step_missing_required_resource_key_fails_closed(registry, tools_
     assert isinstance(outcome, ActionRevalidationFailure)
 
 
+def test_browser_read_page_eligible_when_approved_pages_key_exists(registry):
+    steps = (_action_step(1, "browser_read_page", "example_docs"),)
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_pages={"example_docs": object()},
+    )
+
+    outcome = evaluate_next_step(task, [], registry, config)
+
+    assert isinstance(outcome, EligibleStep)
+    assert outcome.currently_sensitive is False
+
+
+def test_browser_read_page_removed_approved_pages_key_fails_closed_before_execution(registry):
+    # The plan was persisted referencing "example_docs", but the CURRENT
+    # tools_config (as of execution time) no longer configures it - the
+    # same "removed since planning" scenario
+    # test_removed_resource_key_fails_closed() already covers for
+    # run_registered_script, now proven for browser_read_page: this must
+    # fail BEFORE any browser is ever launched.
+    steps = (_action_step(1, "browser_read_page", "example_docs"),)
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+    empty_pages_config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_pages={},  # "example_docs" no longer configured
+    )
+
+    outcome = evaluate_next_step(task, [], registry, empty_pages_config)
+
+    assert isinstance(outcome, ActionRevalidationFailure)
+    assert outcome.step_position == 1
+    assert outcome.resource_key == "example_docs"
+
+
 def test_system_status_eligible_regardless_of_tools_config(registry):
     steps = (_action_step(1, "system_status", None),)
     task = _task_record(plan_json=_plan_json(_TASK_ID, steps))

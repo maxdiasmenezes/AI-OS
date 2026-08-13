@@ -57,20 +57,32 @@ _EXPECTED_MATRIX = {
     "list_processes": (False, ResourceKeyRequirement.FORBIDDEN),
     "create_directory": (True, ResourceKeyRequirement.REQUIRED),
     "copy_file": (True, ResourceKeyRequirement.REQUIRED),
+    # Milestone 44 P1 added one further action to this same shared
+    # registry after Milestone 43 closed - see
+    # tests/kernel/tools/test_registry.py's own
+    # test_milestone_44_p1_browser_read_page_is_not_sensitive for the
+    # dedicated M44 coverage; included here only so this whole-registry
+    # matrix stays accurate, since ActionRegistry is one shared allowlist,
+    # not a milestone-scoped snapshot.
+    "browser_read_page": (False, ResourceKeyRequirement.REQUIRED),
 }
 
 
 def test_final_registry_action_set_and_sensitivity_matrix():
-    """The complete, final Milestone 43 registry: exactly eleven actions
-    (six pre-existing plus the five M43 actions), no more and no fewer,
-    each with exactly the sensitivity and resource-key-requirement this
-    milestone's design established."""
+    """The complete registry as of Milestone 44 P1: the eleven actions
+    Milestone 43 closed with, plus Milestone 44 P1's one addition
+    (browser_read_page) - twelve total, no more and no fewer, each with
+    exactly the sensitivity and resource-key-requirement its own milestone
+    established. ActionRegistry is a single shared allowlist, not a
+    milestone-scoped snapshot, so this test's own exact-count assertion is
+    expected to need updating again whenever a later milestone adds
+    another action - that is not a regression."""
 
     registry = ActionRegistry()
     descriptors = registry.descriptors()
 
     assert {d.name for d in descriptors} == set(_EXPECTED_MATRIX)
-    assert len(descriptors) == 11
+    assert len(descriptors) == 12
 
     for descriptor in descriptors:
         expected_sensitive, expected_requirement = _EXPECTED_MATRIX[descriptor.name]

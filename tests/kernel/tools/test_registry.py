@@ -17,10 +17,11 @@ _ALL_ACTIONS = (
     "list_processes",
     "create_directory",
     "copy_file",
+    "browser_read_page",
 )
 
 
-def test_exactly_the_eleven_milestone_actions_are_known():
+def test_exactly_the_twelve_milestone_actions_are_known():
     registry = ActionRegistry()
 
     for action in _ALL_ACTIONS:
@@ -61,6 +62,12 @@ def test_milestone_43_p1_read_only_actions_are_not_sensitive():
     assert registry.is_sensitive("list_processes") is False
 
 
+def test_milestone_44_p1_browser_read_page_is_not_sensitive():
+    registry = ActionRegistry()
+
+    assert registry.is_sensitive("browser_read_page") is False
+
+
 def test_unknown_action_is_not_sensitive_and_has_no_handler():
     registry = ActionRegistry()
 
@@ -97,6 +104,7 @@ _EXPECTED_REQUIREMENTS = {
     "list_processes": ResourceKeyRequirement.FORBIDDEN,
     "create_directory": ResourceKeyRequirement.REQUIRED,
     "copy_file": ResourceKeyRequirement.REQUIRED,
+    "browser_read_page": ResourceKeyRequirement.REQUIRED,
 }
 
 

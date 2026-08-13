@@ -42,6 +42,7 @@ _RESOURCE_FIELD_BY_ACTION = {
     "read_text_file": "approved_files",
     "create_directory": "approved_directory_creations",
     "copy_file": "approved_copies",
+    "browser_read_page": "approved_pages",
 }
 
 _SUMMARY_TEMPLATES = {
@@ -56,6 +57,7 @@ _SUMMARY_TEMPLATES = {
     "list_processes": lambda key: "List currently running processes.",
     "create_directory": lambda key: f"Create the registered '{key}' directory.",
     "copy_file": lambda key: f"Copy the registered '{key}' file.",
+    "browser_read_page": lambda key: f"Read the registered '{key}' web page.",
 }
 
 # Actions whose resource_key names one specific, narrowly-purposed
@@ -78,6 +80,11 @@ _SUMMARY_TEMPLATES = {
 # destination+name triple) - "create a directory" or "copy the file"
 # without the request naming which preconfigured operation must never
 # silently authorize one the request never identified.
+# browser_read_page (Milestone 44 P1) joins for the same reason
+# file_metadata/read_text_file do: an approved_pages key names one
+# specific, exact web page (a SPECIES, not a location/category) - "read
+# the page" without the request naming which one must never silently
+# authorize a specifically-named page the request never mentioned.
 _NAMED_CAPABILITY_ACTIONS = frozenset(
     {
         "open_application",
@@ -86,6 +93,7 @@ _NAMED_CAPABILITY_ACTIONS = frozenset(
         "read_text_file",
         "create_directory",
         "copy_file",
+        "browser_read_page",
     }
 )
 

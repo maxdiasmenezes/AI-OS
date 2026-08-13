@@ -441,24 +441,27 @@ abandoned mid-processing.
 - **tools** — reusable tools (actions, integrations, lookups) that
   capabilities could invoke. Implemented (Milestone 33; extended in
   Milestone 34; extended again in Milestone 35; extended again in
-  Milestone 43): the safe computer task execution layer, transport-agnostic
+  Milestone 43; extended again in Milestone 44): the safe computer task
+  execution layer, transport-agnostic
   and consumed today only by
   `capabilities/tasks/TasksCapability` — see Capabilities below for the
   full command surface. `kernel/tools/types.py` defines `ActionRequest`
   (an action name plus an optional symbolic `resource_key` — never a raw
   path or argument list) and `ActionResult`. `kernel/tools/registry.py`'s
   `ActionRegistry` is the fixed, non-configurable allowlist of exactly
-  eleven actions (`system_status`, `list_files`, `open_application`,
+  twelve actions (`system_status`, `list_files`, `open_application`,
   `run_registered_script`, `repo_health`, `repository_backup`, —
   Milestone 43 P1 — `file_metadata`, `read_text_file`, `list_processes`,
-  and — Milestone 43 P2 — `create_directory`, `copy_file`) and which five
-  of them are sensitive (`open_application`, `run_registered_script`,
+  — Milestone 43 P2 — `create_directory`, `copy_file`, and — Milestone 44
+  — `browser_read_page`) and which five of them are sensitive
+  (`open_application`, `run_registered_script`,
   `repository_backup`, `create_directory`, `copy_file`) — `repo_health` is
   read-only and, like `system_status`/`list_files`, is not sensitive;
   `repository_backup`/`create_directory`/`copy_file` each write a new
   filesystem entry, so all three are sensitive; the three Milestone 43 P1
-  actions are all read-only and not sensitive either; no action beyond
-  these eleven is ever reachable, no matter what a caller asks for.
+  actions and `browser_read_page` are all read-only and not sensitive
+  either; no action beyond
+  these twelve is ever reachable, no matter what a caller asks for.
   `kernel/tools/git_safety.py`
   (Milestone 35) holds the local git-execution hardening shared by
   `repo_health.py` and `repository_backup.py` — `GIT_SAFE_PREFIX` and
@@ -2515,16 +2518,163 @@ this flow — a single call to `handle()` is one full request/response cycle.
   text/file writing, arbitrary shell/PowerShell, browser automation, and
   native GUI automation.
 
+- Milestone 44 — Browser Worker: **IMPLEMENTED.** Adds one registered
+  action to `kernel/tools/registry.py` — `ActionRegistry` now holds twelve
+  actions in total — `browser_read_page`, non-sensitive, requiring no
+  confirmation, the same read-only trust tier as `read_text_file`/
+  `file_metadata`. A new `kernel/tools/browser_safety.py` (URL/origin
+  parsing and normalization, private/local-network rejection, DNS
+  defense-in-depth, and the pure request-allowlist function shared by
+  production and by tests) and a new `ToolsConfig.approved_pages` section
+  (`kernel/tools/config.py`, `ApprovedPageSpec`) authorize exactly one
+  canonical HTTPS page URL per symbolic key, plus an optional, small
+  (at most `browser_safety.MAX_STYLESHEET_ORIGINS` = 5), explicit list of
+  additional HTTPS origins authorized for stylesheet `GET` requests
+  ONLY — never for document navigation, not even on the page's own
+  origin (an admin who wants the page's own origin to also serve its
+  stylesheet must list it explicitly). `browser_read_page`
+  (`kernel/tools/handlers/browser_read_page.py`) renders that one page in
+  an isolated, headless, single-use Playwright/Chromium browser context
+  with `java_script_enabled=False` (fixed, code-owned, not
+  configurable — this is the design's core safety property: no page
+  script can ever execute, so no `fetch()`/XHR/WebSocket construction/
+  `navigator.serviceWorker.register()`/JS navigation/`window.open()` can
+  ever be attempted in the first place) and `service_workers="block"` as
+  additional defense in depth (empirically: this does not make a page's
+  own `register()` call reject, but does prevent a worker from ever
+  gaining page-control or fetch-interception authority). WebSockets are
+  unsupported specifically *because* page JavaScript is disabled — not
+  because Playwright's own `route_web_socket()` mechanism is used (it was
+  found, empirically, to hang the browser context in this exact
+  environment/version and is not used anywhere in this codebase).
+
+  **Exact document identity is enforced through a semantic URL comparison,
+  never raw string equality** — an adversarial security review found that
+  Chromium's own reported `Request.url` omits a default HTTPS port even
+  when the configured URL included it explicitly, which a naive string
+  comparison would have silently and completely broken for any ordinarily-
+  written config. `kernel/tools/browser_safety.py`'s
+  `NormalizedDocumentURL`/`parse_document_url()` parse both the configured
+  page URL and every live request URL into the same structured
+  (scheme, normalized host, default-filled port, path, query) form before
+  comparison, so an omitted and an explicit default port are correctly
+  treated as identical while a genuinely different port remains distinct.
+  A configured path containing a `.`/`..` segment (including
+  case-insensitive percent-encoded forms) or a backslash is rejected
+  outright at config-validation time, rather than this module attempting
+  to emulate Chromium's own dot-segment-resolution/backslash-to-slash
+  rewriting.
+
+  **HTTP redirects are categorically unsupported — a deliberate design
+  choice, not a temporary limitation**, found necessary after Playwright's
+  `context.route()` was empirically shown not to reliably re-invoke for a
+  redirected request's target (a confirmed, currently-open upstream
+  Playwright limitation). Every request the context-wide gate permits —
+  exactly one main-frame `GET` document (the configured URL, matched in
+  full, exactly once per action — no HTTP redirect, meta refresh, or any
+  other secondary main-frame navigation is ever followed) or a `GET`
+  stylesheet from an explicitly authorized origin — is fetched via
+  `route.fetch(max_redirects=0, timeout=browser_read_page._FETCH_TIMEOUT_MS)`
+  (an explicit, code-owned 5-second timeout — Playwright's own `route.fetch()`
+  default is an unrelated 30 seconds, confirmed empirically to be governed
+  by neither `page.set_default_timeout()` nor
+  `set_default_navigation_timeout()`) and inspected before ever being
+  fulfilled into Chromium; any redirect, non-2xx status, wrong
+  Content-Type, or oversized response fails the read closed. Every other
+  resource class (script, image, font, media, iframe/subframe document,
+  XHR, fetch, beacon, prefetch, object, embed, manifest, favicon,
+  WebSocket, or anything else) is denied by the same small, fixed
+  ALLOWLIST — never a denylist that could omit a class its authors never
+  thought of.
+
+  **An action-wide stylesheet count and cumulative-byte bound close a gap
+  the per-response cap alone did not**: a real-browser reproduction during
+  adversarial review proved a 20-level recursive CSS `@import` chain and a
+  50-`<link>` page both passed through completely unrestricted before
+  this. `browser_safety.MAX_STYLESHEET_REQUESTS` (8) is checked and
+  consumed *before* `route.fetch()` is ever called for the next
+  stylesheet — an excess request is aborted before any network dispatch —
+  and `browser_safety.MAX_TOTAL_STYLESHEET_BYTES` (256 KiB) tracks the
+  authoritative, decompressed byte total of every stylesheet fulfilled so
+  far in the action (never `Content-Length`, which is advisory-only:
+  compression makes it diverge arbitrarily from the actual decompressed
+  size `APIResponse.body()` returns — confirmed empirically with a
+  519-byte response decompressing to 500,000 bytes). Exceeding either
+  bound fails the *whole* action closed once navigation completes, never a
+  silent partial-styling success. No CSS parsing of any kind happens in
+  Python — the request gate itself is the bound.
+
+  Output (`Page:`/`Location:`/`Title:`/`Content:`) is bounded (title/
+  location/visible-text each independently capped, empirically proven via
+  the real `build_action_observation()`/`serialize_observation()` pipeline
+  to fit `MAX_STEP_RESULT_JSON_CHARS` even in the worst JSON-escaping
+  case) and excludes query strings, fragments, cookies, headers, raw HTML,
+  iframe text, and any raw exception detail. A response-buffering residual
+  risk is documented honestly: Playwright 1.62.0's `route.fetch()` has no
+  hard pre-buffering byte ceiling, so the actual, decompressed
+  `len(body)` — never `Content-Length` — is the sole authoritative bound,
+  checked after fetch and before fulfillment; neither it nor the request-
+  count/cumulative-byte bounds above prevent the underlying fetch's own
+  network/memory/decompression cost inside Playwright's Node driver
+  process for any *one* response, which has already been paid by the time
+  any check runs — accepted, bounded in scope and duration (not
+  eliminated), for a personal, single-action-at-a-time system whose whole
+  browser process is destroyed at the end of every action.
+
+  **DNS defense-in-depth resolution runs in a real, killable OS
+  subprocess, not a Python thread.** `kernel/tools/dns_resolver_worker.py`
+  is a small, fixed, zero-project-import leaf script invoked via
+  `kernel/tools/process_control.py`'s `run_capturing_stdout()` — the same
+  `shell=False`, list-form-argv, full-process-tree-kill-and-reap primitive
+  already used by `open_application`/`run_registered_script`/
+  `repo_health`/`repository_backup`. This replaced an initial
+  `concurrent.futures.ThreadPoolExecutor`-based implementation that
+  adversarial review proved did NOT actually bound wall-clock time: a hung
+  resolver call left the executor's own context-manager exit
+  (`shutdown(wait=True)`) blocking for the resolver's full real duration
+  regardless of the configured timeout, since a Python thread blocked
+  inside a C-level socket call cannot be cancelled from another thread — a
+  real OS process can be, and now is. A DNS-rebinding residual risk is
+  documented honestly regardless: this defense-in-depth check is not full
+  DNS pinning — Chromium performs its own, independent resolution
+  afterward. No authenticated or persistent session of any kind exists —
+  one fresh, isolated browser context per action, always fully closed at
+  the end of that one action, never the user's real Chrome/Edge profile;
+  a server may set a cookie reused by a later *permitted* request within
+  that same action's own request sequence (ordinary browser behavior),
+  but the entire context (and any such cookie state) is destroyed
+  afterward. No `TaskPlan`/planner-schema change was needed —
+  `browser_read_page` fits `action_name` + one `resource_key` exactly like
+  every action since Milestone 33, and joins the planner's named-
+  capability-grounding set (`kernel/task_planner/catalog.py`) for the same
+  reason `file_metadata`/`read_text_file` do.
+
+  **Milestone 44 closes here, deliberately, without bounded browser
+  interaction.** Clicks, form submission, downloads, uploads, screenshots,
+  a separate `browser_open_page`/`browser_list_links` action, arbitrary
+  URLs or selectors, authenticated browsing, and headed mode were all
+  evaluated and are not implemented. This is not an unfinished phase of
+  this milestone — it is this milestone's completed scope. Safe execution
+  authority for JavaScript-enabled or otherwise interactive browser
+  behavior (page JavaScript, WebSockets, workers, dynamic DOM identity,
+  selectors, clicks, forms, state-changing navigation, authenticated
+  sessions, downloads/uploads) requires its own explicit security design;
+  it is deferred beyond the current Browser Worker milestone, not
+  "scheduled" as a numbered phase of it.
+
 **Planned / not yet implemented:**
 
-- Milestones 44-48, building on `kernel/task_execution/`'s execution
-  engine: Milestone 44 (Browser Worker), Milestone 45 (Windows Desktop
-  Worker), Milestone 46 (WhatsApp Task Control — real task submission,
-  result delivery, and confirmation-reply routing), Milestone 47
-  (persistence recovery/reconciliation, especially an uncertain
-  `in_progress` external action left behind by a process crash), and
-  Milestone 48 (employee acceptance/launch). None of this exists yet; do
-  not treat any of these names as implemented.
+- Milestones 45-48, building on `kernel/task_execution/`'s execution
+  engine: Milestone 45 (Windows Desktop Worker), Milestone 46 (WhatsApp
+  Task Control — real task submission, result delivery, and
+  confirmation-reply routing), Milestone 47 (persistence
+  recovery/reconciliation, especially an uncertain `in_progress` external
+  action left behind by a process crash), and Milestone 48 (employee
+  acceptance/launch). None of this exists yet; do not treat any of these
+  names as implemented. Milestone 44 does not, and must not, absorb any
+  of this scope — a future JavaScript-enabled or interactive browser
+  capability is a new, separately-designed feature, not a hidden part of
+  any of these four.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

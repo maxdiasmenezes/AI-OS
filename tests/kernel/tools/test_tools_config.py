@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from kernel.tools.browser_safety import MAX_STYLESHEET_ORIGINS
 from kernel.tools.config import (
     MAX_SYMBOLIC_NAME_LENGTH,
     ApplicationSpec,
+    ApprovedPageSpec,
     DirectoryCreationSpec,
     FileCopySpec,
     FileSpec,
@@ -1680,3 +1682,456 @@ def test_full_valid_configuration_parses_all_eight_sections(tmp_path):
             destination_name="monthly_report.pdf",
         )
     }
+
+
+# --- Milestone 44 P1: approved_pages ------------------------------------------
+
+
+def test_approved_pages_omitted_yields_empty_mapping(tmp_path):
+    path = _write(tmp_path, "list_files:\n  approved_directories:\n    documents: C:/one\n")
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages == {}
+
+
+def test_valid_canonical_https_page_parses(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n',
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages == {
+        "example_docs": ApprovedPageSpec(
+            url="https://example.com:443/docs", allowed_stylesheet_origins=()
+        )
+    }
+
+
+def test_allowed_stylesheet_origins_omitted_defaults_to_empty(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n  example_docs:\n    url: \"https://example.com/docs\"\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages["example_docs"].allowed_stylesheet_origins == ()
+
+
+def test_single_valid_stylesheet_origin(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://static.example.com"\n',
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages["example_docs"].allowed_stylesheet_origins == (
+        "https://static.example.com:443",
+    )
+
+
+def test_multiple_stylesheet_origins(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://static.example.com"\n'
+        '      - "https://cdn.example.com"\n',
+    )
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages["example_docs"].allowed_stylesheet_origins == (
+        "https://static.example.com:443",
+        "https://cdn.example.com:443",
+    )
+
+
+def test_duplicate_normalized_stylesheet_origin_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://static.example.com"\n'
+        '      - "https://STATIC.example.com:443"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_too_many_stylesheet_origins_raises(tmp_path):
+    origins = "\n".join(f'      - "https://s{i}.example.com"' for i in range(MAX_STYLESHEET_ORIGINS + 1))
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        f"    allowed_stylesheet_origins:\n{origins}\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_max_stylesheet_origins_is_accepted(tmp_path):
+    origins = "\n".join(f'      - "https://s{i}.example.com"' for i in range(MAX_STYLESHEET_ORIGINS))
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        f"    allowed_stylesheet_origins:\n{origins}\n",
+    )
+
+    config = load_tools_config(path)
+
+    assert len(config.approved_pages["example_docs"].allowed_stylesheet_origins) == MAX_STYLESHEET_ORIGINS
+
+
+def test_wildcard_stylesheet_origin_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://*.example.com"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_http_page_url_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n  bad:\n    url: \"http://example.com/docs\"\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_http_stylesheet_origin_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "http://static.example.com"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_userinfo_in_page_url_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n  bad:\n    url: \"https://user:pass@example.com/docs\"\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_userinfo_in_stylesheet_origin_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://user:pass@static.example.com"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost",
+        "127.0.0.1",
+        "127.255.255.254",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+    ],
+)
+def test_ipv4_and_localhost_page_urls_rejected(tmp_path, host):
+    path = _write(tmp_path, f'approved_pages:\n  bad:\n    url: "https://{host}/docs"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+@pytest.mark.parametrize("host", ["[::1]", "[fe80::1]"])
+def test_ipv6_loopback_and_link_local_page_urls_rejected(tmp_path, host):
+    path = _write(tmp_path, f'approved_pages:\n  bad:\n    url: "https://{host}/docs"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_non_https_scheme_variants_rejected(tmp_path):
+    for scheme_url in (
+        "file:///etc/passwd",
+        "data:text/html,hi",
+        "javascript:alert(1)",
+        "blob:https://example.com/x",
+        "about:blank",
+    ):
+        path = _write(tmp_path, f'approved_pages:\n  bad:\n    url: "{scheme_url}"\n')
+        with pytest.raises(ToolsConfigError):
+            load_tools_config(path)
+
+
+def test_malformed_url_raises(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  bad:\n    url: "not a url"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_origin_with_path_raises(tmp_path):
+    # allowed_stylesheet_origins entries must be an origin only - no path.
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://static.example.com/some/path"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_origin_with_query_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        '      - "https://static.example.com?x=1"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_default_port_normalization_in_stored_url(tmp_path):
+    path = _write(
+        tmp_path,
+        'approved_pages:\n  a:\n    url: "https://example.com:443/docs"\n',
+    )
+    path2 = _write(
+        tmp_path,
+        'approved_pages:\n  a:\n    url: "https://example.com/docs"\n',
+    )
+
+    config1 = load_tools_config(path)
+    config2 = load_tools_config(path2)
+
+    assert config1.approved_pages["a"].url == config2.approved_pages["a"].url
+
+
+def test_explicit_non_default_port_preserved(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  a:\n    url: "https://example.com:8443/docs"\n')
+
+    config = load_tools_config(path)
+
+    assert ":8443" in config.approved_pages["a"].url
+
+
+def test_hostname_case_normalized(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  a:\n    url: "https://EXAMPLE.com/docs"\n')
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages["a"].url.startswith("https://example.com")
+
+
+def test_trailing_dot_hostname_normalized(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  a:\n    url: "https://example.com./docs"\n')
+
+    config = load_tools_config(path)
+
+    assert "example.com." not in config.approved_pages["a"].url
+    assert config.approved_pages["a"].url.startswith("https://example.com:443")
+
+
+def test_idn_unicode_hostname_rejected(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  a:\n    url: "https://mÃ¼nchen.example/docs"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_idn_punycode_hostname_accepted(tmp_path):
+    path = _write(
+        tmp_path, 'approved_pages:\n  a:\n    url: "https://xn--mnchen-3ya.example/docs"\n'
+    )
+
+    config = load_tools_config(path)
+
+    assert "xn--mnchen-3ya.example" in config.approved_pages["a"].url
+
+
+def test_oversized_symbolic_page_key_raises(tmp_path):
+    long_key = "k" * (MAX_SYMBOLIC_NAME_LENGTH + 1)
+    path = _write(tmp_path, f'approved_pages:\n  {long_key}:\n    url: "https://example.com/docs"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_max_length_symbolic_page_key_accepted(tmp_path):
+    max_key = "k" * MAX_SYMBOLIC_NAME_LENGTH
+    path = _write(tmp_path, f'approved_pages:\n  {max_key}:\n    url: "https://example.com/docs"\n')
+
+    config = load_tools_config(path)
+
+    assert max_key in config.approved_pages
+
+
+def test_oversized_page_url_raises(tmp_path):
+    from kernel.tools.browser_safety import MAX_URL_LENGTH
+
+    huge = "https://example.com/" + ("a" * MAX_URL_LENGTH)
+    path = _write(tmp_path, f'approved_pages:\n  a:\n    url: "{huge}"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_oversized_stylesheet_origin_raises(tmp_path):
+    from kernel.tools.browser_safety import MAX_STYLESHEET_ORIGIN_LENGTH
+
+    huge = "https://" + ("a" * MAX_STYLESHEET_ORIGIN_LENGTH) + ".example.com"
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    allowed_stylesheet_origins:\n"
+        f'      - "{huge}"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_case_insensitive_duplicate_page_key_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  Example_Docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "  example_docs:\n"
+        '    url: "https://other.example.com/docs"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_unknown_field_in_approved_pages_entry_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        "    unexpected_field: 1\n",
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_missing_required_url_field_raises(tmp_path):
+    path = _write(tmp_path, "approved_pages:\n  example_docs:\n    allowed_stylesheet_origins: []\n")
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_allowed_stylesheet_origins_not_a_list_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "approved_pages:\n"
+        "  example_docs:\n"
+        '    url: "https://example.com/docs"\n'
+        '    allowed_stylesheet_origins: "https://static.example.com"\n',
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_tools_example_yaml_parses():
+    example_path = (
+        Path(__file__).resolve().parents[3] / "kernel" / "config" / "tools.example.yaml"
+    )
+    config = load_tools_config(example_path)
+
+    assert "example_docs" in config.approved_pages
+    assert config.approved_pages["example_docs"].url.startswith("https://")
+    assert len(config.approved_pages["example_docs"].allowed_stylesheet_origins) == 1
+
+
+# --- Milestone 44 P1 adversarial-review correction: path ambiguity -----------
+
+
+def test_dot_segment_page_url_raises_through_full_config_load(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  bad:\n    url: "https://example.com/a/../docs"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_percent_encoded_dot_segment_page_url_raises_through_full_config_load(tmp_path):
+    path = _write(
+        tmp_path, 'approved_pages:\n  bad:\n    url: "https://example.com/a/%2e%2e/docs"\n'
+    )
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_backslash_page_url_raises_through_full_config_load(tmp_path):
+    path = _write(tmp_path, 'approved_pages:\n  bad:\n    url: "https://example.com/a\\docs"\n')
+
+    with pytest.raises(ToolsConfigError):
+        load_tools_config(path)
+
+
+def test_default_port_page_url_still_loads_normally_through_full_config_load(tmp_path):
+    # Regression guard: the path-ambiguity rejection above must not
+    # accidentally reject an ordinary, unambiguous configured URL.
+    path = _write(tmp_path, 'approved_pages:\n  ok:\n    url: "https://example.com/docs"\n')
+
+    config = load_tools_config(path)
+
+    assert config.approved_pages["ok"].url == "https://example.com:443/docs"

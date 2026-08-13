@@ -59,6 +59,22 @@
 #     destination_name follows the same safe-path-component rule
 #     directory_name does above. Create-only: an existing destination is
 #     never overwritten.
+#   - approved_pages (Milestone 44 P1: browser_read_page) names EXACTLY ONE
+#     approved web page per key - `url` must be an absolute, canonical
+#     HTTPS URL (no userinfo, no localhost/private/link-local host); it is
+#     the ONLY main-frame document URL ever authorized for that key -
+#     browser_read_page does not follow HTTP redirects, meta refresh, or
+#     any other secondary navigation. `allowed_stylesheet_origins` is
+#     optional (at most 5 entries) and authorizes GET stylesheet requests
+#     ONLY on those exact HTTPS origins - it never authorizes a document
+#     request, even on the page's own origin: if the page's own origin
+#     should also serve its stylesheet, list it explicitly here.
+
+approved_pages:
+  example_docs:
+    url: "https://example.com/docs"
+    allowed_stylesheet_origins:
+      - "https://static.example.com"
 
 list_files:
   approved_directories:

@@ -12,13 +12,22 @@ read-only actions: file_metadata, read_text_file, and list_processes -
 none of them added to _SENSITIVE_ACTIONS. Milestone 43 P2 (Bounded File
 Mutations) adds two write actions - create_directory and copy_file - both
 added to _SENSITIVE_ACTIONS, since both write a new filesystem entry
-(matching repository_backup's own precedent).
+(matching repository_backup's own precedent). Milestone 44 P1 (Browser
+Foundation + Read-Only Page Inspection) adds one read-only action,
+browser_read_page - not added to _SENSITIVE_ACTIONS: it renders exactly
+one pre-authorized HTTPS page in an isolated, JavaScript-disabled browser
+context with a default-deny network gate (kernel/tools/browser_safety.py,
+kernel/tools/handlers/browser_read_page.py) and returns only bounded,
+already-safe text - the same non-sensitive, read-only trust tier as
+read_text_file/file_metadata, never an authenticated session, a write, or
+any external side effect.
 """
 
 from dataclasses import dataclass
 from enum import Enum
 
 from kernel.tools.handlers import (
+    browser_read_page,
     copy_file,
     create_directory,
     file_metadata,
@@ -63,6 +72,7 @@ _HANDLERS = {
     "list_processes": list_processes.run,
     "create_directory": create_directory.run,
     "copy_file": copy_file.run,
+    "browser_read_page": browser_read_page.run,
 }
 
 
@@ -117,6 +127,7 @@ _RESOURCE_KEY_REQUIREMENTS = {
         "the registered directory-creation operation key",
     ),
     "copy_file": (ResourceKeyRequirement.REQUIRED, "the registered file-copy operation key"),
+    "browser_read_page": (ResourceKeyRequirement.REQUIRED, "the registered page key to read"),
 }
 
 
@@ -137,9 +148,9 @@ class ActionRegistry:
         same fixed order as _HANDLERS (declaration order - system_status,
         list_files, open_application, run_registered_script, repo_health,
         repository_backup, file_metadata, read_text_file, list_processes,
-        create_directory, copy_file) - deterministic across calls and
-        processes,
-        never dependent on dict iteration happening to match by chance."""
+        create_directory, copy_file, browser_read_page) - deterministic
+        across calls and processes, never dependent on dict iteration
+        happening to match by chance."""
 
         return tuple(
             ActionDescriptor(

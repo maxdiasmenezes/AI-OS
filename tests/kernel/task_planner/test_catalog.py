@@ -7,6 +7,7 @@ import pytest
 from kernel.task_planner.catalog import build_catalog
 from kernel.tools.config import (
     ApplicationSpec,
+    ApprovedPageSpec,
     DirectoryCreationSpec,
     FileCopySpec,
     FileSpec,
@@ -432,3 +433,74 @@ def test_catalog_ids_remain_opaque_and_sequential_with_p2_actions_included(
 ):
     catalog = build_catalog(registry, full_tools_config_with_p2)
     assert [e.catalog_id for e in catalog] == [f"action_{i}" for i in range(1, len(catalog) + 1)]
+
+
+# --- Milestone 44 P1: browser_read_page --------------------------------------
+
+
+@pytest.fixture
+def full_tools_config_with_pages(full_tools_config):
+    return ToolsConfig(
+        approved_directories=full_tools_config.approved_directories,
+        approved_applications=full_tools_config.approved_applications,
+        approved_scripts=full_tools_config.approved_scripts,
+        approved_repositories=full_tools_config.approved_repositories,
+        approved_backups=full_tools_config.approved_backups,
+        approved_pages={
+            "example_docs": ApprovedPageSpec(url="https://example.com:443/docs"),
+            "another_page": ApprovedPageSpec(url="https://another.example.com:443/page"),
+        },
+    )
+
+
+def test_catalog_covers_browser_read_page_per_approved_pages_key(
+    registry, full_tools_config_with_pages
+):
+    catalog = build_catalog(registry, full_tools_config_with_pages)
+    pairs = {(e.action_name, e.resource_key) for e in catalog}
+
+    assert ("browser_read_page", "example_docs") in pairs
+    assert ("browser_read_page", "another_page") in pairs
+
+    entries = [e for e in catalog if e.action_name == "browser_read_page"]
+    assert len(entries) == 2
+
+
+def test_browser_read_page_is_non_sensitive_in_the_catalog(registry, full_tools_config_with_pages):
+    catalog = build_catalog(registry, full_tools_config_with_pages)
+    by_action = {e.action_name: e.sensitive for e in catalog}
+
+    assert by_action["browser_read_page"] is False
+
+
+def test_browser_read_page_requires_grounding_even_with_a_single_configured_page(registry):
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+        approved_pages={"example_docs": ApprovedPageSpec(url="https://example.com:443/docs")},
+    )
+    catalog = build_catalog(registry, config)
+    by_action = {e.action_name: e for e in catalog}
+
+    # Exactly one configured page - an approved_pages key is intrinsically a
+    # SPECIES (a single, exact web page), like an approved_files entry -
+    # naming the sole registered page is still a narrowing "read the page"
+    # alone never justifies.
+    assert by_action["browser_read_page"].requires_capability_grounding is True
+
+
+def test_catalog_never_exposes_a_url_for_browser_read_page(registry, full_tools_config_with_pages):
+    catalog = build_catalog(registry, full_tools_config_with_pages)
+    for entry in catalog:
+        if entry.action_name == "browser_read_page":
+            assert "example.com" not in entry.summary
+            assert "https://" not in entry.summary
+            assert "http://" not in entry.summary
+
+
+def test_browser_read_page_has_no_entries_when_unconfigured(registry, full_tools_config):
+    catalog = build_catalog(registry, full_tools_config)
+    assert [e for e in catalog if e.action_name == "browser_read_page"] == []

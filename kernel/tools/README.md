@@ -2,7 +2,7 @@
 
 Reusable tools and integrations that AI employees can invoke to take action or fetch information.
 
-## Safe computer task execution (Milestone 33; extended in Milestone 34, 35, 43, and 44 P1)
+## Safe computer task execution (Milestone 33; extended in Milestone 34, 35, 43, and 44)
 
 The implementation here is a small, explicitly allowlisted set of computer
 actions on this machine: `system_status`, `list_files`, `open_application`,
@@ -13,19 +13,21 @@ computer inspection), — Milestone 43 P2 — `create_directory` and
 `copy_file` (bounded, create-only filesystem mutations, each authorized by
 one pre-configured composite `resource_key` naming an entire operation -
 never a caller/model-supplied path, filename, or overwrite flag), and —
-Milestone 44 P1 (**IN PROGRESS** — see `docs/architecture.md`'s Milestone
-44 section; P2+ is not designed) — `browser_read_page`: a bounded,
-read-only render of exactly one pre-authorized HTTPS page
+Milestone 44 (**IMPLEMENTED** — see `docs/architecture.md`'s Milestone 44
+section for the full design) — `browser_read_page`: a bounded, read-only
+render of exactly one pre-authorized HTTPS page
 (`ToolsConfig.approved_pages`) in an isolated, single-use, headless,
 JavaScript-disabled Playwright/Chromium browser context with a
 default-deny request gate (`browser_safety.py`,
 `handlers/browser_read_page.py`) — HTTP redirects, meta refresh, and every
 resource class other than the one authorized main-frame document and
 explicitly-authorized stylesheet origins are categorically unsupported;
-never a caller/model-supplied URL, selector, or JavaScript. See
-`docs/architecture.md`'s Capabilities section — Repository Backup and
-Repository Health Checks in particular — for the full design, and
-`capabilities/tasks/` for the only current caller.
+never a caller/model-supplied URL, selector, or JavaScript. Milestone 44
+closes without bounded browser interaction (clicks, forms, downloads,
+screenshots, JavaScript) by deliberate design — see `docs/architecture.md`
+for why. See `docs/architecture.md`'s Capabilities section — Repository
+Backup and Repository Health Checks in particular — for the full design,
+and `capabilities/tasks/` for the only current caller.
 
 Highlights:
 

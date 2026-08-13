@@ -2665,9 +2665,11 @@ this flow — a single call to `handle()` is one full request/response cycle.
   it is deferred beyond the current Browser Worker milestone, not
   "scheduled" as a numbered phase of it.
 
-- Milestone 45 — Windows Desktop Worker: **IN PROGRESS.** P1 (Windows
-  Desktop Foundation and Exact Target/Control Status) is **implemented.**
-  Adds two registered, read-only, non-sensitive actions to
+- Milestone 45 — Windows Desktop Worker: **IMPLEMENTED.** Delivered as a
+  single phase (P1 — Windows Desktop Foundation and Exact Target/Control
+  Status; P3 — Security Acceptance and Closure — see below; no P2
+  mutation phase, by deliberate, empirically-justified design — see NO
+  MUTATION below). Adds two registered, read-only, non-sensitive actions to
   `kernel/tools/registry.py` — `ActionRegistry` now holds fourteen actions
   in total — `desktop_target_status` and `desktop_control_status`. Each
   reports one of a small set of fixed, code-owned states
@@ -2815,7 +2817,8 @@ this flow — a single call to `handle()` is one full request/response cycle.
   for every locator field, not merely "probably won't match anything."
 
   **NO MUTATION — empirically evaluated and REJECTED for this
-  milestone.** `desktop_invoke_control`, `desktop_click`,
+  milestone, not planned, not pending, not deferred to a later phase of
+  it.** `desktop_invoke_control`, `desktop_click`,
   `desktop_type_text`, `desktop_hotkey`, `desktop_set_control_value`, and
   `desktop_close_window` are not implemented. UI Automation's
   `InvokePattern` was proven callable, via a pure COM code path with no
@@ -2823,32 +2826,59 @@ this flow — a single call to `handle()` is one full request/response cycle.
   but invoking it against the validation fixture's native Win32 button
   empirically (a) changed the foreground window despite no explicit
   activation call, and (b) did not reliably trigger the target
-  application's actual behavior at all. A dedicated AST-based static
+  application's actual behavior at all. Native desktop mutation was
+  therefore empirically evaluated and REJECTED from Milestone 45's
+  accepted scope — any future native desktop mutation capability requires
+  its own new, explicit security design; it is not "coming next" in
+  Milestone 46 or any later milestone. A dedicated AST-based static
   acceptance test
   (`tests/kernel/tools/test_desktop_no_mutation_static_acceptance.py`)
   proves this milestone's production code contains no reference,
   anywhere, to `click`/`click_input`/`invoke`/`iface_invoke`/`type_keys`/
   `send_keys`/`SendInput`/`SetForegroundWindow`/`set_focus`/
   `set_edit_text`/`set_value`/`screenshot`/`capture`/`close`/`kill`/
-  `terminate`, and no import of `keyboard`/`mouse`/`pyautogui` — this is a
-  mechanical property of the code, not merely current behavior. **P3
-  (Security Acceptance and Closure) has not yet run — Milestone 45 is not
-  complete.**
+  `terminate`, and no import of `keyboard`/`mouse`/`pyautogui` — plus a
+  complementary, positive external-API allowlist (the same file) asserting
+  every attribute this milestone's production code touches is drawn from
+  the narrow, explicit set P1 actually needs (`find_elements`, `IsIconic`,
+  `CreateFile`/`GetFileInformationByHandle`/`Close`, `Process`/`exe`/
+  `NoSuchProcess`, plus this module's own dataclass fields and enum
+  members) — broader coverage against accidental reintroduction than a
+  denylist alone, at the honestly-documented cost of not catching a
+  `getattr()`-based dynamic dispatch or a raw numeric UIA pattern ID,
+  neither of which is expressible as a named attribute access at all. This
+  is a mechanical property of the code, not merely current behavior.
+
+  **Milestone 45 closes here, deliberately, without a mutation phase.**
+  P3 (Security Acceptance and Closure) — a dedicated whole-milestone
+  acceptance suite,
+  `tests/kernel/tools/test_milestone_45_acceptance.py`, covering the final
+  registry/action matrix, the exact config authority shape, the launch-
+  path-versus-runtime-identity separation, the complete-authority
+  cardinality contract, the five-value status taxonomy, runtime spec
+  revalidation, the read-only/no-reconnaissance production surface, and
+  the M42/M46+ boundary as one consolidated policy sweep, deliberately not
+  re-proving every P1 implementation-level test — closes Milestone 45 with
+  no production behavior change: P1 (frozen at commit `0ef56a2`) needed no
+  correction during closure. This is this milestone's completed scope, not
+  an unfinished phase of it — see docs/principles.md's "personal tool,
+  production discipline" and this repository's own Milestone 43/44
+  closure precedent for why a dedicated acceptance pass, rather than a new
+  capability, is what "closes" a milestone here.
 
 **Planned / not yet implemented:**
 
-- The remainder of Milestone 45 (P3 — Security Acceptance and Closure;
-  no new capability), Milestone 46 (WhatsApp
+- Milestone 46 (WhatsApp
   Task Control — real task submission, result delivery, and
   confirmation-reply routing), Milestone 47 (persistence
   recovery/reconciliation, especially an uncertain `in_progress` external
   action left behind by a process crash), and Milestone 48 (employee
   acceptance/launch). None of this exists yet; do not treat any of these
-  names as implemented. Milestone 44 does not, and must not, absorb any
+  names as implemented. Neither Milestone 44 nor Milestone 45 absorbs any
   of this scope — a future JavaScript-enabled or interactive browser
-  capability is a new, separately-designed feature, not a hidden part of
-  any of these four. Milestone 45 will close as a read-only Windows
-  Desktop Worker — no mutation phase is planned (see above).
+  capability, and any future native desktop mutation capability, are each
+  new, separately-designed features, not a hidden part of any of these
+  three, and not owned by M46 either.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

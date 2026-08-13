@@ -2,7 +2,7 @@
 
 Reusable tools and integrations that AI employees can invoke to take action or fetch information.
 
-## Safe computer task execution (Milestone 33; extended in Milestone 34, 35, 43, 44, and 45 P1)
+## Safe computer task execution (Milestone 33; extended in Milestone 34, 35, 43, 44, and 45)
 
 The implementation here is a small, explicitly allowlisted set of computer
 actions on this machine: `system_status`, `list_files`, `open_application`,
@@ -25,10 +25,9 @@ explicitly-authorized stylesheet origins are categorically unsupported;
 never a caller/model-supplied URL, selector, or JavaScript. Milestone 44
 closes without bounded browser interaction (clicks, forms, downloads,
 screenshots, JavaScript) by deliberate design — see `docs/architecture.md`
-for why. — and Milestone 45 P1 (**IMPLEMENTED — see
-`docs/architecture.md`'s Milestone 45 section for the full design; P3
-Security Acceptance and Closure has not yet run, so the milestone as a
-whole is not complete**) — `desktop_target_status` and
+for why. — and Milestone 45 (**IMPLEMENTED — see
+`docs/architecture.md`'s Milestone 45 section for the full design**) —
+`desktop_target_status` and
 `desktop_control_status`: bounded, read-only Windows UI Automation
 presence checks for one already-approved desktop window/control
 (`ToolsConfig.approved_desktop_targets`/`approved_desktop_controls`,
@@ -47,8 +46,9 @@ target's status). Mutation (`desktop_invoke_control` and similar) was
 empirically evaluated during this milestone's design/validation passes and
 **rejected** — semantic UI Automation `InvokePattern` invocation against
 the validation fixture changed the foreground window and did not reliably
-trigger the target application's actual behavior; Milestone 45 will close
-as a read-only Windows Desktop Worker. See `docs/architecture.md`'s
+trigger the target application's actual behavior; Milestone 45 closes
+as a read-only Windows Desktop Worker — no mutation capability is planned
+for a later phase of it or for Milestone 46. See `docs/architecture.md`'s
 Capabilities section — Repository Backup and Repository Health Checks in
 particular — for the full design, and `capabilities/tasks/` for the only
 current caller.

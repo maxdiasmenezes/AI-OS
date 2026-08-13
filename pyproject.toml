@@ -8,6 +8,7 @@ dependencies = [
     "playwright>=1.62.0",
     "psutil>=7.2.2",
     "python-dotenv",
+    "pywinauto>=0.6.9",
     "pyyaml",
 ]
 

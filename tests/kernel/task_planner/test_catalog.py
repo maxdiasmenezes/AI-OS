@@ -8,6 +8,8 @@ from kernel.task_planner.catalog import build_catalog
 from kernel.tools.config import (
     ApplicationSpec,
     ApprovedPageSpec,
+    DesktopControlSpec,
+    DesktopTargetSpec,
     DirectoryCreationSpec,
     FileCopySpec,
     FileSpec,
@@ -504,3 +506,130 @@ def test_catalog_never_exposes_a_url_for_browser_read_page(registry, full_tools_
 def test_browser_read_page_has_no_entries_when_unconfigured(registry, full_tools_config):
     catalog = build_catalog(registry, full_tools_config)
     assert [e for e in catalog if e.action_name == "browser_read_page"] == []
+
+
+# --- Milestone 45 P1: desktop_target_status / desktop_control_status ---------
+
+
+@pytest.fixture
+def full_tools_config_with_desktop(full_tools_config):
+    return ToolsConfig(
+        approved_directories=full_tools_config.approved_directories,
+        approved_applications=full_tools_config.approved_applications,
+        approved_scripts=full_tools_config.approved_scripts,
+        approved_repositories=full_tools_config.approved_repositories,
+        approved_backups=full_tools_config.approved_backups,
+        approved_desktop_targets={
+            "fixture_window": DesktopTargetSpec(
+                application_key="notepad",
+                process_executable="/e/notepad.exe",
+                window_class_name="Notepad",
+            ),
+            "other_window": DesktopTargetSpec(
+                application_key="notepad",
+                process_executable="/e/notepad.exe",
+                window_class_name="OtherClass",
+            ),
+        },
+        approved_desktop_controls={
+            "fixture_refresh": DesktopControlSpec(
+                target_key="fixture_window",
+                control_automation_id="5001",
+                control_type="Button",
+            ),
+        },
+    )
+
+
+def test_catalog_covers_desktop_target_status_per_approved_desktop_targets_key(
+    registry, full_tools_config_with_desktop
+):
+    catalog = build_catalog(registry, full_tools_config_with_desktop)
+    pairs = {(e.action_name, e.resource_key) for e in catalog}
+
+    assert ("desktop_target_status", "fixture_window") in pairs
+    assert ("desktop_target_status", "other_window") in pairs
+    assert len([e for e in catalog if e.action_name == "desktop_target_status"]) == 2
+
+
+def test_catalog_covers_desktop_control_status_per_approved_desktop_controls_key(
+    registry, full_tools_config_with_desktop
+):
+    catalog = build_catalog(registry, full_tools_config_with_desktop)
+    pairs = {(e.action_name, e.resource_key) for e in catalog}
+
+    assert ("desktop_control_status", "fixture_refresh") in pairs
+    assert len([e for e in catalog if e.action_name == "desktop_control_status"]) == 1
+
+
+def test_desktop_status_actions_are_non_sensitive_in_the_catalog(
+    registry, full_tools_config_with_desktop
+):
+    catalog = build_catalog(registry, full_tools_config_with_desktop)
+    by_action = {e.action_name: e.sensitive for e in catalog}
+
+    assert by_action["desktop_target_status"] is False
+    assert by_action["desktop_control_status"] is False
+
+
+def test_desktop_target_status_requires_grounding_even_with_a_single_configured_target(registry):
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+        approved_desktop_targets={
+            "fixture_window": DesktopTargetSpec(
+                application_key="notepad",
+                process_executable="/e/notepad.exe",
+                window_class_name="Notepad",
+            )
+        },
+    )
+    catalog = build_catalog(registry, config)
+    by_action = {e.action_name: e for e in catalog}
+
+    assert by_action["desktop_target_status"].requires_capability_grounding is True
+
+
+def test_desktop_control_status_requires_grounding_even_with_a_single_configured_control(registry):
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+        approved_desktop_targets={
+            "fixture_window": DesktopTargetSpec(
+                application_key="notepad",
+                process_executable="/e/notepad.exe",
+                window_class_name="Notepad",
+            )
+        },
+        approved_desktop_controls={
+            "fixture_refresh": DesktopControlSpec(
+                target_key="fixture_window",
+                control_automation_id="5001",
+                control_type="Button",
+            )
+        },
+    )
+    catalog = build_catalog(registry, config)
+    by_action = {e.action_name: e for e in catalog}
+
+    assert by_action["desktop_control_status"].requires_capability_grounding is True
+
+
+def test_catalog_never_exposes_desktop_locator_metadata(registry, full_tools_config_with_desktop):
+    catalog = build_catalog(registry, full_tools_config_with_desktop)
+    for entry in catalog:
+        if entry.action_name in ("desktop_target_status", "desktop_control_status"):
+            for forbidden in ("notepad.exe", "Notepad", "5001", "Button", "/e/"):
+                assert forbidden not in entry.summary
+
+
+def test_desktop_status_actions_have_no_entries_when_unconfigured(registry, full_tools_config):
+    catalog = build_catalog(registry, full_tools_config)
+    assert [e for e in catalog if e.action_name == "desktop_target_status"] == []
+    assert [e for e in catalog if e.action_name == "desktop_control_status"] == []

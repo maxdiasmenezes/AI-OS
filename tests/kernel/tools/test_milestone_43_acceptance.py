@@ -65,24 +65,34 @@ _EXPECTED_MATRIX = {
     # matrix stays accurate, since ActionRegistry is one shared allowlist,
     # not a milestone-scoped snapshot.
     "browser_read_page": (False, ResourceKeyRequirement.REQUIRED),
+    # Milestone 45 P1 added two further read-only, non-sensitive actions
+    # after Milestone 44 closed - see
+    # tests/kernel/tools/test_registry.py's own
+    # test_milestone_45_p1_desktop_status_actions_are_not_sensitive for
+    # the dedicated M45 P1 coverage; included here for the same
+    # whole-registry-accuracy reason as browser_read_page above.
+    "desktop_target_status": (False, ResourceKeyRequirement.REQUIRED),
+    "desktop_control_status": (False, ResourceKeyRequirement.REQUIRED),
 }
 
 
 def test_final_registry_action_set_and_sensitivity_matrix():
-    """The complete registry as of Milestone 44 P1: the eleven actions
+    """The complete registry as of Milestone 45 P1: the eleven actions
     Milestone 43 closed with, plus Milestone 44 P1's one addition
-    (browser_read_page) - twelve total, no more and no fewer, each with
-    exactly the sensitivity and resource-key-requirement its own milestone
-    established. ActionRegistry is a single shared allowlist, not a
-    milestone-scoped snapshot, so this test's own exact-count assertion is
-    expected to need updating again whenever a later milestone adds
-    another action - that is not a regression."""
+    (browser_read_page), plus Milestone 45 P1's two additions
+    (desktop_target_status, desktop_control_status) - fourteen total, no
+    more and no fewer, each with exactly the sensitivity and
+    resource-key-requirement its own milestone established. ActionRegistry
+    is a single shared allowlist, not a milestone-scoped snapshot, so this
+    test's own exact-count assertion is expected to need updating again
+    whenever a later milestone adds another action - that is not a
+    regression."""
 
     registry = ActionRegistry()
     descriptors = registry.descriptors()
 
     assert {d.name for d in descriptors} == set(_EXPECTED_MATRIX)
-    assert len(descriptors) == 12
+    assert len(descriptors) == 14
 
     for descriptor in descriptors:
         expected_sensitive, expected_requirement = _EXPECTED_MATRIX[descriptor.name]

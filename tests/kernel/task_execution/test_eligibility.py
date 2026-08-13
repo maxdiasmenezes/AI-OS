@@ -392,6 +392,72 @@ def test_browser_read_page_removed_approved_pages_key_fails_closed_before_execut
     assert outcome.resource_key == "example_docs"
 
 
+def test_desktop_target_status_eligible_when_approved_desktop_targets_key_exists(registry):
+    steps = (_action_step(1, "desktop_target_status", "fixture_window"),)
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_desktop_targets={"fixture_window": object()},
+    )
+
+    outcome = evaluate_next_step(task, [], registry, config)
+
+    assert isinstance(outcome, EligibleStep)
+    assert outcome.currently_sensitive is False
+
+
+def test_desktop_target_status_removed_key_fails_closed_before_execution(registry):
+    steps = (_action_step(1, "desktop_target_status", "fixture_window"),)
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+    empty_targets_config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_desktop_targets={},  # "fixture_window" no longer configured
+    )
+
+    outcome = evaluate_next_step(task, [], registry, empty_targets_config)
+
+    assert isinstance(outcome, ActionRevalidationFailure)
+    assert outcome.step_position == 1
+    assert outcome.resource_key == "fixture_window"
+
+
+def test_desktop_control_status_eligible_when_approved_desktop_controls_key_exists(registry):
+    steps = (_action_step(1, "desktop_control_status", "fixture_refresh"),)
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+    config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_desktop_controls={"fixture_refresh": object()},
+    )
+
+    outcome = evaluate_next_step(task, [], registry, config)
+
+    assert isinstance(outcome, EligibleStep)
+    assert outcome.currently_sensitive is False
+
+
+def test_desktop_control_status_removed_key_fails_closed_before_execution(registry):
+    steps = (_action_step(1, "desktop_control_status", "fixture_refresh"),)
+    task = _task_record(plan_json=_plan_json(_TASK_ID, steps))
+    empty_controls_config = ToolsConfig(
+        approved_directories={},
+        approved_applications={},
+        approved_scripts={},
+        approved_desktop_controls={},  # "fixture_refresh" no longer configured
+    )
+
+    outcome = evaluate_next_step(task, [], registry, empty_controls_config)
+
+    assert isinstance(outcome, ActionRevalidationFailure)
+    assert outcome.step_position == 1
+    assert outcome.resource_key == "fixture_refresh"
+
+
 def test_system_status_eligible_regardless_of_tools_config(registry):
     steps = (_action_step(1, "system_status", None),)
     task = _task_record(plan_json=_plan_json(_TASK_ID, steps))

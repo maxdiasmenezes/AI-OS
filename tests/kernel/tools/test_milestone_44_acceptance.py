@@ -41,11 +41,19 @@ from kernel.tools.browser_safety import Origin, PageAuthority, is_request_permit
 # ============================================================================
 
 
-def test_registry_contains_exactly_twelve_actions_with_browser_read_page_included():
+def test_registry_contains_browser_read_page_included():
+    # This test originally asserted an exact count of 12 (the M44 P1
+    # closing count) - that count assertion moved to
+    # tests/kernel/tools/test_milestone_43_acceptance.py's
+    # test_final_registry_action_set_and_sensitivity_matrix(), which
+    # already documents its own exact count needing to grow with each
+    # later milestone (Milestone 45 P1 added two further actions after
+    # this M44 file was written - ActionRegistry is a single shared
+    # allowlist, not a milestone-scoped snapshot). This test keeps only
+    # the M44-specific assertion: browser_read_page is present.
     registry = ActionRegistry()
     descriptors = registry.descriptors()
 
-    assert len(descriptors) == 12
     assert "browser_read_page" in {d.name for d in descriptors}
 
 
@@ -527,12 +535,31 @@ def test_task_execution_service_and_respond_have_no_browser_specific_surface():
     assert "browser" not in inspect.getsource(respond).lower()
 
 
-def test_no_m45_plus_capability_named_in_the_registry():
+def test_no_desktop_mutation_or_m46_plus_capability_named_in_the_registry():
+    """Originally forbade the bare substring "desktop" outright, as a
+    positive regression proving Milestone 45 had not prematurely leaked
+    into the registry while this M44 file was written. Milestone 45 P1 has
+    since been implemented - desktop_target_status/desktop_control_status
+    are real, approved, read-only actions (see
+    tests/kernel/tools/test_registry.py's own dedicated M45 P1 coverage) -
+    so the bare substring is no longer the right guard. What must still
+    never appear is any DESKTOP MUTATION shape (M45 P1 is read-only by
+    design - see docs/architecture.md's Milestone 45 entry for why
+    semantic invocation was evaluated and rejected) or any M46+ shape."""
+
     registry = ActionRegistry()
     action_names = {d.name for d in registry.descriptors()}
 
     forbidden_substrings = (
-        "desktop",
+        "desktop_invoke",
+        "desktop_click",
+        "desktop_type",
+        "desktop_hotkey",
+        "desktop_set",
+        "desktop_close",
+        "desktop_focus",
+        "desktop_screenshot",
+        "desktop_capture",
         "window_control",
         "mouse",
         "keyboard",
@@ -564,6 +591,13 @@ def test_milestone_44_closes_without_bounded_browser_interaction_by_design():
     registry = ActionRegistry()
     action_names = {d.name for d in registry.descriptors()}
 
+    # desktop_target_status/desktop_control_status (Milestone 45 P1) were
+    # added to this same shared registry after this M44 file was written -
+    # both are themselves read-only/non-sensitive (see
+    # test_no_desktop_mutation_or_m46_plus_capability_named_in_the_registry
+    # above for the still-enforced guard against any DESKTOP MUTATION
+    # shape), so their presence does not weaken this test's actual claim:
+    # no bounded BROWSER interaction capability exists.
     assert action_names == {
         "system_status",
         "list_files",
@@ -577,4 +611,6 @@ def test_milestone_44_closes_without_bounded_browser_interaction_by_design():
         "create_directory",
         "copy_file",
         "browser_read_page",
+        "desktop_target_status",
+        "desktop_control_status",
     }

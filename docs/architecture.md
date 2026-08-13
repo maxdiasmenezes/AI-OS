@@ -441,7 +441,8 @@ abandoned mid-processing.
 - **tools** — reusable tools (actions, integrations, lookups) that
   capabilities could invoke. Implemented (Milestone 33; extended in
   Milestone 34; extended again in Milestone 35; extended again in
-  Milestone 43; extended again in Milestone 44): the safe computer task
+  Milestone 43; extended again in Milestone 44; extended again in
+  Milestone 45 P1): the safe computer task
   execution layer, transport-agnostic
   and consumed today only by
   `capabilities/tasks/TasksCapability` — see Capabilities below for the
@@ -449,19 +450,21 @@ abandoned mid-processing.
   (an action name plus an optional symbolic `resource_key` — never a raw
   path or argument list) and `ActionResult`. `kernel/tools/registry.py`'s
   `ActionRegistry` is the fixed, non-configurable allowlist of exactly
-  twelve actions (`system_status`, `list_files`, `open_application`,
+  fourteen actions (`system_status`, `list_files`, `open_application`,
   `run_registered_script`, `repo_health`, `repository_backup`, —
   Milestone 43 P1 — `file_metadata`, `read_text_file`, `list_processes`,
-  — Milestone 43 P2 — `create_directory`, `copy_file`, and — Milestone 44
-  — `browser_read_page`) and which five of them are sensitive
+  — Milestone 43 P2 — `create_directory`, `copy_file`, — Milestone 44 —
+  `browser_read_page`, and — Milestone 45 P1 — `desktop_target_status`,
+  `desktop_control_status`) and which five of them are sensitive
   (`open_application`, `run_registered_script`,
   `repository_backup`, `create_directory`, `copy_file`) — `repo_health` is
   read-only and, like `system_status`/`list_files`, is not sensitive;
   `repository_backup`/`create_directory`/`copy_file` each write a new
   filesystem entry, so all three are sensitive; the three Milestone 43 P1
-  actions and `browser_read_page` are all read-only and not sensitive
+  actions, `browser_read_page`, and the two Milestone 45 P1 actions are all
+  read-only and not sensitive
   either; no action beyond
-  these twelve is ever reachable, no matter what a caller asks for.
+  these fourteen is ever reachable, no matter what a caller asks for.
   `kernel/tools/git_safety.py`
   (Milestone 35) holds the local git-execution hardening shared by
   `repo_health.py` and `repository_backup.py` — `GIT_SAFE_PREFIX` and
@@ -2662,10 +2665,180 @@ this flow — a single call to `handle()` is one full request/response cycle.
   it is deferred beyond the current Browser Worker milestone, not
   "scheduled" as a numbered phase of it.
 
+- Milestone 45 — Windows Desktop Worker: **IN PROGRESS.** P1 (Windows
+  Desktop Foundation and Exact Target/Control Status) is **implemented.**
+  Adds two registered, read-only, non-sensitive actions to
+  `kernel/tools/registry.py` — `ActionRegistry` now holds fourteen actions
+  in total — `desktop_target_status` and `desktop_control_status`. Each
+  reports one of a small set of fixed, code-owned states
+  (`"available"`/`"unavailable"`/`"ambiguous"`, plus two distinct
+  failure states — see CHECK_FAILED/AUTOMATION_UNAVAILABLE below) for one
+  already-approved, exactly-matched Windows desktop target/control —
+  never a window title,
+  control text, AutomationId, ClassName, PID, HWND, process path, or match
+  count. A new `kernel/tools/desktop_safety.py` (Windows UI Automation
+  identity resolution and config-load-time locator validation) and two new
+  flat, top-level `ToolsConfig` sections
+  (`approved_desktop_targets`/`approved_desktop_controls`,
+  `kernel/tools/config.py`) authorize exactly one Windows window/control
+  per symbolic key, following the same "shared, not duplicated" and
+  composite-operation precedent `browser_safety.py`/`approved_pages` and
+  `create_directory`/`copy_file` already established.
+
+  **Foundation: `pywinauto` (`uia` backend), added as a new project
+  dependency.** Chosen after empirically proving, on the project's actual
+  Python 3.14.6 interpreter, that it imports and constructs cleanly, that
+  its low-level `findwindows.find_elements()` API performs exact,
+  complete-enumeration property matching (`class_name`, `control_type`,
+  `auto_id`) with no dependency on any fuzzy/best-match/index-based
+  convenience API, and that a direct `comtypes`/UIA COM fallback also
+  works independently (proving a future pywinauto-wrapper-specific failure
+  would mean "wrapper incompatible," never "UIA unavailable"). Coordinates,
+  mouse movement, and keyboard/text-input APIs are never imported or
+  called anywhere in this milestone's production code — proven
+  mechanically, not just by design intent (see NO MUTATION below).
+
+  **Window/control identity model — exact, config-owned, never
+  fuzzy/positional/text-based.** A target is
+  `(application launch reference [`approved_applications`] + a SEPARATE,
+  independently-required `process_executable` runtime-image path +
+  `window_class_name` + optional `window_automation_id`)`; a control is
+  `(target reference + REQUIRED `control_automation_id` + `control_type` +
+  optional `control_class_name`)`. There is no title field, no title
+  matching of any kind, and no control Name/displayed-text matching of any
+  kind anywhere in this model — both are treated as untrusted, potentially
+  private runtime data, never authority (see `desktop_safety.py`'s own
+  module docstring, AUTHORITY MODEL and TITLE/TEXT EXCLUSION sections).
+  `control_automation_id` is **required**, not optional: empirical
+  validation proved a real Tkinter application's sibling controls of the
+  same type share an *empty* `automation_id` and an *identical*
+  `class_name`/`control_type` — class/type alone cannot distinguish them.
+  An application/control that exposes no stable AutomationId is
+  unsupported by this milestone; this module never falls back to visible
+  text, sibling index, or position. `control_type` is validated at
+  config-load time against a small, closed, code-owned allowlist of UIA
+  control types (`desktop_safety.SUPPORTED_CONTROL_TYPES`), extended
+  deliberately, never implicitly.
+
+  **Launch path is not runtime process identity — a load-bearing
+  distinction, proven empirically, not assumed.** A configured
+  application's *launch* path
+  (`approved_applications[*].executable`) can be a real, separate
+  executable from the one Windows reports as actually *owning* a live
+  window's process (`psutil.Process(pid).exe()`) — e.g. a virtual
+  environment's `Scripts\python.exe` launcher versus its own base
+  interpreter, empirically reproduced during this milestone's validation
+  pass. `approved_desktop_targets[*].process_executable` is therefore a
+  separate, independently-required, config-owned field — never derived
+  from `approved_applications`. The runtime comparison
+  (`desktop_safety.compare_windows_executable_identity()`) never uses raw
+  string equality or `os.path.realpath()`/`Path.resolve()` (neither
+  reliably resolves a Windows launcher/redirector's real target) — it
+  opens both paths read-only (metadata query only, zero content bytes
+  read) and compares Windows' own file identity
+  (`GetFileInformationByHandle`'s volume-serial-number + file-index
+  triple), which correctly treats a launcher and the distinct file it
+  starts as different files, exactly as they are, while correctly
+  treating a hard link to the same NTFS file as the SAME identity (it is,
+  byte-for-byte, the same file under another name — never a content hash,
+  so a byte-identical copy at a different path is correctly NOT the same
+  identity). This three-way comparison — `MATCH`/`NO_MATCH`/`CHECK_FAILED`
+  — is deliberately not a bare boolean at the point it matters (see
+  COMPLETE AUTHORITY BEFORE CARDINALITY below): an inspection failure
+  (access denied, an unexpected Win32 error) must never be silently
+  reported as a proven `NO_MATCH`. `same_windows_executable()` remains
+  available as a boolean convenience wrapper for simple callers that
+  collapses `CHECK_FAILED` into `False`.
+
+  **Complete authority before cardinality — corrected after an
+  adversarial review found and reproduced the original ordering bug.**
+  The configured target authority is the FULL combination of (exact UIA
+  window locator) AND (configured runtime executable identity) AND
+  (usable state — visible, not minimized). The initial implementation
+  computed cardinality on the raw UIA-locator match count *before* ever
+  checking process identity or minimized state — reproduced live: two raw
+  candidates sharing a configured window class, only one of which
+  belonged to the correct process (or only one of which was not
+  minimized), were both reported ambiguous without the process-identity/
+  minimized check ever running on either one, meaning an unrelated
+  process merely exposing the same window class could suppress a
+  legitimately-available target's status. `desktop_safety.py`'s
+  `_resolve_target_internal()` now evaluates **every** raw UIA candidate
+  against the complete authority first, classifying each as `QUALIFIED`,
+  `NON_QUALIFYING` (wrong process, minimized, or its owning process
+  cleanly exited — `psutil.NoSuchProcess`), or `INSPECTION_FAILED` (an
+  unexpected `AccessDenied`, Win32, or file-identity-comparison failure —
+  see `_evaluate_target_candidate()`) — cardinality is computed only over
+  the `QUALIFIED` set: zero → unavailable, exactly one → available, two or
+  more → ambiguous. If **any** candidate is `INSPECTION_FAILED`, the whole
+  result is `CHECK_FAILED` unconditionally, regardless of how many other
+  candidates already qualified — exact cardinality cannot be proven while
+  any candidate remains unresolved. A control can only be available if its
+  target independently resolves to exactly `AVAILABLE` first; an ambiguous,
+  unavailable, check-failed, or automation-unavailable target now
+  **propagates that exact status unchanged** to the control (a control
+  scoped to an ambiguous target is itself ambiguous — it cannot be
+  uniquely resolved, for a documented reason — rather than being
+  collapsed to a less-accurate "unavailable"). Hidden (withdrawn) targets
+  are not resolvable through this path at all (proven empirically — a raw
+  Win32 `EnumWindows` cross-check confirms the window still exists at the
+  OS level; UIA's own element tree simply never surfaces it), so no
+  special case was needed to reject them.
+
+  **`DesktopStatus` has five values, not three — infrastructure failure is
+  never ordinary absence.** `AVAILABLE`/`UNAVAILABLE`/`AMBIGUOUS` all mean
+  the check itself *succeeded*. `CHECK_FAILED` (the system could not
+  reliably perform the configured check — an unexpected Win32/COM/psutil
+  failure, or a malformed spec caught by runtime revalidation before any
+  live call) and `AUTOMATION_UNAVAILABLE` (the platform/UIA foundation
+  itself is unavailable — not running on Windows) are now distinct,
+  reachable outcomes (`ActionResult(success=False, outcome="failed", ...)`)
+  — an adversarial review proved the original implementation collapsed
+  every one of these into ordinary `UNAVAILABLE`, meaning a fully broken
+  UIA stack was silently indistinguishable from "the application isn't
+  there." Only genuinely-unregistered symbolic keys or a broken
+  `application`/`target` reference remain `outcome="rejected"`, unchanged.
+
+  **Runtime spec revalidation closes the manually-built-`ToolsConfig`
+  gap.** `_revalidate_target_spec()`/`_revalidate_control_spec()` re-run
+  the exact same field validation `kernel/tools/config.py` runs at
+  config-load time, again at execution time, before any live UIA call —
+  never trusting that a caller-supplied spec necessarily passed through
+  `load_tools_config()`. This closes a gap an adversarial review
+  reproduced live: a hand-built `DesktopControlSpec` with an empty
+  `control_automation_id` (which `load_tools_config()` already rejects,
+  but a manually-constructed one could bypass) reached
+  `find_elements(auto_id="")` directly, which genuinely matches real
+  controls with an empty AutomationId (proven against the fixture — 8 real
+  matches, including window-chrome buttons). An invalid manually-built
+  spec now fails `CHECK_FAILED` before `find_elements()` is ever called,
+  for every locator field, not merely "probably won't match anything."
+
+  **NO MUTATION — empirically evaluated and REJECTED for this
+  milestone.** `desktop_invoke_control`, `desktop_click`,
+  `desktop_type_text`, `desktop_hotkey`, `desktop_set_control_value`, and
+  `desktop_close_window` are not implemented. UI Automation's
+  `InvokePattern` was proven callable, via a pure COM code path with no
+  mouse/keyboard/focus call anywhere in pywinauto's own implementation —
+  but invoking it against the validation fixture's native Win32 button
+  empirically (a) changed the foreground window despite no explicit
+  activation call, and (b) did not reliably trigger the target
+  application's actual behavior at all. A dedicated AST-based static
+  acceptance test
+  (`tests/kernel/tools/test_desktop_no_mutation_static_acceptance.py`)
+  proves this milestone's production code contains no reference,
+  anywhere, to `click`/`click_input`/`invoke`/`iface_invoke`/`type_keys`/
+  `send_keys`/`SendInput`/`SetForegroundWindow`/`set_focus`/
+  `set_edit_text`/`set_value`/`screenshot`/`capture`/`close`/`kill`/
+  `terminate`, and no import of `keyboard`/`mouse`/`pyautogui` — this is a
+  mechanical property of the code, not merely current behavior. **P3
+  (Security Acceptance and Closure) has not yet run — Milestone 45 is not
+  complete.**
+
 **Planned / not yet implemented:**
 
-- Milestones 45-48, building on `kernel/task_execution/`'s execution
-  engine: Milestone 45 (Windows Desktop Worker), Milestone 46 (WhatsApp
+- The remainder of Milestone 45 (P3 — Security Acceptance and Closure;
+  no new capability), Milestone 46 (WhatsApp
   Task Control — real task submission, result delivery, and
   confirmation-reply routing), Milestone 47 (persistence
   recovery/reconciliation, especially an uncertain `in_progress` external
@@ -2674,7 +2847,8 @@ this flow — a single call to `handle()` is one full request/response cycle.
   names as implemented. Milestone 44 does not, and must not, absorb any
   of this scope — a future JavaScript-enabled or interactive browser
   capability is a new, separately-designed feature, not a hidden part of
-  any of these four.
+  any of these four. Milestone 45 will close as a read-only Windows
+  Desktop Worker — no mutation phase is planned (see above).
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

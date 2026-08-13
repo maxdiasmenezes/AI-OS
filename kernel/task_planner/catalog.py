@@ -43,6 +43,8 @@ _RESOURCE_FIELD_BY_ACTION = {
     "create_directory": "approved_directory_creations",
     "copy_file": "approved_copies",
     "browser_read_page": "approved_pages",
+    "desktop_target_status": "approved_desktop_targets",
+    "desktop_control_status": "approved_desktop_controls",
 }
 
 _SUMMARY_TEMPLATES = {
@@ -58,6 +60,12 @@ _SUMMARY_TEMPLATES = {
     "create_directory": lambda key: f"Create the registered '{key}' directory.",
     "copy_file": lambda key: f"Copy the registered '{key}' file.",
     "browser_read_page": lambda key: f"Read the registered '{key}' web page.",
+    "desktop_target_status": lambda key: (
+        f"Check whether the registered '{key}' desktop target is available."
+    ),
+    "desktop_control_status": lambda key: (
+        f"Check whether the registered '{key}' desktop control is available."
+    ),
 }
 
 # Actions whose resource_key names one specific, narrowly-purposed
@@ -85,6 +93,12 @@ _SUMMARY_TEMPLATES = {
 # specific, exact web page (a SPECIES, not a location/category) - "read
 # the page" without the request naming which one must never silently
 # authorize a specifically-named page the request never mentioned.
+# desktop_target_status/desktop_control_status (Milestone 45 P1) join for
+# the identical reason: an approved_desktop_targets/approved_desktop_controls
+# key names one specific, exact Windows window/control (a SPECIES, not a
+# location/category) - "check the desktop target" or "check the control"
+# without the request naming which one must never silently authorize a
+# specifically-named target/control the request never mentioned.
 _NAMED_CAPABILITY_ACTIONS = frozenset(
     {
         "open_application",
@@ -94,6 +108,8 @@ _NAMED_CAPABILITY_ACTIONS = frozenset(
         "create_directory",
         "copy_file",
         "browser_read_page",
+        "desktop_target_status",
+        "desktop_control_status",
     }
 )
 

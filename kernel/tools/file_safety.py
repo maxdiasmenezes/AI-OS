@@ -48,13 +48,23 @@ race-free "fail if it already exists" primitive, which this module's
 checks only usefully narrow the window before, never replace.
 """
 
+from __future__ import annotations
+
 import stat as stat_module
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from kernel.tools.config import ToolsConfig
+# TYPE_CHECKING-only import (never at runtime): kernel/tools/config.py now
+# imports kernel/tools/desktop_safety.py, which imports THIS module for
+# its shared classify_stat_mode()/StatClassification - a real, runtime,
+# top-level "from kernel.tools.config import ToolsConfig" here would
+# create a circular import (config -> desktop_safety -> file_safety ->
+# config). ToolsConfig is only ever used as a type annotation below.
+if TYPE_CHECKING:
+    from kernel.tools.config import ToolsConfig
 
 # Symbolic outcome codes shared by both handlers via FileResourceError -
 # kernel/tools/audit.py's own fixed, bounded outcome vocabulary.

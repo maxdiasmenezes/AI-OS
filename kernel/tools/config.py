@@ -27,7 +27,7 @@ from pathlib import Path
 
 import yaml
 
-from kernel.tools import browser_safety
+from kernel.tools import browser_safety, desktop_safety
 
 # kernel/tools/config.py -> kernel/tools -> kernel -> project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +46,8 @@ _TOP_LEVEL_KEYS = {
     "create_directory",
     "copy_file",
     "approved_pages",
+    "approved_desktop_targets",
+    "approved_desktop_controls",
 }
 _LIST_FILES_KEYS = {"approved_directories"}
 _OPEN_APPLICATION_KEYS = {"approved_applications"}
@@ -65,6 +67,10 @@ _APPROVED_FILE_REQUIRED_FIELDS = {"path"}
 _APPROVED_FILE_ALL_FIELDS = _APPROVED_FILE_REQUIRED_FIELDS
 _APPROVED_PAGE_REQUIRED_FIELDS = {"url"}
 _APPROVED_PAGE_ALL_FIELDS = _APPROVED_PAGE_REQUIRED_FIELDS | {"allowed_stylesheet_origins"}
+_DESKTOP_TARGET_REQUIRED_FIELDS = {"application", "process_executable", "window_class_name"}
+_DESKTOP_TARGET_ALL_FIELDS = _DESKTOP_TARGET_REQUIRED_FIELDS | {"window_automation_id"}
+_DESKTOP_CONTROL_REQUIRED_FIELDS = {"target", "control_automation_id", "control_type"}
+_DESKTOP_CONTROL_ALL_FIELDS = _DESKTOP_CONTROL_REQUIRED_FIELDS | {"control_class_name"}
 _DIRECTORY_CREATION_REQUIRED_FIELDS = {"parent_directory", "directory_name"}
 _DIRECTORY_CREATION_ALL_FIELDS = _DIRECTORY_CREATION_REQUIRED_FIELDS
 _FILE_COPY_REQUIRED_FIELDS = {"source_file", "destination_directory", "destination_name"}
@@ -325,6 +331,58 @@ class ApprovedPageSpec:
 
 
 @dataclass(frozen=True)
+class DesktopTargetSpec:
+    """One exact, individually-approved Windows desktop target (Milestone
+    45 P1) - the resource kernel/tools/handlers/desktop_target_status.py
+    and desktop_control_status.py resolve a resource_key/target reference
+    against, via kernel/tools/desktop_safety.py.
+
+    `application_key` references an existing
+    open_application.approved_applications entry - preserving the logical
+    association with an already-approved application, but NEVER by itself
+    proof of runtime process identity (that association is the LAUNCH
+    path; a real application can spawn, forward to, or otherwise differ
+    from the process that ends up owning its window - see
+    kernel/tools/desktop_safety.py's module docstring). `process_executable`
+    is a SEPARATE, independently-required exact absolute path identifying
+    the process image expected to actually OWN the live window at
+    resolution time - config-authored only, never supplied by a caller,
+    model, or runtime observation. `window_class_name` is the window's
+    exact, required semantic class identity; `window_automation_id` is an
+    OPTIONAL exact supplemental identity, used only when the target
+    application is known to expose one stably. There is deliberately no
+    title field in P1 - see desktop_safety.py's module docstring for why
+    window title is never part of this authority model."""
+
+    application_key: str
+    process_executable: str
+    window_class_name: str
+    window_automation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DesktopControlSpec:
+    """One exact, individually-approved control inside an already-approved
+    desktop target (Milestone 45 P1) - the resource
+    kernel/tools/handlers/desktop_control_status.py resolves a
+    resource_key against. `target_key` references an existing
+    approved_desktop_targets entry (never a duplicated window locator).
+    `control_automation_id` is REQUIRED and must be a non-empty string -
+    see kernel/tools/desktop_safety.py's module docstring (WHY
+    AUTOMATION_ID IS REQUIRED) for the empirical finding this rests on:
+    class_name/control_type alone cannot distinguish sibling controls of
+    the same type. `control_type` is REQUIRED and must be one of
+    desktop_safety.SUPPORTED_CONTROL_TYPES. `control_class_name` is an
+    OPTIONAL exact cross-check. Never a control's Name/displayed text,
+    never a selector index, never a fuzzy/best-match string."""
+
+    target_key: str
+    control_automation_id: str
+    control_type: str
+    control_class_name: str | None = None
+
+
+@dataclass(frozen=True)
 class DirectoryCreationSpec:
     """One exact, pre-authorized directory-creation operation (Milestone
     43 P2) - the resource kernel/tools/handlers/create_directory.py
@@ -366,6 +424,8 @@ class ToolsConfig:
     approved_directory_creations: dict = field(default_factory=dict)
     approved_copies: dict = field(default_factory=dict)
     approved_pages: dict = field(default_factory=dict)
+    approved_desktop_targets: dict = field(default_factory=dict)
+    approved_desktop_controls: dict = field(default_factory=dict)
 
 
 EMPTY_TOOLS_CONFIG = ToolsConfig(
@@ -378,6 +438,8 @@ EMPTY_TOOLS_CONFIG = ToolsConfig(
     approved_directory_creations={},
     approved_copies={},
     approved_pages={},
+    approved_desktop_targets={},
+    approved_desktop_controls={},
 )
 
 
@@ -716,6 +778,117 @@ def _parse_approved_pages(section) -> dict:
     return result
 
 
+def _parse_approved_desktop_targets(section, known_application_keys: set) -> dict:
+    """approved_desktop_targets (Milestone 45 P1): a flat, top-level
+    mapping of symbolic key -> DesktopTargetSpec, matching approved_files/
+    approved_pages' own precedent (shared by more than one action -
+    desktop_target_status and desktop_control_status both resolve against
+    it - so it is not nested under a single action-named section).
+    `application` must already exist as an
+    open_application.approved_applications key (referential integrity,
+    mirroring _parse_create_directory()'s own precedent) -
+    `process_executable` is validated independently via
+    kernel/tools/desktop_safety.py's validate_process_executable_path()
+    (see that module's docstring for why this is a separate, required
+    field rather than derived from the application's own launch path)."""
+
+    if not isinstance(section, dict):
+        raise ToolsConfigError("approved_desktop_targets must be a mapping")
+
+    result = {}
+    seen: dict = {}
+    for raw_key, spec in section.items():
+        key = _casefolded_unique_key(
+            raw_key, seen, "approved_desktop_targets", max_length=MAX_SYMBOLIC_NAME_LENGTH
+        )
+        if not isinstance(spec, dict):
+            raise ToolsConfigError(f"approved_desktop_targets[{raw_key!r}] must be a mapping")
+        context = f"approved_desktop_targets[{raw_key!r}]"
+        _reject_unknown_fields(set(spec), _DESKTOP_TARGET_ALL_FIELDS, context)
+        missing = _DESKTOP_TARGET_REQUIRED_FIELDS - set(spec)
+        if missing:
+            raise ToolsConfigError(f"{context} missing required field(s): {sorted(missing)}")
+
+        application_key = _require_referenced_key(
+            spec["application"], known_application_keys, f"{context}.application"
+        )
+
+        try:
+            process_executable = desktop_safety.validate_process_executable_path(
+                spec["process_executable"], field_name=f"{context}.process_executable"
+            )
+            window_class_name = desktop_safety.validate_window_class_name(
+                spec["window_class_name"], field_name=f"{context}.window_class_name"
+            )
+            window_automation_id = None
+            if "window_automation_id" in spec:
+                window_automation_id = desktop_safety.validate_automation_id(
+                    spec["window_automation_id"],
+                    field_name=f"{context}.window_automation_id",
+                )
+        except desktop_safety.DesktopSafetyError as exc:
+            raise ToolsConfigError(str(exc)) from exc
+
+        result[key] = DesktopTargetSpec(
+            application_key=application_key,
+            process_executable=process_executable,
+            window_class_name=window_class_name,
+            window_automation_id=window_automation_id,
+        )
+    return result
+
+
+def _parse_approved_desktop_controls(section, known_target_keys: set) -> dict:
+    """approved_desktop_controls (Milestone 45 P1): a flat, top-level
+    mapping of symbolic key -> DesktopControlSpec. `target` must already
+    exist as an approved_desktop_targets key (referential integrity,
+    mirroring _parse_copy_file()'s own precedent)."""
+
+    if not isinstance(section, dict):
+        raise ToolsConfigError("approved_desktop_controls must be a mapping")
+
+    result = {}
+    seen: dict = {}
+    for raw_key, spec in section.items():
+        key = _casefolded_unique_key(
+            raw_key, seen, "approved_desktop_controls", max_length=MAX_SYMBOLIC_NAME_LENGTH
+        )
+        if not isinstance(spec, dict):
+            raise ToolsConfigError(f"approved_desktop_controls[{raw_key!r}] must be a mapping")
+        context = f"approved_desktop_controls[{raw_key!r}]"
+        _reject_unknown_fields(set(spec), _DESKTOP_CONTROL_ALL_FIELDS, context)
+        missing = _DESKTOP_CONTROL_REQUIRED_FIELDS - set(spec)
+        if missing:
+            raise ToolsConfigError(f"{context} missing required field(s): {sorted(missing)}")
+
+        target_key = _require_referenced_key(
+            spec["target"], known_target_keys, f"{context}.target"
+        )
+
+        try:
+            control_automation_id = desktop_safety.validate_automation_id(
+                spec["control_automation_id"], field_name=f"{context}.control_automation_id"
+            )
+            control_type = desktop_safety.validate_control_type(
+                spec["control_type"], field_name=f"{context}.control_type"
+            )
+            control_class_name = None
+            if "control_class_name" in spec:
+                control_class_name = desktop_safety.validate_control_class_name(
+                    spec["control_class_name"], field_name=f"{context}.control_class_name"
+                )
+        except desktop_safety.DesktopSafetyError as exc:
+            raise ToolsConfigError(str(exc)) from exc
+
+        result[key] = DesktopControlSpec(
+            target_key=target_key,
+            control_automation_id=control_automation_id,
+            control_type=control_type,
+            control_class_name=control_class_name,
+        )
+    return result
+
+
 def _parse_create_directory(section, known_directory_keys: set) -> dict:
     """create_directory (Milestone 43 P2): each entry is one complete,
     pre-authorized (parent directory key, child directory name) pair -
@@ -882,6 +1055,20 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
     approved_pages = (
         _parse_approved_pages(data["approved_pages"]) if "approved_pages" in data else {}
     )
+    approved_desktop_targets = (
+        _parse_approved_desktop_targets(
+            data["approved_desktop_targets"], set(approved_applications)
+        )
+        if "approved_desktop_targets" in data
+        else {}
+    )
+    approved_desktop_controls = (
+        _parse_approved_desktop_controls(
+            data["approved_desktop_controls"], set(approved_desktop_targets)
+        )
+        if "approved_desktop_controls" in data
+        else {}
+    )
 
     return ToolsConfig(
         approved_directories=approved_directories,
@@ -893,4 +1080,6 @@ def load_tools_config(path: Path | None = None) -> ToolsConfig:
         approved_directory_creations=approved_directory_creations,
         approved_copies=approved_copies,
         approved_pages=approved_pages,
+        approved_desktop_targets=approved_desktop_targets,
+        approved_desktop_controls=approved_desktop_controls,
     )

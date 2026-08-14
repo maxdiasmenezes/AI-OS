@@ -69,6 +69,45 @@
 #     ONLY on those exact HTTPS origins - it never authorizes a document
 #     request, even on the page's own origin: if the page's own origin
 #     should also serve its stylesheet, list it explicitly here.
+#   - approved_desktop_targets (Milestone 45 P1: desktop_target_status/
+#     desktop_control_status) names EXACTLY ONE approved Windows desktop
+#     window per key. `application` must already exist as an
+#     open_application.approved_applications key - this is LAUNCH
+#     authority only, never proof of which process actually owns the live
+#     window. `process_executable` is a SEPARATE, independently-required
+#     exact absolute path to the executable expected to actually OWN the
+#     window at check time - it may legitimately differ from the
+#     application's own launch path (e.g. a launcher/redirector that
+#     starts a different real process image) and must be the real runtime
+#     image, never the launcher. `window_class_name` is required;
+#     `window_automation_id` is optional and should only be set if the
+#     target application is known to expose a stable one - there is no
+#     title field, and title is never used as identity.
+#   - approved_desktop_controls (Milestone 45 P1: desktop_control_status)
+#     names EXACTLY ONE approved control per key, scoped to an already-
+#     approved approved_desktop_targets entry. `control_automation_id` is
+#     REQUIRED and must be a stable, non-empty AutomationId - class name
+#     and control type alone cannot reliably distinguish sibling controls
+#     of the same type (proven empirically during Milestone 45's design
+#     validation). An application/control that exposes no stable
+#     AutomationId is not supported by this milestone - never approve a
+#     control using its visible caption/text as a substitute identity.
+#     `control_class_name` is an optional exact cross-check.
+
+approved_desktop_targets:
+  example_window:
+    application: notepad
+    process_executable: "C:/Windows/System32/notepad.exe"
+    window_class_name: "Notepad"
+    # window_automation_id omitted here - optional, only set it if the
+    # target application is known to expose a stable one.
+
+approved_desktop_controls:
+  example_control:
+    target: example_window
+    control_automation_id: "ExampleAutomationId"
+    control_type: "Button"
+    # control_class_name omitted here - optional exact cross-check.
 
 approved_pages:
   example_docs:

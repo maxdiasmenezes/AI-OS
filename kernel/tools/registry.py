@@ -20,7 +20,25 @@ context with a default-deny network gate (kernel/tools/browser_safety.py,
 kernel/tools/handlers/browser_read_page.py) and returns only bounded,
 already-safe text - the same non-sensitive, read-only trust tier as
 read_text_file/file_metadata, never an authenticated session, a write, or
-any external side effect.
+any external side effect. Milestone 45 P1 (Windows Desktop Foundation and
+Exact Target/Control Status) adds two read-only actions,
+desktop_target_status and desktop_control_status - neither added to
+_SENSITIVE_ACTIONS: each reports a fixed, code-owned status
+("available"/"unavailable"/"ambiguous", or a distinct failure state when
+the check itself could not be reliably performed - see
+kernel/tools/desktop_safety.DesktopStatus) for one already-approved,
+exactly-matched Windows desktop target/control
+(kernel/tools/desktop_safety.py, kernel/tools/handlers/
+desktop_target_status.py, desktop_control_status.py), never a window
+title, control text, AutomationId, ClassName, PID, HWND, process path, or
+match count - the same non-sensitive, read-only trust tier as
+list_processes/browser_read_page, even though resolving exact identity
+internally reads UIA properties (sensitivity concerns output/authority/
+side effect, never what a handler reads internally to do its job
+correctly - see desktop_target_status.py's own module docstring). M45 P1
+is deliberately read-only end to end: mutation
+(desktop_invoke_control and similar) was empirically evaluated and
+REJECTED for this milestone - see docs/architecture.md.
 """
 
 from dataclasses import dataclass
@@ -30,6 +48,8 @@ from kernel.tools.handlers import (
     browser_read_page,
     copy_file,
     create_directory,
+    desktop_control_status,
+    desktop_target_status,
     file_metadata,
     list_files,
     list_processes,
@@ -73,6 +93,8 @@ _HANDLERS = {
     "create_directory": create_directory.run,
     "copy_file": copy_file.run,
     "browser_read_page": browser_read_page.run,
+    "desktop_target_status": desktop_target_status.run,
+    "desktop_control_status": desktop_control_status.run,
 }
 
 
@@ -128,6 +150,14 @@ _RESOURCE_KEY_REQUIREMENTS = {
     ),
     "copy_file": (ResourceKeyRequirement.REQUIRED, "the registered file-copy operation key"),
     "browser_read_page": (ResourceKeyRequirement.REQUIRED, "the registered page key to read"),
+    "desktop_target_status": (
+        ResourceKeyRequirement.REQUIRED,
+        "the registered desktop target key to check",
+    ),
+    "desktop_control_status": (
+        ResourceKeyRequirement.REQUIRED,
+        "the registered desktop control key to check",
+    ),
 }
 
 
@@ -148,7 +178,8 @@ class ActionRegistry:
         same fixed order as _HANDLERS (declaration order - system_status,
         list_files, open_application, run_registered_script, repo_health,
         repository_backup, file_metadata, read_text_file, list_processes,
-        create_directory, copy_file, browser_read_page) - deterministic
+        create_directory, copy_file, browser_read_page,
+        desktop_target_status, desktop_control_status) - deterministic
         across calls and processes, never dependent on dict iteration
         happening to match by chance."""
 

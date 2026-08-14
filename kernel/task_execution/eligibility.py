@@ -105,6 +105,8 @@ _RESOURCE_FIELD_BY_ACTION = {
     "create_directory": "approved_directory_creations",
     "copy_file": "approved_copies",
     "browser_read_page": "approved_pages",
+    "desktop_target_status": "approved_desktop_targets",
+    "desktop_control_status": "approved_desktop_controls",
 }
 
 

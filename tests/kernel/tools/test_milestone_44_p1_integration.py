@@ -21,6 +21,7 @@ No public internet dependency anywhere - every server here is a real,
 local, ephemeral-port http.server instance."""
 
 import http.server
+import select
 import socketserver
 import threading
 import time
@@ -262,8 +263,37 @@ def _make_handler(tag, hit_log, state):
                     f'<body><p>slow stylesheet page text</p></body></html>'.encode()
                 )
             elif p == "/slow.css":
-                time.sleep(state["slow_stylesheet_delay_seconds"])
-                self._send(b"body{color:blue;}", content_type="text/css")
+                # Deterministic, wall-clock-noise-immune instrumentation
+                # (M45 P3 flake fix): rather than blocking in a single
+                # time.sleep() and inferring the client's fetch-timeout
+                # behavior from the *test's* total elapsed time (which
+                # also includes Chromium/Node process launch and teardown
+                # - dominant, highly variable overhead on some machines,
+                # unrelated to the fetch timeout under test), poll the raw
+                # connection socket in short slices via select(). Once
+                # route.fetch()'s own timeout fires client-side, the
+                # underlying TCP connection is closed/reset, which makes
+                # the socket select()-readable well before the full
+                # server-side delay elapses. This measures exactly the
+                # interval the test cares about - how long the client
+                # actually waited before giving up - independent of
+                # anything else in the browser lifecycle.
+                start = time.monotonic()
+                deadline = start + state["slow_stylesheet_delay_seconds"]
+                aborted_after = None
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    readable, _, _ = select.select([self.connection], [], [], min(remaining, 0.02))
+                    if readable:
+                        aborted_after = time.monotonic() - start
+                        break
+                state["slow_stylesheet_client_abort_after_seconds"] = aborted_after
+                try:
+                    self._send(b"body{color:blue;}", content_type="text/css")
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                    pass
 
             else:
                 self._send(b"", status=404)
@@ -300,6 +330,7 @@ def fixtures(servers):
     hit_log, state = servers
     hit_log.reset()
     state.pop("cookie_seen", None)
+    state.pop("slow_stylesheet_client_abort_after_seconds", None)
     return hit_log, state
 
 
@@ -751,22 +782,59 @@ def test_stalled_stylesheet_bounded_by_fetch_timeout_not_playwright_default(fixt
     """The load-bearing regression: route.fetch() has its own independent
     timeout (Playwright default 30s, confirmed NOT governed by
     page.set_default_timeout()). A reduced, private _FETCH_TIMEOUT_MS
-    proves the explicit timeout argument actually takes effect - the
-    total wall-clock time must stay close to the REDUCED value, nowhere
-    near the slow server's real delay or Playwright's 30s default."""
+    proves the explicit timeout argument actually takes effect.
+
+    This asserts the real security property directly, via the fixture's
+    own select()-based instrumentation (see the "/slow.css" handler
+    above) of exactly how long the CLIENT kept the connection open before
+    giving up - not the test's total wall-clock time. Total elapsed time
+    for the whole _execute_read() call also includes Chromium/Node
+    process launch and teardown, which is real, sometimes-multi-second,
+    highly variable overhead unrelated to route.fetch()'s own timeout
+    (confirmed by direct reproduction: a bare Playwright launch/close
+    with no page work at all took anywhere from ~2.6s to ~12.7s on one
+    real Windows machine) - asserting on it produced the M45 P3 flake
+    (an observed `elapsed=3.57` against a `< 3.0` bound). The
+    client-abort measurement below is immune to that noise because it is
+    a server-side timestamp delta, started only once the stylesheet
+    request actually arrives and stopped the instant the client's own
+    fetch timeout closes the connection."""
 
     hit_log, state = fixtures
-    monkeypatch.setattr(browser_read_page, "_FETCH_TIMEOUT_MS", 800)
+    fetch_timeout_ms = 800
+    monkeypatch.setattr(browser_read_page, "_FETCH_TIMEOUT_MS", fetch_timeout_ms)
     state["slow_stylesheet_delay_seconds"] = 3.0  # comfortably longer than 800ms
     authority = _authority(state, "/slow-stylesheet-page", stylesheet_origin_bases=(state["a"],))
 
-    t0 = time.monotonic()
     result = browser_read_page._execute_read(authority, "slow_stylesheet")
-    elapsed = time.monotonic() - t0
 
     # The main document itself loads fine; only the slow stylesheet times
     # out and is aborted - a non-fatal per-resource failure, not a whole-
     # action failure (unlike the count/cumulative bounds above).
     assert result.success is True
-    assert elapsed < 3.0  # nowhere near the slow server's real 3s delay
     assert "raw" not in result.message.lower()
+
+    abort_after = state["slow_stylesheet_client_abort_after_seconds"]
+    fetch_timeout_s = fetch_timeout_ms / 1000
+    # The client must have actually given up before the server's full 3s
+    # delay elapsed - proves an explicit timeout fired at all (this is
+    # None, and the assertion fails, if production regresses to an
+    # unbounded wait or Playwright's own 30s default: the server would
+    # then observe the full 3s delay elapse with the connection never
+    # aborted early).
+    assert abort_after is not None, (
+        "the client never aborted the stalled stylesheet request early - "
+        "route.fetch()'s explicit timeout did not fire"
+    )
+    # Lower bound: it waited close to the configured timeout, not some
+    # unrelated near-instant rejection - proves this genuinely exercised
+    # the timeout path rather than some other early-abort reason.
+    assert abort_after > fetch_timeout_s * 0.5
+    # Upper bound: generous margin over the configured timeout to absorb
+    # ordinary OS/network scheduling jitter (observed in repeated local
+    # reproduction: ~0.79s-0.82s against an 800ms configured timeout),
+    # while staying nowhere near the slow server's real 3s delay and
+    # orders of magnitude below Playwright's 30s default - so a
+    # regression to either of those still fails this bound.
+    assert abort_after < fetch_timeout_s * 3
+    assert abort_after < state["slow_stylesheet_delay_seconds"] * 0.8

@@ -25,6 +25,7 @@ from interfaces.whatsapp.handler import (
     classify_message,
 )
 from interfaces.whatsapp.payload import IncomingMessage
+from interfaces.whatsapp.task_control import TASK_HELP_TEXT, TaskExecutionWork, TaskRequestText
 
 SENDER = "15551234567"
 PHONE_NUMBER_ID = "1234567890"
@@ -119,6 +120,73 @@ def test_incoming_length_limit_is_injectable():
 
     assert isinstance(task, FixedReplyTask)
     assert task.reply_text == OVERSIZED_MESSAGE_REPLY
+
+
+# --- classify_message(): Milestone 46 P1 "/task ..." recognition ------
+
+
+def test_task_natural_language_request_produces_task_request_text():
+    task = classify_message(_message(text="/task open notepad"))
+
+    assert isinstance(task, TaskRequestText)
+    assert task.request_text == "open notepad"
+    # Never a TextTask - the orchestrator must never see this text.
+    assert not isinstance(task, TextTask)
+
+
+def test_bare_task_produces_fixed_help_reply():
+    task = classify_message(_message(text="/task"))
+
+    assert isinstance(task, FixedReplyTask)
+    assert task.sender == SENDER
+    assert task.reply_text == TASK_HELP_TEXT
+
+
+def test_task_help_produces_fixed_help_reply():
+    task = classify_message(_message(text="/task help"))
+
+    assert isinstance(task, FixedReplyTask)
+    assert task.reply_text == TASK_HELP_TEXT
+
+
+def test_legacy_task_confirm_produces_migration_reply_not_task_request():
+    task = classify_message(_message(text="/task confirm"))
+
+    assert isinstance(task, FixedReplyTask)
+    assert "CONFIRM" in task.reply_text
+    assert task.reply_text != TASK_HELP_TEXT
+
+
+def test_legacy_task_cancel_produces_migration_reply_not_task_request():
+    task = classify_message(_message(text="/task cancel"))
+
+    assert isinstance(task, FixedReplyTask)
+    assert "REJECT" in task.reply_text
+
+
+def test_oversized_task_request_is_rejected_before_task_creation():
+    task = classify_message(_message(text="/task " + "x" * (MAX_INCOMING_TEXT_LENGTH)))
+
+    # The whole message (including "/task ") exceeds max_incoming_text_length
+    # - the ordinary whole-message oversized check fires first, exactly as
+    # for any other message.
+    assert isinstance(task, FixedReplyTask)
+    assert task.reply_text == OVERSIZED_MESSAGE_REPLY
+
+
+def test_task_prefix_mid_sentence_is_not_a_task_command():
+    # Anchored to the start of the message - "/task" appearing mid-sentence
+    # must never be treated as a command.
+    task = classify_message(_message(text="please run /task help me"))
+
+    assert isinstance(task, TextTask)
+    assert task.text == "please run /task help me"
+
+
+def test_knowledge_command_is_still_unaffected_by_task_routing():
+    task = classify_message(_message(text="/knowledge status"))
+
+    assert isinstance(task, TextTask)
 
 
 # --- MessageHandler.handle_task(): no authorization, no dedup ----------
@@ -224,6 +292,57 @@ def test_unrecognized_task_type_raises_type_error():
         assert False, "expected TypeError"
     except TypeError:
         pass
+
+
+# --- TaskExecutionWork: Milestone 46 P1's only execution boundary ------
+
+
+def test_task_execution_work_dispatches_planning_with_the_wired_dependencies(monkeypatch):
+    import interfaces.whatsapp.handler as handler_module
+
+    calls = []
+
+    def fake_dispatch_planning(repository, task_id, catalog, planner_provider):
+        calls.append((repository, task_id, catalog, planner_provider))
+
+    monkeypatch.setattr(handler_module, "dispatch_planning", fake_dispatch_planning)
+
+    sentinel_repo, sentinel_catalog, sentinel_provider = object(), object(), object()
+    handler = MessageHandler(
+        FakeOrchestrator("should not be reached"),
+        RecordingClient(),
+        task_repository=sentinel_repo,
+        task_catalog=sentinel_catalog,
+        planner_provider=sentinel_provider,
+    )
+
+    handler.handle_task(TaskExecutionWork(task_id="task-123"))
+
+    assert calls == [(sentinel_repo, "task-123", sentinel_catalog, sentinel_provider)]
+
+
+def test_task_execution_work_never_calls_orchestrator_or_sends_a_message(monkeypatch):
+    import interfaces.whatsapp.handler as handler_module
+
+    monkeypatch.setattr(handler_module, "dispatch_planning", lambda *a, **k: None)
+
+    orchestrator = FakeOrchestrator("should not be reached")
+    client = RecordingClient()
+    handler = MessageHandler(
+        orchestrator,
+        client,
+        task_repository=object(),
+        task_catalog=object(),
+        planner_provider=object(),
+    )
+
+    handler.handle_task(TaskExecutionWork(task_id="task-123"))
+
+    # Milestone 46 P1 sends no outbound WhatsApp message of its own for a
+    # TaskExecutionWork - no "Task accepted" notice, no result, no
+    # confirmation (all P2).
+    assert client.sent == []
+    assert orchestrator.received_prompts == []
 
 
 # --- Orchestrator result contract: plain str vs ModelResponse ----------

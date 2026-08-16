@@ -11,6 +11,18 @@ retries anywhere in this module, and no log line here ever includes a
 sender ID (masked or otherwise), message text, AI response text, or any
 detail of an exception - only a generic category (processing_error,
 outbound_failure).
+
+Milestone 46 P1 adds a second, unrelated kind of queued work:
+interfaces/whatsapp/task_control.py's TaskExecutionWork(task_id) - the
+durable planning handoff for a "/task <request>" message already durably
+accepted in server.py's POST handling (before this worker ever sees it -
+see task_control.py's own module docstring on the connection-lifecycle
+split between request threads and this worker). Handling one is entirely
+delegated to task_control.dispatch_planning() using this handler's own
+long-lived TaskRepository instance/catalog/planner ModelProvider - this
+module still performs no planning/execution itself and, per P1's explicit
+scope, never sends any outbound WhatsApp message for a TaskExecutionWork
+(no "Task accepted" notice, no result, no confirmation - Milestone 46 P2).
 """
 
 import logging
@@ -19,6 +31,13 @@ from kernel.models.base import ModelResponse
 from kernel.orchestrator.context import RequestContext
 
 from interfaces.whatsapp.client import WhatsAppClientError
+from interfaces.whatsapp.task_control import (
+    TaskExecutionWork,
+    TaskFixedReply,
+    TaskRequestText,
+    classify_task_text,
+    dispatch_planning,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +94,18 @@ class FixedReplyTask:
 
 def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_LENGTH):
     """Turn an already-authorized IncomingMessage into a Task. Pure - no I/O,
-    no authorization, no deduplication."""
+    no authorization, no deduplication.
+
+    Milestone 46 P1: a "/task ..." message is recognized here (delegating
+    the actual grammar to task_control.classify_task_text(), which is
+    itself pure) and returned as either a TaskFixedReply-wrapping
+    FixedReplyTask (bare /task, /task help, or the legacy /task
+    confirm/cancel migration notice - none of these ever reach
+    TaskRepository) or a TaskRequestText, unchanged, for server.py's POST
+    handling to durably accept - this function itself performs no I/O and
+    creates no TaskRecord. Every other message (including ordinary text
+    that doesn't match the /task prefix) is classified exactly as before
+    Milestone 46."""
 
     if message.message_type != "text":
         return FixedReplyTask(message.sender, UNSUPPORTED_MESSAGE_REPLY)
@@ -86,6 +116,12 @@ def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_
 
     if len(text) > max_incoming_text_length:
         return FixedReplyTask(message.sender, OVERSIZED_MESSAGE_REPLY)
+
+    task_classification = classify_task_text(text)
+    if isinstance(task_classification, TaskFixedReply):
+        return FixedReplyTask(message.sender, task_classification.reply_text)
+    if isinstance(task_classification, TaskRequestText):
+        return task_classification
 
     return TextTask(message.sender, text)
 
@@ -133,18 +169,46 @@ class MessageHandler:
         orchestrator,
         client,
         max_outgoing_text_length: int = MAX_OUTGOING_TEXT_LENGTH,
+        *,
+        task_repository=None,
+        task_catalog=None,
+        planner_provider=None,
     ) -> None:
         self._orchestrator = orchestrator
         self._client = client
         self._max_outgoing_text_length = max_outgoing_text_length
+        # Milestone 46 P1: this worker's own long-lived TaskRepository
+        # instance/connection (never shared with a request thread - see
+        # task_control.py's own module docstring) plus the catalog/planner
+        # ModelProvider advance_task_planning() needs. All three are only
+        # required if a TaskExecutionWork item is ever actually dispatched
+        # (see _handle_task_execution_work()) - a build that never wires
+        # them (e.g. an existing test constructing MessageHandler with just
+        # orchestrator/client) keeps working exactly as before for
+        # TextTask/FixedReplyTask.
+        self._task_repository = task_repository
+        self._task_catalog = task_catalog
+        self._planner_provider = planner_provider
 
     def handle_task(self, task) -> None:
         if isinstance(task, TextTask):
             self._handle_text_task(task)
         elif isinstance(task, FixedReplyTask):
             self._reply(task.sender, task.reply_text)
+        elif isinstance(task, TaskExecutionWork):
+            self._handle_task_execution_work(task)
         else:
             raise TypeError(f"unsupported task type: {type(task).__name__}")
+
+    def _handle_task_execution_work(self, task: TaskExecutionWork) -> None:
+        # Milestone 46 P1's only execution boundary: the CREATED -> planning
+        # handoff, via task_control.dispatch_planning(). Never sends any
+        # outbound WhatsApp message - no "Task accepted" notice, no result,
+        # no confirmation request (all Milestone 46 P2) - and never calls
+        # SafeTaskExecutor/run_task_until_blocked/advance_task_execution.
+        dispatch_planning(
+            self._task_repository, task.task_id, self._task_catalog, self._planner_provider
+        )
 
     def _handle_text_task(self, task: TextTask) -> None:
         try:

@@ -57,14 +57,18 @@ to the kernel.
   CLI outside the runtime kernel); not wired into the orchestrator, any
   capability, or kernel/knowledge above.
   kernel/employee_tasks: implemented (Milestone 40; schema version 2,
-  adding plan persistence, in Milestone 41 P2) - a separate,
+  adding plan persistence, in Milestone 41 P2; schema version 4 as of
+  Milestone 42 P2 - unchanged by Milestone 46 P1) - a separate,
   dedicated SQLite database (storage/tasks/tasks.sqlite3) giving durable
-  task identity and lifecycle state; not wired into the orchestrator, any
-  capability, kernel/action_protocol, or kernel/tools/confirmation.py -
-  deliberately distinct from capabilities/tasks/TasksCapability, an
-  unrelated, existing command capability. As of Milestone 41 P2 it has
-  exactly one caller, kernel/task_orchestration/ below - still no
-  production caller upstream of that.
+  task identity and lifecycle state; not wired into kernel/tools/
+  confirmation.py - deliberately distinct from
+  capabilities/tasks/TasksCapability, an unrelated, existing command
+  capability. As of Milestone 46 P1 its production callers are
+  kernel/task_orchestration/ (below) and, directly, the new
+  interfaces/whatsapp/task_control.py (TaskRepository.create_task()/
+  get_task_by_dedup_key() - the latter added in Milestone 46 P1, no schema
+  change) for durable "/task ..." ingress. kernel/task_execution/ (below)
+  still has no production caller.
   kernel/task_planner: implemented (Milestone 41 P1 - Bounded Task
   Planner) - takes one persisted employee_tasks Task and a deterministic
   action catalog and produces a bounded, validated plan via exactly one
@@ -74,14 +78,21 @@ to the kernel.
   Orchestration) - connects kernel/task_planner to kernel/employee_tasks
   without either depending on the other, running one task through
   created -> planning -> {ready | failed}. See Planning Orchestration
-  below. No production caller yet.
+  below. As of Milestone 46 P1, its production caller is the WhatsApp
+  worker thread (interfaces/whatsapp/task_control.py:dispatch_planning()),
+  asynchronously, off the webhook HTTP thread - the CREATED -> planning
+  handoff only; execution (kernel/task_execution/, below) is not yet
+  wired to any real caller.
   kernel/task_execution: implemented (Milestone 42 - Autonomous Execution
   Loop) - drives a ready/running task one step at a time (deterministic,
   model-free eligibility; action execution through SafeTaskExecutor;
   durable confirmation for sensitive actions; RESPOND synthesis through an
   injected conversational ModelProvider) plus a bounded runner that
   repeats that one-step primitive until a blocking/terminal condition.
-  See Autonomous Execution Loop below. No production caller yet.
+  See Autonomous Execution Loop below. No production caller yet - this is
+  explicitly Milestone 46 P2's scope (result delivery, confirmation
+  interaction, and the actual run_task_until_blocked()/SafeTaskExecutor
+  wiring), not P1's.
 ```
 
 ## Layers
@@ -171,12 +182,21 @@ responsibility:
 - **handler** (`handler.py`) — performs no authorization or
   deduplication; both already happened in `server.py` before this module
   is ever involved. `classify_message(message)` is a pure function that
-  turns an already-authorized `IncomingMessage` into a `TextTask` (valid
-  text, ready for the orchestrator) or a `FixedReplyTask` (one of three
-  fixed replies — unsupported type, empty text, or text over the
-  configured inbound limit, default 4,096 Unicode characters — the
-  orchestrator is never called for these). `MessageHandler.handle_task(task)`
-  is what the background worker calls: for a `TextTask` it calls
+  turns an already-authorized `IncomingMessage` into one of four outcomes:
+  a `TextTask` (ordinary chat text, ready for the orchestrator), a
+  `FixedReplyTask` (unsupported type, empty text, text over the configured
+  inbound limit — default 4,096 Unicode characters — or, as of Milestone 46
+  P1, a bare `/task`/`/task help` or legacy `/task confirm`/`/task cancel`
+  migration notice — the orchestrator is never called for any of these), or
+  (Milestone 46 P1) a `TaskRequestText` — a `"/task <request>"` message
+  whose text is durable-task input, not ordinary chat, and is deliberately
+  *not* turned into a `TextTask` here: `classify_message()` delegates the
+  `/task` grammar itself to `interfaces/whatsapp/task_control.py`'s pure
+  `classify_task_text()`, and returns a `TaskRequestText` unchanged for
+  `server.py`'s `do_POST` to durably accept (see "Milestone 46 P1 — Durable
+  WhatsApp Task Ingress" below) — `handler.py` never touches
+  `TaskRepository` itself. `MessageHandler.handle_task(task)` is what the
+  background worker calls: for a `TextTask` it calls
   `Orchestrator.handle(text, context=_TRUSTED_CONTEXT)` inside a
   `try/except` — `_TRUSTED_CONTEXT` (Milestone 33,
   `RequestContext(allow_computer_actions=True, actor="whatsapp")`) is
@@ -205,7 +225,14 @@ responsibility:
   log line in this module ever includes a sender ID (masked or
   otherwise), message text, or AI response text; a failed reply (fixed or
   otherwise) is logged once as a generic `outbound_failure` category and
-  dropped, never retried.
+  dropped, never retried. Milestone 46 P1 adds a fifth item this same
+  `handle_task(task)` dispatches on: `TaskExecutionWork(task_id)` (defined
+  in `task_control.py`, queued only by `server.py`'s `do_POST`, never
+  constructed here) — handling one calls `task_control.dispatch_planning()`
+  using this handler's own long-lived, worker-owned `TaskRepository`/
+  catalog/planner `ModelProvider` (see "Milestone 46 P1" below), and sends
+  no outbound WhatsApp message of any kind — no "Task accepted" notice, no
+  result, no confirmation request (Milestone 46 P2's concern).
 - **memory** (`memory.py`) — `FixedNamespaceMemory` is the concrete
   namespace adapter the `memory_manager` injection seam (see Orchestrator
   below) was built for: it wraps a real `MemoryManager` and pins every
@@ -290,9 +317,31 @@ a dedicated `AF_INET6` server variant rather than being silently
 mishandled by an IPv4-only socket. `WhatsAppServer.stop()` shuts the HTTP
 server down, then enqueues a shutdown sentinel *after* whatever is
 already queued — so already-queued tasks are drained before the worker
-sees it — and joins the background worker thread with a bounded timeout,
-for a graceful exit with no in-flight or already-queued message
-abandoned mid-processing.
+sees it — and joins the background worker thread with a bounded timeout
+(`_WORKER_JOIN_TIMEOUT_SECONDS`, 5 seconds).
+
+**The exact shutdown guarantee, precisely stated (Milestone 46 adversarial
+review correction — an earlier version of this section overclaimed this):**
+if the worker finishes within that bounded join, `stop()` returns having
+genuinely waited for it. If the worker is still active past the timeout —
+realistic once Milestone 46 P1 placed durable task planning (a real,
+sometimes-slow model call) onto this same worker — `stop()` still returns
+rather than blocking indefinitely, but it does **not** claim the worker has
+stopped: it logs a bounded `worker_shutdown_pending` category (never
+request/task/SQL/provider detail) and returns, leaving the worker running.
+`stop()` never forces the worker to stop, never closes resources out from
+under it, and never marks its in-flight task failed or cancelled from
+another thread — P1 owns no recovery/reconciliation system for this (that
+remains Milestone 47's concern). The worker keeps processing whatever it
+was doing, then the already-enqueued `_STOP` sentinel, on its own schedule;
+only once its own loop has actually exited does it close its own
+Milestone 46 P1 task-DB connection itself (`_run_worker()`'s own `finally`
+block) — never any other thread, and never before then. This corrects an
+earlier defect (found and fixed during the Milestone 46 P1 adversarial
+review) where `stop()` itself closed that connection unconditionally after
+the join, regardless of whether the worker had actually finished —
+empirically capable of leaving a task permanently stuck mid-plan if the
+worker was still using the connection at that moment.
 
 ### Kernel
 
@@ -2866,18 +2915,59 @@ this flow — a single call to `handle()` is one full request/response cycle.
   closure precedent for why a dedicated acceptance pass, rather than a new
   capability, is what "closes" a milestone here.
 
+- Milestone 46 — WhatsApp Task Control: **IN PROGRESS.** P1 (Durable
+  WhatsApp Task Ingress) is implemented: `interfaces/whatsapp/` now
+  recognizes `"/task <request>"` and durably accepts it into
+  `kernel/employee_tasks/` (`TaskRepository.create_task(source="whatsapp",
+  dedup_key=...)`, idempotent under concurrent/duplicate webhook delivery
+  via the existing `dedup_key` `UNIQUE` constraint — see
+  `interfaces/whatsapp/task_control.py`) *before* the webhook HTTP thread
+  may respond with success, then hands only the resulting `task_id` (never
+  raw request text or the provider message ID) to the existing single
+  WhatsApp worker thread, which advances it through
+  `kernel/task_orchestration/`'s `advance_task_planning()` — the
+  `CREATED -> planning -> {ready | failed}` handoff only. Ordinary
+  conversational WhatsApp messages are completely unchanged (still
+  `Orchestrator.handle()`, no `TaskRepository` involvement). WhatsApp's
+  `/task` no longer reaches Milestone 33's `TasksCapability` or
+  `kernel/tools/confirmation.py`'s `ConfirmationStore` at all — both remain
+  in the repository, untouched, for any other future caller, but WhatsApp
+  itself is fully cut over. P1 explicitly does **not**: execute any action
+  (`kernel/task_execution/`'s `SafeTaskExecutor`/`run_task_until_blocked()`/
+  `advance_task_execution()` are never called), deliver any task result,
+  send any confirmation request, implement `CONFIRM`/`REJECT`, or send even
+  an acceptance acknowledgement ("Task accepted") over WhatsApp — a
+  successfully-planned task may sit in `READY` indefinitely until P2 lands;
+  that is deliberate, not a bug. No schema change (`SCHEMA_VERSION` stays
+  4) — the only `kernel/employee_tasks/repository.py` addition is
+  `get_task_by_dedup_key()`, an exact-equality lookup reusing the existing
+  `UNIQUE` index. **Milestone 46 P2 (task execution/result delivery/
+  confirmation interaction) and P3 (security acceptance and closure)
+  remain outstanding — do not treat Milestone 46 as complete.**
+
+  An adversarial review of this P1 implementation found and this pass
+  corrected: (1) `WhatsAppServer.stop()` could close the worker's task-DB
+  connection while the worker was still using it — see "WhatsApp Server
+  Lifecycle" above for the corrected, precise shutdown guarantee; (2) an
+  ungrounded, arbitrary 256-character provider-message-ID length limit
+  (no such contract exists anywhere in this repository) has been removed —
+  `compute_dedup_key()` now bounds only the fixed-length SHA-256 digest it
+  produces, never the input, relying on the webhook body's own existing
+  1 MiB hard cap for transitive boundedness.
+
 **Planned / not yet implemented:**
 
-- Milestone 46 (WhatsApp
-  Task Control — real task submission, result delivery, and
-  confirmation-reply routing), Milestone 47 (persistence
-  recovery/reconciliation, especially an uncertain `in_progress` external
-  action left behind by a process crash), and Milestone 48 (employee
-  acceptance/launch). None of this exists yet; do not treat any of these
-  names as implemented. Neither Milestone 44 nor Milestone 45 absorbs any
-  of this scope — a future JavaScript-enabled or interactive browser
-  capability, and any future native desktop mutation capability, are each
-  new, separately-designed features, not a hidden part of any of these
+- Milestone 46 P2/P3 (task result delivery, confirmation request/reply
+  delivery over WhatsApp, and the P3 security-acceptance closure pass —
+  see the Milestone 46 entry above for what P1 already covers), Milestone
+  47 (persistence recovery/reconciliation, especially an uncertain
+  `in_progress` external action left behind by a process crash), and
+  Milestone 48 (employee acceptance/launch). None of this exists yet; do
+  not treat any of these names as implemented. Neither Milestone 44 nor
+  Milestone 45 absorbs any of this scope — a future JavaScript-enabled or
+  interactive browser capability, and any future native desktop mutation
+  capability, are each new, separately-designed features, not a hidden
+  part of any of these
   three, and not owned by M46 either.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see

@@ -6,6 +6,6 @@ provider module, so the kernel never needs to know which provider is active.
 """
 
 from kernel.models.base import ModelResponse
-from kernel.models.factory import get_provider
+from kernel.models.factory import get_planner_provider, get_provider
 
-__all__ = ["ModelResponse", "get_provider"]
+__all__ = ["ModelResponse", "get_provider", "get_planner_provider"]

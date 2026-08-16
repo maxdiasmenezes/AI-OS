@@ -250,6 +250,76 @@ def test_get_task_by_display_id_not_found(repo):
         repo.get_task_by_display_id("TASK-ZZZZZZZZ")
 
 
+# --- get_task_by_dedup_key (Milestone 46 P1) -------------------------------
+
+
+def test_get_task_by_dedup_key_existing_match(repo):
+    created = repo.create_task("request", "whatsapp", dedup_key="whatsapp:abc123")
+    fetched = repo.get_task_by_dedup_key("whatsapp:abc123")
+    assert fetched == created
+
+
+def test_get_task_by_dedup_key_no_match_returns_none(repo):
+    repo.create_task("request", "whatsapp", dedup_key="whatsapp:abc123")
+    assert repo.get_task_by_dedup_key("whatsapp:does-not-exist") is None
+
+
+def test_get_task_by_dedup_key_no_rows_at_all_returns_none(repo):
+    assert repo.get_task_by_dedup_key("whatsapp:anything") is None
+
+
+def test_get_task_by_dedup_key_exact_equality_only(repo):
+    repo.create_task("request", "whatsapp", dedup_key="whatsapp:abc123")
+    # Prefix/substring/case variants must never match - exact equality only.
+    assert repo.get_task_by_dedup_key("whatsapp:abc12") is None
+    assert repo.get_task_by_dedup_key("whatsapp:abc123x") is None
+    assert repo.get_task_by_dedup_key("WHATSAPP:ABC123") is None
+
+
+def test_get_task_by_dedup_key_two_different_keys(repo):
+    first = repo.create_task("request one", "whatsapp", dedup_key="whatsapp:key1")
+    second = repo.create_task("request two", "whatsapp", dedup_key="whatsapp:key2")
+
+    assert repo.get_task_by_dedup_key("whatsapp:key1") == first
+    assert repo.get_task_by_dedup_key("whatsapp:key2") == second
+
+
+def test_get_task_by_dedup_key_oversized_key_rejected(repo):
+    with pytest.raises(TaskInputTooLargeError):
+        repo.get_task_by_dedup_key("x" * (MAX_DEDUP_KEY_CHARS + 1))
+
+
+def test_get_task_by_dedup_key_nul_byte_rejected(repo):
+    with pytest.raises(TaskInputTooLargeError):
+        repo.get_task_by_dedup_key("whatsapp:abc\x00123")
+
+
+def test_get_task_by_dedup_key_empty_key_rejected(repo):
+    with pytest.raises(TaskInputTooLargeError):
+        repo.get_task_by_dedup_key("")
+
+
+def test_get_task_by_dedup_key_works_over_reader_connection(db_path, repo):
+    created = repo.create_task("request", "whatsapp", dedup_key="whatsapp:abc123")
+
+    reader_conn = open_reader_connection(db_path)
+    try:
+        reader_repo = TaskRepository(reader_conn)
+        assert reader_repo.get_task_by_dedup_key("whatsapp:abc123") == created
+    finally:
+        reader_conn.close()
+
+
+def test_get_task_by_dedup_key_performs_no_mutation(repo):
+    created = repo.create_task("request", "whatsapp", dedup_key="whatsapp:abc123")
+    repo.get_task_by_dedup_key("whatsapp:abc123")
+    repo.get_task_by_dedup_key("whatsapp:no-such-key")
+
+    reloaded = repo.get_task(created.task_id)
+    assert reloaded == created
+    assert len(repo.list_tasks(limit=100)) == 1
+
+
 def test_list_tasks_deterministic_order(repo):
     for i in range(10):
         repo.create_task(f"request {i}", "whatsapp")

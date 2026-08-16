@@ -29,10 +29,19 @@ from interfaces.whatsapp.server import (
     WhatsAppServer,
     build_orchestrator,
 )
+from interfaces.whatsapp.task_control import TaskExecutionWork, compute_dedup_key
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
+from kernel.employee_tasks import (
+    TaskRepository,
+    TaskState,
+    open_writer_connection,
+)
 from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
+from kernel.task_planner import build_catalog
+from kernel.tools.config import RepoBackupSpec, ToolsConfig
+from kernel.tools.registry import ActionRegistry
 
 _APP_SECRET = "test-app-secret"
 _VERIFY_TOKEN = "test-verify-token"
@@ -1037,6 +1046,804 @@ def test_server_can_bind_to_ipv6_loopback():
         with urllib.request.urlopen(url, timeout=5) as response:
             assert response.status == 200
             assert response.read() == b"ipv6ok"
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+# --- Milestone 46 P1: durable "/task" ingress ---------------------------
+
+
+def _task_catalog():
+    tools_config = ToolsConfig(
+        approved_directories={},
+        approved_applications={"notepad": object()},
+        approved_scripts={},
+        approved_repositories={"ai_os": object()},
+        approved_backups={"ai_os": RepoBackupSpec(destination_directory="/x")},
+    )
+    return build_catalog(ActionRegistry(), tools_config)
+
+
+def _valid_plan_raw(catalog, objective="Check repository health."):
+    entry = next(e for e in catalog if e.action_name == "repo_health")
+    return json.dumps(
+        {
+            "plan_version": 1,
+            "result": "plan",
+            "objective": objective,
+            "steps": [
+                {
+                    "step_kind": "action",
+                    "catalog_id": entry.catalog_id,
+                    "description": "Check repo health.",
+                    "expected_result": "Health known.",
+                    "depends_on": [],
+                }
+            ],
+        }
+    )
+
+
+class _FakePlannerProvider:
+    """Records every prompt it received and returns canned responses in
+    order - never a real network call."""
+
+    def __init__(self, responses=None):
+        self._responses = list(responses) if responses is not None else []
+        self.calls: list[str] = []
+
+    def send_prompt(self, prompt, *, options=None):
+        self.calls.append(prompt)
+        text = self._responses.pop(0) if self._responses else _valid_plan_raw(_task_catalog())
+        return ModelResponse(
+            text=text, model="fake-planner", input_tokens=0, output_tokens=0, latency_seconds=0.0
+        )
+
+
+class _BlockingPlannerProvider:
+    """Blocks send_prompt() until release() is called - mirrors
+    BlockingOrchestrator above, used to prove the planner is only ever
+    called asynchronously, off the webhook HTTP thread (see
+    test_task_planning_never_happens_on_the_webhook_http_thread below)."""
+
+    def __init__(self, response_text=None):
+        self._response_text = response_text
+        self.started = threading.Event()
+        self._release = threading.Event()
+        self.calls: list[str] = []
+
+    def send_prompt(self, prompt, *, options=None):
+        self.calls.append(prompt)
+        self.started.set()
+        self._release.wait(timeout=5)
+        text = self._response_text or _valid_plan_raw(_task_catalog())
+        return ModelResponse(
+            text=text, model="fake-planner", input_tokens=0, output_tokens=0, latency_seconds=0.0
+        )
+
+    def release(self):
+        self._release.set()
+
+
+def _make_server_with_tasks(
+    tmp_path,
+    planner_provider,
+    *,
+    orchestrator=None,
+    queue_capacity=DEFAULT_QUEUE_CAPACITY,
+):
+    """Builds a real WhatsAppServer with Milestone 46 P1 durable-ingress
+    wiring - a real tmp_path SQLite database (schema pre-initialized, like
+    build_server()'s own composition root), a real worker-owned
+    TaskRepository, and the given (fake) planner provider. Returns
+    (server, client, db_path) - the caller is responsible for
+    starting/stopping the server, matching every other inline server
+    construction in this file."""
+
+    whatsapp_config = _make_whatsapp_config()
+    db_path = tmp_path / "tasks.sqlite3"
+
+    schema_init_connection = open_writer_connection(db_path)
+    schema_init_connection.close()
+
+    worker_connection = open_writer_connection(db_path)
+    worker_repository = TaskRepository(worker_connection)
+
+    client = RecordingClient()
+    handler = MessageHandler(
+        orchestrator if orchestrator is not None else FakeOrchestrator("ordinary chat reply"),
+        client,
+        task_repository=worker_repository,
+        task_catalog=_task_catalog(),
+        planner_provider=planner_provider,
+    )
+    server = WhatsAppServer(
+        whatsapp_config,
+        handler,
+        queue_capacity=queue_capacity,
+        task_db_path=db_path,
+        worker_task_connection=worker_connection,
+    )
+    return server, client, db_path
+
+
+def _list_tasks(db_path):
+    conn = open_writer_connection(db_path)
+    try:
+        return TaskRepository(conn).list_tasks(limit=100)
+    finally:
+        conn.close()
+
+
+def test_task_request_is_durably_accepted_and_planned(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        status = _post(server, _envelope("wamid.task1", _AUTHORIZED_SENDER, text="/task check repo health"))
+        assert status == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(planner.calls) == 0:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].source == "whatsapp"
+        assert tasks[0].request_text == "check repo health"
+        assert tasks[0].state == TaskState.READY
+
+        # Milestone 46 P1 sends no outbound WhatsApp message of its own.
+        assert client.sent == []
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_task_planning_never_happens_on_the_webhook_http_thread(tmp_path):
+    planner = _BlockingPlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        # The webhook POST must complete and return 200 WITHOUT ever
+        # waiting on the (currently blocked) planner call - this is a
+        # call-path proof, not a timing race: urlopen() only returns once
+        # the HTTP response has actually been sent, so reaching this
+        # assertion already proves do_POST returned while the planner
+        # provider was still parked on its own Event.
+        status = _post(server, _envelope("wamid.block1", _AUTHORIZED_SENDER, text="/task check repo health"))
+        assert status == 200
+
+        # The durable row already exists even though the model call has not
+        # returned yet - proving durable acceptance itself also never waited
+        # on the model. advance_task_planning() moves CREATED -> PLANNING
+        # before ever calling the model, so PLANNING (not CREATED) is the
+        # state observed here while the fake provider is still blocked.
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].state == TaskState.PLANNING
+
+        # Only now does the worker thread reach the (still-blocked) model
+        # call - proving planning genuinely happens, just asynchronously.
+        assert planner.started.wait(timeout=2)
+    finally:
+        planner.release()
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_task_storage_failure_returns_retryable_status_and_creates_nothing(tmp_path, monkeypatch):
+    import kernel.employee_tasks.repository as repository_module
+
+    def raise_storage_error(self, *args, **kwargs):
+        from kernel.employee_tasks import TaskStorageUnavailableError
+        raise TaskStorageUnavailableError("simulated failure")
+
+    monkeypatch.setattr(repository_module.TaskRepository, "create_task", raise_storage_error)
+
+    planner = _FakePlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        status = _post(server, _envelope("wamid.fail1", _AUTHORIZED_SENDER, text="/task open notepad"))
+        assert status == 503
+
+        time.sleep(0.1)
+        assert _list_tasks(db_path) == []
+        assert planner.calls == []  # never even reached the worker
+        assert client.sent == []
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_duplicate_task_message_resolves_same_task_no_second_row(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        envelope = _envelope("wamid.dup_task", _AUTHORIZED_SENDER, text="/task check repo health")
+        assert _post(server, envelope) == 200
+        assert _post(server, envelope) == 200  # exact redelivery, same message id
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(_list_tasks(db_path)) == 0:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_duplicate_message_id_with_different_content_does_not_mutate_original(tmp_path):
+    # Milestone 46 adversarial review, §13: the same provider message ID
+    # redelivered with DIFFERENT /task text must never replace the
+    # original task's intent, never create a second TaskRecord, and never
+    # trigger a second plan from the changed body - exercised through the
+    # real server path, not only task_control.py directly.
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        first_envelope = _envelope("wamid.samekey", _AUTHORIZED_SENDER, text="/task check repo health")
+        assert _post(server, first_envelope) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(_list_tasks(db_path)) == 0:
+            time.sleep(0.02)
+        original_task_id = _list_tasks(db_path)[0].task_id
+
+        # Same message ID, deliberately different /task text.
+        second_envelope = _envelope("wamid.samekey", _AUTHORIZED_SENDER, text="/task open notepad")
+        assert _post(server, second_envelope) == 200
+
+        time.sleep(0.1)  # give any (incorrect) second dispatch a chance to happen
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1, "a redelivered message ID with different content must not create a second row"
+        assert tasks[0].task_id == original_task_id
+        assert tasks[0].request_text == "check repo health", "original request text must remain authoritative"
+        # Only the original request was ever planned - a second, different
+        # plan was never generated from the changed body.
+        assert len(planner.calls) <= 1
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_task_queue_full_returns_503_keeps_durable_row_and_retries_via_dedup(tmp_path):
+    planner = _BlockingPlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner, queue_capacity=1)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        # A: dequeued immediately, blocks the worker inside the planner call.
+        assert _post(server, _envelope("wamid.qa", _AUTHORIZED_SENDER, text="/task check repo health")) == 200
+        assert planner.started.wait(timeout=2)
+
+        # B: occupies the queue's one free slot (never dequeued while A blocks).
+        assert _post(server, _envelope("wamid.qb", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+
+        # C: a NEW /task - the queue is full, so this must be 503, and its
+        # durable row must still exist (never deleted merely because the
+        # queue overflowed).
+        status = _post(server, _envelope("wamid.qc", _AUTHORIZED_SENDER, text="/task check repo health also"))
+        assert status == 503
+
+        tasks_after_overflow = _list_tasks(db_path)
+        assert len(tasks_after_overflow) == 3  # A, B, and the durably-created-but-unqueued C
+        c_task = next(t for t in tasks_after_overflow if t.request_text == "check repo health also")
+        assert c_task.state == TaskState.CREATED
+
+        planner.release()
+
+        # Let A and B both fully drain (the worker dequeues and processes
+        # one at a time) before retrying C, so the queue is deterministically
+        # empty for the retry - never a wall-clock guess.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and any(
+            t.state == TaskState.CREATED for t in _list_tasks(db_path) if t.request_text != "check repo health also"
+        ):
+            time.sleep(0.02)
+        assert all(
+            t.state == TaskState.READY
+            for t in _list_tasks(db_path)
+            if t.request_text != "check repo health also"
+        )
+
+        # A retry of the exact same provider message (C) must resolve the
+        # SAME durable row via dedup_key, never create a second one - and
+        # the queue is now empty, so it deterministically succeeds. Must
+        # still be recognized as the SAME /task message on redelivery - a
+        # webhook retry resends the identical message body, so this keeps
+        # the "/task " prefix (an earlier version of this test used
+        # non-"/task" text here, which silently classified the redelivery
+        # as ordinary chat instead of exercising the durable dedup path at
+        # all - a real bug the L5 assertion-tightening in the Milestone 46
+        # adversarial review correction pass exposed).
+        retry_status = _post(
+            server, _envelope("wamid.qc", _AUTHORIZED_SENDER, text="/task check repo health also")
+        )
+        assert retry_status == 200
+
+        # Wait deterministically for the retry to actually restore dispatch
+        # and finish planning - proving the retry worked, not merely that
+        # it might have (Milestone 46 adversarial review, L5).
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and next(
+            t for t in _list_tasks(db_path) if t.request_text == "check repo health also"
+        ).state == TaskState.CREATED:
+            time.sleep(0.02)
+
+        tasks_final = _list_tasks(db_path)
+        assert len(tasks_final) == 3  # still exactly 3 - no new row from the retry
+        c_task_final = next(t for t in tasks_final if t.request_text == "check repo health also")
+        assert c_task_final.state == TaskState.READY
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+# --- H1 regression: worker owns and closes its own DB connection --------
+
+
+class _ClosingSpyConnection:
+    """Wraps a real sqlite3.Connection, recording every close() call -
+    everything else is delegated unchanged. sqlite3.Connection instances
+    do not support arbitrary attribute assignment (no __dict__), so a
+    wrapper is required rather than monkeypatching .close on the instance
+    itself."""
+
+    def __init__(self, real_conn):
+        self._real = real_conn
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+        self._real.close()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_stop_does_not_close_worker_connection_while_worker_still_active(tmp_path, monkeypatch):
+    """Milestone 46 adversarial review, H1 regression test.
+
+    Reproduces the exact original defect if the fix is reverted: the
+    worker is deliberately kept blocked inside a planner call well past
+    stop()'s join timeout, proving stop() returns without closing the
+    worker's connection, and that the worker - once released - completes
+    normally, closes its OWN connection exactly once, and leaves the task
+    in its correct durable state (never orphaned in PLANNING, never a
+    worker_error from a closed database)."""
+
+    import interfaces.whatsapp.server as server_module
+
+    # Shortened so this test is fast and deterministic - the worker is
+    # kept blocked well past this timeout, on purpose.
+    monkeypatch.setattr(server_module, "_WORKER_JOIN_TIMEOUT_SECONDS", 0.3)
+
+    whatsapp_config = _make_whatsapp_config()
+    db_path = tmp_path / "tasks.sqlite3"
+
+    schema_init_connection = open_writer_connection(db_path)
+    schema_init_connection.close()
+
+    real_worker_connection = open_writer_connection(db_path)
+    spy_connection = _ClosingSpyConnection(real_worker_connection)
+    worker_repository = TaskRepository(spy_connection)
+
+    planner = _BlockingPlannerProvider()
+    client = RecordingClient()
+    handler = MessageHandler(
+        FakeOrchestrator("ordinary chat reply"),
+        client,
+        task_repository=worker_repository,
+        task_catalog=_task_catalog(),
+        planner_provider=planner,
+    )
+    server = server_module.WhatsAppServer(
+        whatsapp_config,
+        handler,
+        task_db_path=db_path,
+        worker_task_connection=spy_connection,
+    )
+
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    # Seed a durable CREATED task directly and dispatch it into the worker
+    # queue - this test is about shutdown lifecycle, not ingress, so HTTP
+    # is not needed to get a task in flight.
+    task = worker_repository.create_task(
+        "check repo health", "whatsapp", dedup_key="whatsapp:h1regression"
+    )
+    server._queue.put(TaskExecutionWork(task_id=task.task_id))
+
+    try:
+        assert planner.started.wait(timeout=2), "worker never reached the planner call"
+
+        # stop()'s bounded join times out (0.3s) while the worker is still
+        # blocked inside the planner call - it must still return, and it
+        # must NOT close the worker's connection while doing so.
+        server.stop()
+
+        assert spy_connection.close_calls == 0, (
+            "stop() closed the worker's connection while the worker was still active"
+        )
+
+        # Release the blocked planner call - the worker finishes planning,
+        # then drains the already-enqueued _STOP sentinel and exits, closing
+        # its own connection only at that point.
+        planner.release()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and spy_connection.close_calls == 0:
+            time.sleep(0.02)
+
+        assert spy_connection.close_calls == 1, "worker connection was never closed after the worker exited"
+
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        planner.release()
+        thread.join(timeout=5)
+
+    # The task must have finished planning normally through the exact same
+    # connection the worker used throughout - never orphaned in PLANNING,
+    # never requiring a worker_error to "recover" from a closed database.
+    verify_connection = open_writer_connection(db_path)
+    try:
+        final_task = TaskRepository(verify_connection).get_task(task.task_id)
+        assert final_task.state == TaskState.READY
+    finally:
+        verify_connection.close()
+
+
+def test_stop_logs_pending_not_stopped_when_worker_still_active(tmp_path, monkeypatch, caplog):
+    """stop() must never claim the worker has stopped when it has not -
+    only a generic, bounded log line, never request/task/SQL/provider
+    detail."""
+
+    import logging
+
+    import interfaces.whatsapp.server as server_module
+
+    monkeypatch.setattr(server_module, "_WORKER_JOIN_TIMEOUT_SECONDS", 0.3)
+
+    planner = _BlockingPlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.pending1", _AUTHORIZED_SENDER, text="/task check repo health")) == 200
+        assert planner.started.wait(timeout=2)
+
+        with caplog.at_level(logging.WARNING, logger="interfaces.whatsapp.server"):
+            server.stop()
+
+        assert "worker_shutdown_pending" in caplog.text
+        assert "check repo health" not in caplog.text
+    finally:
+        planner.release()
+        thread.join(timeout=5)
+
+
+def test_concurrent_duplicate_task_messages_create_at_most_one_task(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog()) for _ in range(8)])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        message_count = 6
+        envelope = _envelope("wamid.concurrent1", _AUTHORIZED_SENDER, text="/task check repo health")
+        barrier = threading.Barrier(message_count)
+        results = [None] * message_count
+
+        def worker(i):
+            barrier.wait()
+            results[i] = _post(server, envelope)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(message_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        # Every concurrent duplicate must be accepted (200) - the SQLite
+        # UNIQUE constraint on dedup_key resolves the race, never a 5xx
+        # merely because of the concurrency itself.
+        assert all(status == 200 for status in results), results
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(_list_tasks(db_path)) == 0:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1, "at most one TaskRecord for one provider message"
+        assert tasks[0].dedup_key == compute_dedup_key("wamid.concurrent1")
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_plain_chat_unaffected_by_task_wiring_no_task_record_created(tmp_path):
+    orchestrator = FakeOrchestrator("a bold Malbec would work well")
+    planner = _FakePlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner, orchestrator=orchestrator)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        status = _post(server, _envelope("wamid.chat1", _AUTHORIZED_SENDER, text="what wine goes with steak?"))
+        assert status == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.sent:
+            time.sleep(0.02)
+
+        assert orchestrator.received_prompts == ["what wine goes with steak?"]
+        assert client.sent == [(_AUTHORIZED_SENDER, "a bold Malbec would work well")]
+        assert _list_tasks(db_path) == []
+        assert planner.calls == []
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_legacy_task_router_and_confirmation_store_never_reached_for_whatsapp_task(tmp_path):
+    # The old M33 path is only reachable via Orchestrator.handle() - proving
+    # the orchestrator never sees the /task text is sufficient proof
+    # TasksCapability/kernel.tools.confirmation.py's ConfirmationStore were
+    # never reached either, since neither is reachable any other way.
+    orchestrator = FakeOrchestrator("should never be produced for /task")
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner, orchestrator=orchestrator)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.legacy1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(planner.calls) == 0:
+            time.sleep(0.02)
+
+        assert orchestrator.received_prompts == []
+        assert client.sent == []
+
+        # Ordinary chat, on the SAME server, still reaches the orchestrator
+        # exactly as before - this is a migration, not a removal.
+        assert _post(server, _envelope("wamid.legacy2", _AUTHORIZED_SENDER, text="hello there")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not orchestrator.received_prompts:
+            time.sleep(0.02)
+        assert orchestrator.received_prompts == ["hello there"]
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_standalone_confirm_and_reject_remain_ordinary_chat_in_p1(tmp_path):
+    # Milestone 46 adversarial review, §14: bare "CONFIRM <id>"/"REJECT <id>"
+    # (not "/task confirm"/"/task cancel") are NOT intercepted in P1 - they
+    # must reach the orchestrator as ordinary conversational text, never
+    # enter durable task-confirmation handling, and never touch the legacy
+    # ConfirmationStore either. P2 will intercept these; P1 must not.
+    orchestrator = FakeOrchestrator("ordinary chat response")
+    planner = _FakePlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner, orchestrator=orchestrator)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.confirm1", _AUTHORIZED_SENDER, text="CONFIRM abc-123")) == 200
+        assert _post(server, _envelope("wamid.reject1", _AUTHORIZED_SENDER, text="REJECT abc-123")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(orchestrator.received_prompts) < 2:
+            time.sleep(0.02)
+
+        # Reached the orchestrator as plain text, verbatim - never
+        # specially parsed, never diverted into a durable TaskRecord.
+        assert orchestrator.received_prompts == ["CONFIRM abc-123", "REJECT abc-123"]
+        assert client.sent == [
+            (_AUTHORIZED_SENDER, "ordinary chat response"),
+            (_AUTHORIZED_SENDER, "ordinary chat response"),
+        ]
+        assert _list_tasks(db_path) == []
+        assert planner.calls == []
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_mixed_batch_chat_and_task_both_handled(tmp_path):
+    orchestrator = FakeOrchestrator("chat reply")
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner, orchestrator=orchestrator)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        payload = _multi_message_envelope([
+            ("wamid.mix1", _AUTHORIZED_SENDER, "hello"),
+            ("wamid.mix2", _AUTHORIZED_SENDER, "/task check repo health"),
+        ])
+        assert _post(server, payload) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and (not client.sent or len(_list_tasks(db_path)) == 0):
+            time.sleep(0.02)
+
+        assert orchestrator.received_prompts == ["hello"]
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].request_text == "check repo health"
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_two_different_task_messages_create_two_independent_tasks(tmp_path):
+    planner = _FakePlannerProvider(
+        [_valid_plan_raw(_task_catalog()), _valid_plan_raw(_task_catalog())]
+    )
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        payload = _multi_message_envelope([
+            ("wamid.two1", _AUTHORIZED_SENDER, "/task check repo health"),
+            ("wamid.two2", _AUTHORIZED_SENDER, "/task open notepad"),
+        ])
+        assert _post(server, payload) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(_list_tasks(db_path)) < 2:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 2
+        assert {t.dedup_key for t in tasks} == {
+            compute_dedup_key("wamid.two1"),
+            compute_dedup_key("wamid.two2"),
+        }
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_task_ingress_unavailable_without_wiring_returns_503(running_server):
+    # running_server builds a WhatsAppServer with no task_db_path - a /task
+    # message must never be silently accepted as success in that case.
+    server, orchestrator, client = running_server
+    status = _post(server, _envelope("wamid.nowiring", _AUTHORIZED_SENDER, text="/task open notepad"))
+    assert status == 503
+    assert orchestrator.received_prompts == []
+    assert client.sent == []
+
+
+def test_request_thread_never_shares_the_workers_connection(tmp_path, monkeypatch):
+    # Structural proof (not merely empirical) that a request thread's
+    # durable-ingress connection is never the worker's own long-lived
+    # connection: server.py's do_POST always calls the real
+    # kernel.employee_tasks.open_writer_connection() function fresh, per
+    # /task message, and never touches the MessageHandler's
+    # worker-owned TaskRepository/connection at all - see
+    # task_control.py's own module docstring for why sharing one
+    # connection across concurrently-active threads is unsafe (proven in
+    # the Milestone 46 P1 design report's empirical concurrency
+    # validation).
+    import interfaces.whatsapp.server as server_module
+
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    worker_connection_id = id(server._worker_task_connection)
+
+    seen_connections = []
+    real_open_writer_connection = server_module.open_writer_connection
+
+    def spying_open_writer_connection(path):
+        conn = real_open_writer_connection(path)
+        seen_connections.append(conn)
+        return conn
+
+    # Only patched AFTER server construction - build_server()'s own
+    # schema-pre-init and worker-connection opens (already done above)
+    # must not be counted here; only per-request opens are under test.
+    monkeypatch.setattr(server_module, "open_writer_connection", spying_open_writer_connection)
+
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.conn1", _AUTHORIZED_SENDER, text="/task check repo health")) == 200
+        assert _post(server, _envelope("wamid.conn2", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+    # Each /task request opened its own connection object - none of them
+    # is the same object as another, and none is the worker's own
+    # long-lived connection.
+    assert len(seen_connections) == 2
+    assert seen_connections[0] is not seen_connections[1]
+    assert all(id(conn) != worker_connection_id for conn in seen_connections)
+
+
+def test_bare_task_and_help_produce_fixed_replies_via_worker(tmp_path):
+    planner = _FakePlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.help1", _AUTHORIZED_SENDER, text="/task help")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.sent:
+            time.sleep(0.02)
+
+        assert len(client.sent) == 1
+        assert client.sent[0][0] == _AUTHORIZED_SENDER
+        assert _list_tasks(db_path) == []  # help never touches TaskRepository
+        assert planner.calls == []
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_legacy_task_confirm_produces_migration_reply_no_task_created(tmp_path):
+    planner = _FakePlannerProvider()
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.legconfirm1", _AUTHORIZED_SENDER, text="/task confirm")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.sent:
+            time.sleep(0.02)
+
+        assert len(client.sent) == 1
+        assert "CONFIRM" in client.sent[0][1]
+        assert _list_tasks(db_path) == []
     finally:
         server.stop()
         thread.join(timeout=5)

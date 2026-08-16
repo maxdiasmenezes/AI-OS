@@ -508,6 +508,28 @@ class TaskRepository:
             raise TaskNotFoundError(display_id)
         return _row_to_record(row)
 
+    def get_task_by_dedup_key(self, dedup_key: str) -> TaskRecord | None:
+        """Exact-equality lookup by dedup_key, using the column's existing
+        UNIQUE index (see kernel/employee_tasks/db.py's tasks table DDL) -
+        no table scan, no new index. Unlike get_task()/get_task_by_display_id(),
+        returns None rather than raising when nothing matches: this is a
+        plain existence check for the Milestone 46 WhatsApp durable-ingress
+        caller (create_task() -> DuplicateTaskError -> this lookup to find
+        the row that already won the race), not an identity assertion about
+        a caller-known task_id/display_id. Applies the same bounded-input
+        validation create_task() itself applies to dedup_key - never a
+        source-filtered query, since dedup_key is already namespaced by its
+        own caller (e.g. "whatsapp:<digest>") and the column's UNIQUE
+        constraint is global, not composite with source."""
+
+        dedup_key = _validate_bounded_text(dedup_key, "dedup_key", 1, MAX_DEDUP_KEY_CHARS)
+        row = self._conn.execute(
+            f"SELECT {_SELECT_COLUMNS} FROM tasks WHERE dedup_key = ?", (dedup_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_record(row)
+
     def list_tasks(self, limit: int = DEFAULT_LIST_LIMIT) -> list[TaskRecord]:
         limit = _validate_limit(limit)
         rows = self._conn.execute(

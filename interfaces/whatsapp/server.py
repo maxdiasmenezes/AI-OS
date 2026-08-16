@@ -43,6 +43,29 @@ that overflowed, and anything after it, were never reserved or were just
 released, so a full redelivery of the batch reprocesses them correctly)
 and responds HTTP 503 for the whole request - never 200 - so Meta knows
 to retry.
+
+Milestone 46 P1 - durable "/task <request>" ingress: a message classified
+as interfaces.whatsapp.task_control.TaskRequestText (see
+handler.py:classify_message()) never touches SeenMessageCache at all -
+step 5 above applies only to ordinary conversational messages. Instead,
+durable acceptance (interfaces.whatsapp.task_control.accept_task_message())
+happens synchronously, right here in do_POST, before this handler can ever
+respond with success for that message: the SQLite UNIQUE constraint on
+kernel.employee_tasks' tasks.dedup_key - not this in-memory cache - is the
+authoritative concurrent-dedup boundary for /task messages (see
+task_control.py's own module docstring, and the Milestone 46 P1 design
+report's empirical concurrency validation). A storage failure, an
+out-of-bounds provider message ID, or a full queue when a newly-CREATED
+task needs dispatch all produce the same outcome as an ordinary queue-full:
+HTTP 503 for the whole request, the durable row (if one exists) is never
+deleted or rolled back, and the rest of the batch stops being processed -
+so a Meta retry resolves the same row via DuplicateTaskError rather than
+creating a second one. P1 only ever hands a bare task_id (never raw
+request text, the provider message ID, or anything else) to the worker
+queue as a TaskExecutionWork - see handler.py and task_control.py for the
+CREATED -> planning handoff this performs. P1 sends no outbound WhatsApp
+message of its own for a /task submission (no "Task accepted" notice, no
+result, no confirmation) - that begins in Milestone 46 P2.
 """
 
 import hashlib
@@ -57,8 +80,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from capabilities.loader import CapabilityLoader
 from kernel.config.config import Config, load_config
+from kernel.employee_tasks import TaskRepository, open_writer_connection, resolve_database_path
 from kernel.memory import MemoryManager
+from kernel.models import get_planner_provider
 from kernel.orchestrator import Orchestrator
+from kernel.task_planner import build_catalog
+from kernel.tools import ActionRegistry, load_tools_config
 
 from interfaces.whatsapp.client import WhatsAppClient
 from interfaces.whatsapp.config import WhatsAppConfig, load_whatsapp_config
@@ -67,6 +94,13 @@ from interfaces.whatsapp.handler import MessageHandler, classify_message
 from interfaces.whatsapp.memory import FixedNamespaceMemory
 from interfaces.whatsapp.payload import parse_webhook_payload
 from interfaces.whatsapp.signature import verify_signature
+from interfaces.whatsapp.task_control import (
+    DurableAcceptanceFailed,
+    TaskExecutionWork,
+    TaskRequestText,
+    accept_task_message,
+    needs_dispatch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +140,7 @@ def _make_handler_class(
     work_queue: "queue.Queue",
     dedup: SeenMessageCache,
     max_body_bytes: int,
+    task_db_path=None,
 ):
     """Build a BaseHTTPRequestHandler subclass closed over this server's dependencies."""
 
@@ -204,6 +239,46 @@ def _make_handler_class(
                     logger.info("dropping message: unauthorized sender")
                     continue
 
+                classification = classify_message(message)
+
+                if isinstance(classification, TaskRequestText):
+                    # Milestone 46 P1: SeenMessageCache is never consulted
+                    # for a /task message - see this module's own module
+                    # docstring. task_db_path is None only if this server
+                    # was built without durable-ingress wiring (e.g. an
+                    # existing pre-Milestone-46 test construction) - never
+                    # silently accepted as success in that case either.
+                    if task_db_path is None:
+                        logger.warning("rejecting request: task ingress unavailable")
+                        queue_overflowed = True
+                        continue
+
+                    try:
+                        task_record = accept_task_message(
+                            open_writer_connection,
+                            task_db_path,
+                            classification.request_text,
+                            message.message_id,
+                        )
+                    except DurableAcceptanceFailed:
+                        logger.warning(
+                            "rejecting request: task ingress storage failure (ref=%s)",
+                            _message_reference(message.message_id),
+                        )
+                        queue_overflowed = True
+                        continue
+
+                    if needs_dispatch(task_record):
+                        try:
+                            work_queue.put_nowait(TaskExecutionWork(task_record.task_id))
+                        except queue.Full:
+                            logger.warning(
+                                "rejecting request: queue full (ref=%s)",
+                                _message_reference(message.message_id),
+                            )
+                            queue_overflowed = True
+                    continue
+
                 if not dedup.add_if_new(message.message_id):
                     logger.info(
                         "dropping message: duplicate (ref=%s)",
@@ -211,9 +286,8 @@ def _make_handler_class(
                     )
                     continue
 
-                task = classify_message(message)
                 try:
-                    work_queue.put_nowait(task)
+                    work_queue.put_nowait(classification)
                 except queue.Full:
                     dedup.discard(message.message_id)
                     logger.warning(
@@ -333,12 +407,22 @@ class WhatsAppServer:
         dedup: SeenMessageCache | None = None,
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
         queue_capacity: int = DEFAULT_QUEUE_CAPACITY,
+        *,
+        task_db_path=None,
+        worker_task_connection=None,
     ) -> None:
         self._dedup = dedup if dedup is not None else SeenMessageCache()
         self._queue: "queue.Queue" = queue.Queue(maxsize=queue_capacity)
         self._message_handler = message_handler
+        # Milestone 46 P1: the worker's own long-lived task-DB connection
+        # (if any). Only ever used, and only ever closed, by the worker
+        # thread itself (see _run_worker()'s own finally block and stop()'s
+        # own docstring) - never shared with a request thread's own
+        # connection (opened per-request inside accept_task_message(),
+        # never held here), and never closed by any other thread.
+        self._worker_task_connection = worker_task_connection
         handler_class = _make_handler_class(
-            whatsapp_config, self._queue, self._dedup, max_body_bytes
+            whatsapp_config, self._queue, self._dedup, max_body_bytes, task_db_path
         )
         server_class = _select_server_class(whatsapp_config.host)
         self._httpd = server_class(
@@ -357,33 +441,71 @@ class WhatsAppServer:
         self._httpd.serve_forever()
 
     def stop(self) -> None:
-        """Shut down the HTTP server and let the worker finish gracefully."""
+        """Shut down the HTTP server and signal the worker to stop.
+
+        Joins the worker up to the existing bounded timeout, exactly as
+        before. Milestone 46 P1 correction: this method never closes the
+        worker's own task-DB connection itself, whether or not the join
+        completed in time - only the worker thread may ever close a
+        connection it might still be using (kernel/employee_tasks/db.py's
+        own module docstring is explicit that sqlite3 does not serialize
+        concurrent calls on the same connection object across threads; the
+        original version of this method violated that by closing the
+        connection here regardless of whether join() actually returned
+        because the worker finished, or merely timed out while the worker
+        was still active inside dispatch_planning() - empirically proven to
+        leave a task permanently stuck in TaskState.PLANNING). See
+        _run_worker()'s own docstring/finally block: it closes its own
+        connection itself, only after its own loop has actually exited.
+
+        If the worker is still alive once the join timeout elapses, this
+        method still returns - it never blocks indefinitely and never forces
+        the worker to stop (P1 owns no recovery/reconciliation system; a
+        worker still finishing its current item, then draining the already-
+        enqueued _STOP sentinel on its own schedule, is a normal bounded-
+        shutdown outcome, not a failure this method needs to correct)."""
 
         self._httpd.shutdown()
         self._httpd.server_close()
         self._queue.put(_STOP)
         self._worker_thread.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
+        if self._worker_thread.is_alive():
+            # Never claim the worker has stopped when it has not - a
+            # generic, bounded log line only, never request/task/SQL/
+            # provider detail. The worker keeps running; it will still
+            # close its own connection when _run_worker() actually exits.
+            logger.warning("worker_shutdown_pending")
 
     def _run_worker(self) -> None:
         # No authorization or deduplication happens here - only pre-cleared
         # tasks ever reach this loop. Processes one task at a time,
         # preserving the queue's FIFO order, and never retries a failed
         # outbound send.
-        while True:
-            item = self._queue.get()
-            try:
-                if item is _STOP:
-                    break
+        try:
+            while True:
+                item = self._queue.get()
                 try:
-                    self._message_handler.handle_task(item)
-                except Exception:
-                    # No traceback, no exception message, no task detail -
-                    # only a generic category, and the loop continues with
-                    # the next queued task rather than dying or retrying
-                    # this one.
-                    logger.warning("worker_error")
-            finally:
-                self._queue.task_done()
+                    if item is _STOP:
+                        break
+                    try:
+                        self._message_handler.handle_task(item)
+                    except Exception:
+                        # No traceback, no exception message, no task detail -
+                        # only a generic category, and the loop continues with
+                        # the next queued task rather than dying or retrying
+                        # this one.
+                        logger.warning("worker_error")
+                finally:
+                    self._queue.task_done()
+        finally:
+            # Milestone 46 P1: only this thread - the one that actually used
+            # this connection - ever closes it, and only once this loop has
+            # genuinely finished (normal _STOP exit, or any exception
+            # escaping the loop above, though none currently does since
+            # handle_task() is already caught inside it). See stop()'s own
+            # docstring for the invariant this preserves.
+            if self._worker_task_connection is not None:
+                self._worker_task_connection.close()
 
 
 def build_server() -> WhatsAppServer:
@@ -399,9 +521,56 @@ def build_server() -> WhatsAppServer:
         whatsapp_config.phone_number_id,
         whatsapp_config.api_version,
     )
-    message_handler = MessageHandler(orchestrator, client)
 
-    return WhatsAppServer(whatsapp_config, message_handler)
+    # Milestone 46 P1: durable task-ingress wiring.
+    task_db_path = resolve_database_path()
+
+    # Ensure/verify the schema exactly once, synchronously, before
+    # ThreadingHTTPServer ever begins accepting concurrent requests - this
+    # is what makes every later per-request open_writer_connection() call
+    # hit the cheap, already-current-schema path rather than racing another
+    # connection through first-ever schema creation (see task_control.py's
+    # own module docstring and the Milestone 46 P1 design report's
+    # empirical concurrency validation for why concurrent first-ever
+    # schema creation can otherwise leak a raw sqlite3.OperationalError).
+    schema_init_connection = open_writer_connection(task_db_path)
+    schema_init_connection.close()
+
+    task_registry = ActionRegistry()
+    tools_config = load_tools_config()
+    task_catalog = build_catalog(task_registry, tools_config)
+    planner_provider = get_planner_provider(kernel_config)
+
+    # The single WhatsApp worker's own long-lived connection/repository -
+    # opened once here, reused for the life of the process. Ownership
+    # transfers to the returned WhatsAppServer (whose worker thread closes
+    # it - see _run_worker()'s own finally block) only once construction
+    # below actually succeeds; never shared with a request thread's own
+    # per-request connection (see task_control.py's own module docstring).
+    worker_task_connection = open_writer_connection(task_db_path)
+    try:
+        worker_task_repository = TaskRepository(worker_task_connection)
+
+        message_handler = MessageHandler(
+            orchestrator,
+            client,
+            task_repository=worker_task_repository,
+            task_catalog=task_catalog,
+            planner_provider=planner_provider,
+        )
+
+        return WhatsAppServer(
+            whatsapp_config,
+            message_handler,
+            task_db_path=task_db_path,
+            worker_task_connection=worker_task_connection,
+        )
+    except Exception:
+        # Construction failed after the connection was already opened, so
+        # WhatsAppServer never took ownership of it (its worker thread will
+        # never run to close it) - close it here instead of leaking it.
+        worker_task_connection.close()
+        raise
 
 
 def main() -> None:

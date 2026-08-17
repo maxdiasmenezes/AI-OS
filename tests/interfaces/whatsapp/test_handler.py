@@ -297,34 +297,54 @@ def test_unrecognized_task_type_raises_type_error():
 # --- TaskExecutionWork: Milestone 46 P1's only execution boundary ------
 
 
-def test_task_execution_work_dispatches_planning_with_the_wired_dependencies(monkeypatch):
+def test_task_execution_work_dispatches_task_work_with_the_wired_dependencies(monkeypatch):
     import interfaces.whatsapp.handler as handler_module
 
     calls = []
 
-    def fake_dispatch_planning(repository, task_id, catalog, planner_provider):
-        calls.append((repository, task_id, catalog, planner_provider))
+    def fake_dispatch_task_work(
+        repository, task_id, catalog, planner_provider, registry,
+        tools_config_loader, respond_provider, client, authorized_sender,
+    ):
+        calls.append((
+            repository, task_id, catalog, planner_provider, registry,
+            tools_config_loader, respond_provider, client, authorized_sender,
+        ))
 
-    monkeypatch.setattr(handler_module, "dispatch_planning", fake_dispatch_planning)
+    monkeypatch.setattr(handler_module, "dispatch_task_work", fake_dispatch_task_work)
 
-    sentinel_repo, sentinel_catalog, sentinel_provider = object(), object(), object()
+    (
+        sentinel_repo, sentinel_catalog, sentinel_provider, sentinel_registry,
+        sentinel_loader, sentinel_respond_provider, sentinel_sender,
+    ) = (object(), object(), object(), object(), object(), object(), object())
+    sentinel_client = RecordingClient()
     handler = MessageHandler(
         FakeOrchestrator("should not be reached"),
-        RecordingClient(),
+        sentinel_client,
         task_repository=sentinel_repo,
         task_catalog=sentinel_catalog,
         planner_provider=sentinel_provider,
+        action_registry=sentinel_registry,
+        tools_config_loader=sentinel_loader,
+        respond_provider=sentinel_respond_provider,
+        authorized_sender=sentinel_sender,
     )
 
     handler.handle_task(TaskExecutionWork(task_id="task-123"))
 
-    assert calls == [(sentinel_repo, "task-123", sentinel_catalog, sentinel_provider)]
+    assert calls == [(
+        sentinel_repo, "task-123", sentinel_catalog, sentinel_provider, sentinel_registry,
+        sentinel_loader, sentinel_respond_provider, sentinel_client, sentinel_sender,
+    )]
 
 
-def test_task_execution_work_never_calls_orchestrator_or_sends_a_message(monkeypatch):
+def test_task_execution_work_message_handler_adds_no_side_effects_of_its_own(monkeypatch):
+    # MessageHandler._handle_task_execution_work() is a thin wrapper - with
+    # dispatch_task_work() itself neutralized, MessageHandler must not
+    # independently call the orchestrator or send anything.
     import interfaces.whatsapp.handler as handler_module
 
-    monkeypatch.setattr(handler_module, "dispatch_planning", lambda *a, **k: None)
+    monkeypatch.setattr(handler_module, "dispatch_task_work", lambda *a, **k: None)
 
     orchestrator = FakeOrchestrator("should not be reached")
     client = RecordingClient()
@@ -334,6 +354,10 @@ def test_task_execution_work_never_calls_orchestrator_or_sends_a_message(monkeyp
         task_repository=object(),
         task_catalog=object(),
         planner_provider=object(),
+        action_registry=object(),
+        tools_config_loader=object(),
+        respond_provider=object(),
+        authorized_sender=object(),
     )
 
     handler.handle_task(TaskExecutionWork(task_id="task-123"))

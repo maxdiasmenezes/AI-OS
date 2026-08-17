@@ -93,6 +93,7 @@ independently be RUNNING or (if raced) already terminal.
 from datetime import datetime, timezone
 
 from kernel.employee_tasks import (
+    MAX_FAILURE_SUMMARY_CHARS,
     TERMINAL_STATES,
     ConfirmationExpiredError,
     ConfirmationMismatchError,
@@ -112,7 +113,9 @@ from kernel.task_execution.eligibility import (
 from kernel.task_execution.observation import (
     ObservationSerializationError,
     build_action_observation,
+    build_bounded_action_observation,
     build_respond_observation,
+    normalize_action_result_outcome,
     serialize_observation,
 )
 from kernel.task_execution.respond import (
@@ -367,16 +370,69 @@ def _finalize_action_step(
     body so kernel/task_execution/service.py's RESPOND path - see
     _process_running_task() below - can share the exact same claim/
     cancellation-safe finalization mechanics, unchanged, rather than
-    duplicating them)."""
+    duplicating them).
 
+    ActionResult.message is arbitrary, handler-owned descriptive text with
+    no bound of its own (unlike RESPOND's already-bounded synthesized
+    text - see build_action_observation()'s own docstring). ActionResult.outcome
+    is likewise typed as a plain, unconstrained string - "one of audit.py's
+    fixed codes" is a convention every one of the 14 currently-registered
+    handlers happens to follow, never a structural guarantee (Milestone 46
+    adversarial re-review, M1). By the time this function runs, the action
+    has ALREADY executed - claim_step() already committed this step as
+    durably in_progress, and executor.execute() has already returned - so
+    neither an oversized message NOR a malformed/oversized outcome may ever
+    be allowed to leave the step stuck in_progress or convert a real
+    success into a failure (or vice versa): the real outcome is always
+    already known and must always be finalized.
+
+    result.outcome is normalized FIRST, exactly once, via
+    normalize_action_result_outcome() - before either builder is ever
+    called - so both persistence paths it feeds (the StepObservation's own
+    action_outcome/failure_code fields, and the standalone failure_code
+    parameter threaded into repository.fail_running_step()/
+    mark_step_failed() below) always see the identical, already-bounded
+    value; there is no second, unnormalized path. This makes
+    build_bounded_action_observation()'s "structurally bounded" guarantee
+    actually true rather than convention-dependent - see that function's
+    own docstring.
+
+    Two independent bounds then apply to the (already outcome-normalized)
+    result's descriptive text: the serialized StepObservation itself must
+    fit MAX_STEP_RESULT_JSON_CHARS (checked below via
+    serialize_observation()), and - only on the failure path, since only
+    failure re-threads it as `failure_summary` into
+    repository.fail_running_step()/mark_step_failed() - the raw message
+    must also fit MAX_FAILURE_SUMMARY_CHARS. Violating EITHER bound falls
+    back to build_bounded_action_observation()'s fixed, short, code-owned
+    summary - never a truncation of the real message (which could still
+    leak a partial filename/path) - while preserving result.success/
+    result.outcome exactly. That fallback observation's safe_summary is
+    also what becomes `failure_summary` in that case, so it is always well
+    within both bounds, and - because outcome was already normalized above -
+    the fallback's own serialize_observation() call needs no try/except of
+    its own: every field it sets is now provably bounded by construction,
+    not merely expected to be."""
+
+    result = normalize_action_result_outcome(result)
     completed_at = _now_iso()
     observation = build_action_observation(step_position, result, completed_at)
-    observation_json = serialize_observation(observation)
+
+    oversized = not result.success and len(result.message) > MAX_FAILURE_SUMMARY_CHARS
+    if not oversized:
+        try:
+            observation_json = serialize_observation(observation)
+        except ObservationSerializationError:
+            oversized = True
+
+    if oversized:
+        observation = build_bounded_action_observation(step_position, result, completed_at)
+        observation_json = serialize_observation(observation)
 
     if result.success:
         return _finalize_step_success(task_id, repository, step_position, observation_json, result.outcome)
     return _finalize_step_failure(
-        task_id, repository, step_position, result.outcome, result.message, observation_json
+        task_id, repository, step_position, result.outcome, observation.safe_summary, observation_json
     )
 
 

@@ -54,18 +54,29 @@ respond with success for that message: the SQLite UNIQUE constraint on
 kernel.employee_tasks' tasks.dedup_key - not this in-memory cache - is the
 authoritative concurrent-dedup boundary for /task messages (see
 task_control.py's own module docstring, and the Milestone 46 P1 design
-report's empirical concurrency validation). A storage failure, an
-out-of-bounds provider message ID, or a full queue when a newly-CREATED
-task needs dispatch all produce the same outcome as an ordinary queue-full:
-HTTP 503 for the whole request, the durable row (if one exists) is never
-deleted or rolled back, and the rest of the batch stops being processed -
-so a Meta retry resolves the same row via DuplicateTaskError rather than
-creating a second one. P1 only ever hands a bare task_id (never raw
-request text, the provider message ID, or anything else) to the worker
-queue as a TaskExecutionWork - see handler.py and task_control.py for the
-CREATED -> planning handoff this performs. P1 sends no outbound WhatsApp
-message of its own for a /task submission (no "Task accepted" notice, no
-result, no confirmation) - that begins in Milestone 46 P2.
+report's empirical concurrency validation). A storage failure or a full
+queue when a newly-CREATED task needs dispatch both produce the same
+outcome as an ordinary queue-full: HTTP 503 for the whole request, the
+durable row (if one exists) is never deleted or rolled back, and the rest
+of the batch stops being processed - so a Meta retry resolves the same row
+via DuplicateTaskError rather than creating a second one. P1 only ever
+hands a bare task_id (never raw request text, the provider message ID, or
+anything else) to the worker queue as a TaskExecutionWork - see handler.py
+and task_control.py for the CREATED -> planning handoff this performs. P1
+sends no outbound WhatsApp message of its own for a /task submission.
+
+Milestone 46 P2A extends the same TaskExecutionWork dispatch (still queued
+only here, still carrying only a bare task_id) to drive the task all the
+way through the existing bounded execution runner
+(kernel.task_execution.run_task_until_blocked()) and deliver exactly one
+WhatsApp lifecycle message per newly-produced lifecycle event - a planning
+failure, a terminal result/failure, or a confirmation request when a
+sensitive step blocks. All of that still happens exclusively on the
+background worker thread, never here in do_POST - see
+task_control.py:dispatch_task_work()'s own docstring for the exact
+transition-triggered delivery rule and the full execution/delivery
+boundary. CONFIRM/REJECT ingress remains Milestone 46 P2B - not
+implemented here; a message like "CONFIRM abc-123" is still ordinary chat.
 """
 
 import hashlib
@@ -82,7 +93,7 @@ from capabilities.loader import CapabilityLoader
 from kernel.config.config import Config, load_config
 from kernel.employee_tasks import TaskRepository, open_writer_connection, resolve_database_path
 from kernel.memory import MemoryManager
-from kernel.models import get_planner_provider
+from kernel.models import get_planner_provider, get_provider
 from kernel.orchestrator import Orchestrator
 from kernel.task_planner import build_catalog
 from kernel.tools import ActionRegistry, load_tools_config
@@ -541,6 +552,17 @@ def build_server() -> WhatsAppServer:
     task_catalog = build_catalog(task_registry, tools_config)
     planner_provider = get_planner_provider(kernel_config)
 
+    # Milestone 46 P2A: a second, independent conversational ModelProvider
+    # instance, dedicated to RESPOND synthesis - deliberately never the
+    # planner_provider above (see kernel/task_execution/__init__.py's
+    # model-role-separation contract). Orchestrator constructs its own
+    # provider internally with no injection seam, so this is a second
+    # instance rather than a shared one; verified harmless (a ModelProvider
+    # is a stateless config wrapper - kernel/models/ollama.py's
+    # OllamaProvider holds only four plain attributes, no connection pool,
+    # no persistent socket) - not worth adding an Orchestrator seam for.
+    respond_provider = get_provider(kernel_config)
+
     # The single WhatsApp worker's own long-lived connection/repository -
     # opened once here, reused for the life of the process. Ownership
     # transfers to the returned WhatsAppServer (whose worker thread closes
@@ -557,6 +579,19 @@ def build_server() -> WhatsAppServer:
             task_repository=worker_task_repository,
             task_catalog=task_catalog,
             planner_provider=planner_provider,
+            # Milestone 46 P2A execution-time dependencies. action_registry
+            # reuses the same stateless task_registry instance built above
+            # for planning - ActionRegistry has no config dependency, so
+            # there is no freshness concern in sharing it. tools_config_loader
+            # is the bare load_tools_config function, called fresh by
+            # dispatch_task_work() before every execution-layer operation -
+            # never the startup-time `tools_config` snapshot planning uses
+            # (see task_control.py's own module docstring for why that
+            # distinction is security-relevant).
+            action_registry=task_registry,
+            tools_config_loader=load_tools_config,
+            respond_provider=respond_provider,
+            authorized_sender=whatsapp_config.authorized_sender_id,
         )
 
         return WhatsAppServer(

@@ -19,6 +19,7 @@ import urllib.request
 
 import pytest
 
+from interfaces.whatsapp.client import WhatsAppClientError
 from interfaces.whatsapp.config import WhatsAppConfig
 from interfaces.whatsapp.dedup import DEFAULT_CAPACITY as DEFAULT_DEDUP_CAPACITY
 from interfaces.whatsapp.dedup import SeenMessageCache
@@ -39,9 +40,10 @@ from kernel.employee_tasks import (
 )
 from kernel.memory import MemoryManager
 from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
-from kernel.task_planner import build_catalog
+from kernel.task_planner import PlanStep, StepKind, TaskPlan, build_catalog, serialize_plan
 from kernel.tools.config import RepoBackupSpec, ToolsConfig
 from kernel.tools.registry import ActionRegistry
+from kernel.tools.types import ActionResult
 
 _APP_SECRET = "test-app-secret"
 _VERIFY_TOKEN = "test-verify-token"
@@ -68,6 +70,25 @@ class RecordingClient:
         self.sent = []
 
     def send_text_message(self, to, body):
+        self.sent.append((to, body))
+        return "wamid.OUT1"
+
+
+class FailFirstSendClient:
+    """Raises WhatsAppClientError on exactly its first send_text_message()
+    call, then behaves exactly like RecordingClient for every call after -
+    used to prove the worker survives a lifecycle-delivery send failure and
+    goes on to correctly process later, unrelated queue items (Milestone 46
+    adversarial review, M2/worker-survival)."""
+
+    def __init__(self):
+        self.sent = []
+        self._calls = 0
+
+    def send_text_message(self, to, body):
+        self._calls += 1
+        if self._calls == 1:
+            raise WhatsAppClientError("simulated outbound failure")
         self.sent.append((to, body))
         return "wamid.OUT1"
 
@@ -1065,8 +1086,20 @@ def _task_catalog():
     return build_catalog(ActionRegistry(), tools_config)
 
 
-def _valid_plan_raw(catalog, objective="Check repository health."):
-    entry = next(e for e in catalog if e.action_name == "repo_health")
+# Milestone 46 P2A: dispatch_task_work() now continues straight from a
+# fresh plan into REAL execution (P1's dispatch_planning() stopped at
+# READY; that boundary no longer exists). The default plan used by most of
+# this file's existing tests therefore references open_application
+# ("notepad") - a SENSITIVE action, so execution deterministically stops at
+# WAITING_FOR_CONFIRMATION (propose_confirmation() is called BEFORE
+# SafeTaskExecutor ever would be - see kernel/task_execution/service.py) -
+# rather than a non-sensitive action that would actually execute (and would
+# need a real, safe target to execute against). Tests that specifically
+# need a completed/non-sensitive result use their own dedicated
+# list_files-based plan against a tmp_path directory instead - see
+# _non_sensitive_plan_raw() below.
+def _valid_plan_raw(catalog, objective="Open notepad."):
+    entry = next(e for e in catalog if e.action_name == "open_application")
     return json.dumps(
         {
             "plan_version": 1,
@@ -1076,8 +1109,28 @@ def _valid_plan_raw(catalog, objective="Check repository health."):
                 {
                     "step_kind": "action",
                     "catalog_id": entry.catalog_id,
-                    "description": "Check repo health.",
-                    "expected_result": "Health known.",
+                    "description": "Open notepad.",
+                    "expected_result": "Notepad is open.",
+                    "depends_on": [],
+                }
+            ],
+        }
+    )
+
+
+def _non_sensitive_plan_raw(catalog, objective="List the downloads folder."):
+    entry = next(e for e in catalog if e.action_name == "list_files" and e.resource_key == "downloads")
+    return json.dumps(
+        {
+            "plan_version": 1,
+            "result": "plan",
+            "objective": objective,
+            "steps": [
+                {
+                    "step_kind": "action",
+                    "catalog_id": entry.catalog_id,
+                    "description": "List the downloads folder.",
+                    "expected_result": "Files known.",
                     "depends_on": [],
                 }
             ],
@@ -1126,17 +1179,106 @@ class _BlockingPlannerProvider:
         self._release.set()
 
 
+class _BlockingRespondProvider:
+    """Blocks send_prompt() until release() is called - the P2A analogue
+    of _BlockingPlannerProvider, used to prove RESPOND synthesis (and, by
+    extension, the whole execution phase around it) also never happens on
+    the webhook HTTP thread."""
+
+    def __init__(self, response_text="ok"):
+        self._response_text = response_text
+        self.started = threading.Event()
+        self._release = threading.Event()
+        self.calls: list[str] = []
+
+    def send_prompt(self, prompt, *, options=None):
+        self.calls.append(prompt)
+        self.started.set()
+        self._release.wait(timeout=5)
+        return ModelResponse(
+            text=self._response_text, model="fake-respond", input_tokens=0, output_tokens=0, latency_seconds=0.0
+        )
+
+    def release(self):
+        self._release.set()
+
+
+def _task_catalog_with_downloads(downloads_dir):
+    # A planning-time catalog that also registers a "downloads" directory -
+    # used only by tests that specifically need a non-sensitive, genuinely
+    # completing task at the real HTTP+worker level (list_files requires
+    # no grounding - catalog.py:_requires_grounding() - so the request text
+    # need not name the directory).
+    tools_config = ToolsConfig(
+        approved_directories={"downloads": str(downloads_dir)},
+        approved_applications={"notepad": object()},
+        approved_scripts={},
+        approved_repositories={"ai_os": object()},
+        approved_backups={"ai_os": RepoBackupSpec(destination_directory="/x")},
+    )
+    return build_catalog(ActionRegistry(), tools_config)
+
+
+def _execution_tools_config_with_downloads(downloads_dir):
+    return ToolsConfig(
+        approved_directories={"downloads": str(downloads_dir)},
+        approved_applications={"notepad": object()},
+        approved_scripts={},
+        approved_repositories={"ai_os": object()},
+        approved_backups={"ai_os": RepoBackupSpec(destination_directory="/x")},
+    )
+
+
+def _default_execution_tools_config():
+    # Deliberately identical to _task_catalog()'s own ToolsConfig - by
+    # default, execution-time authority agrees with planning-time
+    # authority, so the default open_application/"notepad" plan reaches
+    # WAITING_FOR_CONFIRMATION rather than an unrelated revalidation
+    # failure. Tests that specifically want them to disagree (fresh-config
+    # revalidation) pass their own tools_config_loader instead.
+    return ToolsConfig(
+        approved_directories={},
+        approved_applications={"notepad": object()},
+        approved_scripts={},
+        approved_repositories={"ai_os": object()},
+        approved_backups={"ai_os": RepoBackupSpec(destination_directory="/x")},
+    )
+
+
+class _FakeRespondProvider:
+    """Records every prompt it received and returns canned responses in
+    order - never a real network call. Distinct type from
+    _FakePlannerProvider purely for readability at call sites; behavior is
+    identical."""
+
+    def __init__(self, responses=None):
+        self._responses = list(responses) if responses is not None else []
+        self.calls: list[str] = []
+
+    def send_prompt(self, prompt, *, options=None):
+        self.calls.append(prompt)
+        text = self._responses.pop(0) if self._responses else "ok"
+        return ModelResponse(
+            text=text, model="fake-respond", input_tokens=0, output_tokens=0, latency_seconds=0.0
+        )
+
+
 def _make_server_with_tasks(
     tmp_path,
     planner_provider,
     *,
     orchestrator=None,
     queue_capacity=DEFAULT_QUEUE_CAPACITY,
+    tools_config_loader=None,
+    respond_provider=None,
+    task_catalog=None,
+    client=None,
 ):
     """Builds a real WhatsAppServer with Milestone 46 P1 durable-ingress
-    wiring - a real tmp_path SQLite database (schema pre-initialized, like
-    build_server()'s own composition root), a real worker-owned
-    TaskRepository, and the given (fake) planner provider. Returns
+    and P2A execution/delivery wiring - a real tmp_path SQLite database
+    (schema pre-initialized, like build_server()'s own composition root), a
+    real worker-owned TaskRepository, a real ActionRegistry/SafeTaskExecutor,
+    and the given (fake) planner/respond providers. Returns
     (server, client, db_path) - the caller is responsible for
     starting/stopping the server, matching every other inline server
     construction in this file."""
@@ -1150,13 +1292,17 @@ def _make_server_with_tasks(
     worker_connection = open_writer_connection(db_path)
     worker_repository = TaskRepository(worker_connection)
 
-    client = RecordingClient()
+    client = client if client is not None else RecordingClient()
     handler = MessageHandler(
         orchestrator if orchestrator is not None else FakeOrchestrator("ordinary chat reply"),
         client,
         task_repository=worker_repository,
-        task_catalog=_task_catalog(),
+        task_catalog=task_catalog if task_catalog is not None else _task_catalog(),
         planner_provider=planner_provider,
+        action_registry=ActionRegistry(),
+        tools_config_loader=tools_config_loader or _default_execution_tools_config,
+        respond_provider=respond_provider if respond_provider is not None else _FakeRespondProvider(),
+        authorized_sender=_AUTHORIZED_SENDER,
     )
     server = WhatsAppServer(
         whatsapp_config,
@@ -1176,7 +1322,13 @@ def _list_tasks(db_path):
         conn.close()
 
 
-def test_task_request_is_durably_accepted_and_planned(tmp_path):
+def test_task_request_is_durably_accepted_planned_and_executed(tmp_path):
+    # Milestone 46 P2A: a single TaskExecutionWork dispatch now carries a
+    # freshly-planned task all the way through planning and execution in
+    # one continuous worker turn. The default plan references a sensitive
+    # action (open_application), so it deterministically stops at
+    # WAITING_FOR_CONFIRMATION - propose_confirmation() is reached before
+    # SafeTaskExecutor ever would be, so no real action executes here.
     planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
     server, client, db_path = _make_server_with_tasks(tmp_path, planner)
     thread = threading.Thread(target=server.start, daemon=True)
@@ -1184,21 +1336,24 @@ def test_task_request_is_durably_accepted_and_planned(tmp_path):
     time.sleep(0.05)
 
     try:
-        status = _post(server, _envelope("wamid.task1", _AUTHORIZED_SENDER, text="/task check repo health"))
+        status = _post(server, _envelope("wamid.task1", _AUTHORIZED_SENDER, text="/task open notepad"))
         assert status == 200
 
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(planner.calls) == 0:
+        while time.monotonic() < deadline and not client.sent:
             time.sleep(0.02)
 
         tasks = _list_tasks(db_path)
         assert len(tasks) == 1
         assert tasks[0].source == "whatsapp"
-        assert tasks[0].request_text == "check repo health"
-        assert tasks[0].state == TaskState.READY
+        assert tasks[0].request_text == "open notepad"
+        assert tasks[0].state == TaskState.WAITING_FOR_CONFIRMATION
 
-        # Milestone 46 P1 sends no outbound WhatsApp message of its own.
-        assert client.sent == []
+        # P2A sends exactly one confirmation-request message - never a
+        # separate "Task accepted" notice (that was never added).
+        assert len(client.sent) == 1
+        assert client.sent[0][0] == _AUTHORIZED_SENDER
+        assert "Action: open_application" in client.sent[0][1]
     finally:
         server.stop()
         thread.join(timeout=5)
@@ -1235,6 +1390,239 @@ def test_task_planning_never_happens_on_the_webhook_http_thread(tmp_path):
         assert planner.started.wait(timeout=2)
     finally:
         planner.release()
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_task_execution_never_happens_on_the_webhook_http_thread(tmp_path):
+    # P2A extension of test_task_planning_never_happens_on_the_webhook_http_thread
+    # above: planning here uses a fast, non-blocking fake, but RESPOND
+    # synthesis blocks - proving the whole execution phase (SafeTaskExecutor
+    # invocation, then RESPOND) also runs exclusively on the worker thread,
+    # never on the webhook HTTP thread.
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    catalog = _task_catalog_with_downloads(downloads_dir)
+    entry = next(e for e in catalog if e.action_name == "list_files" and e.resource_key == "downloads")
+    plan_raw = json.dumps(
+        {
+            "plan_version": 1,
+            "result": "plan",
+            "objective": "List the downloads folder and summarize it.",
+            "steps": [
+                {
+                    "step_kind": "action",
+                    "catalog_id": entry.catalog_id,
+                    "description": "List the downloads folder.",
+                    "expected_result": "Files known.",
+                    "depends_on": [],
+                },
+                {
+                    "step_kind": "respond",
+                    "description": "Summarize the files.",
+                    "expected_result": "A summary.",
+                    "depends_on": [1],
+                },
+            ],
+        }
+    )
+    planner = _FakePlannerProvider([plan_raw])
+    respond_provider = _BlockingRespondProvider()
+    server, client, db_path = _make_server_with_tasks(
+        tmp_path,
+        planner,
+        task_catalog=catalog,
+        tools_config_loader=lambda: _execution_tools_config_with_downloads(downloads_dir),
+        respond_provider=respond_provider,
+    )
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        status = _post(server, _envelope("wamid.execblock1", _AUTHORIZED_SENDER, text="/task list downloads"))
+        assert status == 200
+
+        # Only now does the worker thread reach the (still-blocked) RESPOND
+        # call - proving the ACTION step already executed, and the RESPOND
+        # step was reached, entirely asynchronously.
+        assert respond_provider.started.wait(timeout=2)
+
+        # The task is durably RUNNING (past READY, mid-execution) while the
+        # webhook HTTP thread has already returned - the HTTP response
+        # cannot have waited on this in-progress execution.
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].state == TaskState.RUNNING
+        assert client.sent == []
+    finally:
+        respond_provider.release()
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_non_sensitive_task_completes_with_one_result_message_via_real_http(tmp_path):
+    # A full, real HTTP + worker + composition-root E2E: a non-sensitive
+    # task actually executes and completes, delivering exactly one result
+    # message - not just the confirmation path most of this file's other
+    # tests exercise.
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "report.txt").write_text("hello")
+    catalog = _task_catalog_with_downloads(downloads_dir)
+    planner = _FakePlannerProvider([_non_sensitive_plan_raw(catalog)])
+    server, client, db_path = _make_server_with_tasks(
+        tmp_path,
+        planner,
+        task_catalog=catalog,
+        tools_config_loader=lambda: _execution_tools_config_with_downloads(downloads_dir),
+    )
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.nonsensitive1", _AUTHORIZED_SENDER, text="/task list downloads")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.sent:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].state == TaskState.COMPLETED
+        assert len(client.sent) == 1
+        assert "report.txt" in client.sent[0][1]
+
+        # A retried delivery of the exact same provider message must not
+        # resend the already-delivered result - transition-triggered
+        # delivery, proven here at the real HTTP+worker level.
+        assert _post(server, _envelope("wamid.nonsensitive1", _AUTHORIZED_SENDER, text="/task list downloads")) == 200
+        time.sleep(0.1)
+        assert len(client.sent) == 1
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_sensitive_task_duplicate_dispatch_sends_no_second_confirmation_via_real_http(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.dupconf1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.sent:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].state == TaskState.WAITING_FOR_CONFIRMATION
+        assert len(client.sent) == 1
+
+        # Same provider message ID redelivered after the task is already
+        # WAITING_FOR_CONFIRMATION - dispatch_task_work() must no-op (P2A
+        # transition-triggered delivery), never resend the confirmation.
+        assert _post(server, _envelope("wamid.dupconf1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        time.sleep(0.1)
+        assert len(client.sent) == 1
+        assert _list_tasks(db_path)[0].state == TaskState.WAITING_FOR_CONFIRMATION
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_planning_failure_is_delivered_via_real_http(tmp_path):
+    # A plan whose action is real but whose resource_key is not textually
+    # grounded in the request text (kernel/task_planner/grounding.py) fails
+    # closed at planning - P2A must still deliver exactly one failure
+    # message for it, unlike P1 (which only ever produced a silent FAILED
+    # row for this case).
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        # Deliberately ungrounded: the canned plan always selects
+        # open_application/"notepad", but this request text never mentions
+        # "notepad".
+        assert _post(server, _envelope("wamid.planfail1", _AUTHORIZED_SENDER, text="/task check repo health")) == 200
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not client.sent:
+            time.sleep(0.02)
+
+        tasks = _list_tasks(db_path)
+        assert len(tasks) == 1
+        assert tasks[0].state == TaskState.FAILED
+        assert len(client.sent) == 1
+        assert client.sent[0][1].startswith("Task failed:")
+
+        # Redelivery must not resend the failure message a second time.
+        assert _post(server, _envelope("wamid.planfail1", _AUTHORIZED_SENDER, text="/task check repo health")) == 200
+        time.sleep(0.1)
+        assert len(client.sent) == 1
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_worker_survives_a_lifecycle_send_failure_and_processes_the_next_task(tmp_path, caplog):
+    # Milestone 46 adversarial review, M2/worker-survival: a real HTTP +
+    # worker-queue-level proof that a lifecycle-delivery send failure on
+    # one task does not kill the worker or corrupt that task's durable
+    # state, and that a second, later-queued task is still processed (and
+    # delivered) correctly afterward.
+    planner = _FakePlannerProvider()  # always falls back to the default open_application/notepad plan
+    client = FailFirstSendClient()
+    server, _client_unused, db_path = _make_server_with_tasks(tmp_path, planner, client=client)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            # Task A: its confirmation-request send fails (the client's
+            # first call).
+            assert _post(server, _envelope("wamid.survivea", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not _list_tasks(db_path):
+                time.sleep(0.02)
+
+            tasks_after_a = _list_tasks(db_path)
+            assert len(tasks_after_a) == 1
+            # The durable WAITING_FOR_CONFIRMATION transition already
+            # committed before the send was even attempted - a send
+            # failure never rolls it back.
+            assert tasks_after_a[0].state == TaskState.WAITING_FOR_CONFIRMATION
+            assert client.sent == []  # the one send attempt so far failed
+
+            # Task B: a distinct request, still grounded to "notepad" -
+            # its confirmation-request send succeeds (the client's second
+            # call), proving the worker is still alive and processing.
+            assert _post(server, _envelope("wamid.surviveb", _AUTHORIZED_SENDER, text="/task open notepad again")) == 200
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and len(client.sent) == 0:
+                time.sleep(0.02)
+
+        assert len(client.sent) == 1
+        assert "Action: open_application" in client.sent[0][1]
+
+        tasks_final = _list_tasks(db_path)
+        assert len(tasks_final) == 2
+        assert all(t.state == TaskState.WAITING_FOR_CONFIRMATION for t in tasks_final)
+
+        # No raw exception detail (the fake's message text) ever reached
+        # the logs - only the generic, bounded outbound-failure category.
+        for record in caplog.records:
+            assert "simulated outbound failure" not in record.getMessage()
+    finally:
         server.stop()
         thread.join(timeout=5)
 
@@ -1337,8 +1725,20 @@ def test_task_queue_full_returns_503_keeps_durable_row_and_retries_via_dedup(tmp
     time.sleep(0.05)
 
     try:
+        # A, B, and C all mention "notepad" - the _BlockingPlannerProvider's
+        # default response (P2A) is a fixed open_application/"notepad" plan
+        # regardless of which task it is planning for, and P2A's
+        # dispatch_task_work() now continues straight from planning into
+        # capability-grounding-validated execution, so every request text
+        # reaching this default plan must textually ground "notepad" (see
+        # kernel/task_planner/grounding.py) or planning itself fails
+        # closed - a request text mismatch here is a real planner rejection,
+        # not a queue/dedup concern, which is what this test is actually
+        # about. A/B/C stay textually distinct from each other only via
+        # their surrounding words.
+
         # A: dequeued immediately, blocks the worker inside the planner call.
-        assert _post(server, _envelope("wamid.qa", _AUTHORIZED_SENDER, text="/task check repo health")) == 200
+        assert _post(server, _envelope("wamid.qa", _AUTHORIZED_SENDER, text="/task open notepad for health check")) == 200
         assert planner.started.wait(timeout=2)
 
         # B: occupies the queue's one free slot (never dequeued while A blocks).
@@ -1347,12 +1747,12 @@ def test_task_queue_full_returns_503_keeps_durable_row_and_retries_via_dedup(tmp
         # C: a NEW /task - the queue is full, so this must be 503, and its
         # durable row must still exist (never deleted merely because the
         # queue overflowed).
-        status = _post(server, _envelope("wamid.qc", _AUTHORIZED_SENDER, text="/task check repo health also"))
+        status = _post(server, _envelope("wamid.qc", _AUTHORIZED_SENDER, text="/task open notepad also please"))
         assert status == 503
 
         tasks_after_overflow = _list_tasks(db_path)
         assert len(tasks_after_overflow) == 3  # A, B, and the durably-created-but-unqueued C
-        c_task = next(t for t in tasks_after_overflow if t.request_text == "check repo health also")
+        c_task = next(t for t in tasks_after_overflow if t.request_text == "open notepad also please")
         assert c_task.state == TaskState.CREATED
 
         planner.release()
@@ -1362,13 +1762,17 @@ def test_task_queue_full_returns_503_keeps_durable_row_and_retries_via_dedup(tmp
         # empty for the retry - never a wall-clock guess.
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and any(
-            t.state == TaskState.CREATED for t in _list_tasks(db_path) if t.request_text != "check repo health also"
+            t.state == TaskState.CREATED for t in _list_tasks(db_path) if t.request_text != "open notepad also please"
         ):
             time.sleep(0.02)
+        # Both A and B use the default sensitive open_application plan, so
+        # each deterministically stops at WAITING_FOR_CONFIRMATION once
+        # planning completes and execution runs (P2A: planning no longer
+        # ends the flow at READY; that boundary no longer exists).
         assert all(
-            t.state == TaskState.READY
+            t.state == TaskState.WAITING_FOR_CONFIRMATION
             for t in _list_tasks(db_path)
-            if t.request_text != "check repo health also"
+            if t.request_text != "open notepad also please"
         )
 
         # A retry of the exact same provider message (C) must resolve the
@@ -1382,7 +1786,7 @@ def test_task_queue_full_returns_503_keeps_durable_row_and_retries_via_dedup(tmp
         # all - a real bug the L5 assertion-tightening in the Milestone 46
         # adversarial review correction pass exposed).
         retry_status = _post(
-            server, _envelope("wamid.qc", _AUTHORIZED_SENDER, text="/task check repo health also")
+            server, _envelope("wamid.qc", _AUTHORIZED_SENDER, text="/task open notepad also please")
         )
         assert retry_status == 200
 
@@ -1391,14 +1795,14 @@ def test_task_queue_full_returns_503_keeps_durable_row_and_retries_via_dedup(tmp
         # it might have (Milestone 46 adversarial review, L5).
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and next(
-            t for t in _list_tasks(db_path) if t.request_text == "check repo health also"
+            t for t in _list_tasks(db_path) if t.request_text == "open notepad also please"
         ).state == TaskState.CREATED:
             time.sleep(0.02)
 
         tasks_final = _list_tasks(db_path)
         assert len(tasks_final) == 3  # still exactly 3 - no new row from the retry
-        c_task_final = next(t for t in tasks_final if t.request_text == "check repo health also")
-        assert c_task_final.state == TaskState.READY
+        c_task_final = next(t for t in tasks_final if t.request_text == "open notepad also please")
+        assert c_task_final.state == TaskState.WAITING_FOR_CONFIRMATION
     finally:
         server.stop()
         thread.join(timeout=5)
@@ -1461,6 +1865,10 @@ def test_stop_does_not_close_worker_connection_while_worker_still_active(tmp_pat
         task_repository=worker_repository,
         task_catalog=_task_catalog(),
         planner_provider=planner,
+        action_registry=ActionRegistry(),
+        tools_config_loader=_default_execution_tools_config,
+        respond_provider=_FakeRespondProvider(),
+        authorized_sender=_AUTHORIZED_SENDER,
     )
     server = server_module.WhatsAppServer(
         whatsapp_config,
@@ -1475,9 +1883,13 @@ def test_stop_does_not_close_worker_connection_while_worker_still_active(tmp_pat
 
     # Seed a durable CREATED task directly and dispatch it into the worker
     # queue - this test is about shutdown lifecycle, not ingress, so HTTP
-    # is not needed to get a task in flight.
+    # is not needed to get a task in flight. Request text must textually
+    # ground "notepad" (kernel/task_planner/grounding.py) since the default
+    # _BlockingPlannerProvider response is the open_application/"notepad"
+    # plan - an ungrounded request text would fail planning validation
+    # itself, unrelated to the connection-lifecycle behavior under test.
     task = worker_repository.create_task(
-        "check repo health", "whatsapp", dedup_key="whatsapp:h1regression"
+        "open notepad", "whatsapp", dedup_key="whatsapp:h1regression"
     )
     server._queue.put(TaskExecutionWork(task_id=task.task_id))
 
@@ -1516,7 +1928,151 @@ def test_stop_does_not_close_worker_connection_while_worker_still_active(tmp_pat
     verify_connection = open_writer_connection(db_path)
     try:
         final_task = TaskRepository(verify_connection).get_task(task.task_id)
-        assert final_task.state == TaskState.READY
+        # The seeded task planned via the default _BlockingPlannerProvider
+        # response, which is the sensitive open_application plan - so once
+        # planning finishes, execution (still on this same worker/connection)
+        # deterministically stops at WAITING_FOR_CONFIRMATION rather than
+        # READY (P2A: planning no longer ends the flow at READY).
+        assert final_task.state == TaskState.WAITING_FOR_CONFIRMATION
+    finally:
+        verify_connection.close()
+
+
+class _BlockingExecutor:
+    """Blocks execute() until release() is called - the H1 shutdown test's
+    analogue of _BlockingPlannerProvider/_BlockingRespondProvider, now
+    blocking inside the real execution boundary itself (SafeTaskExecutor's
+    replacement), since P2A execution can now take real, possibly slow
+    action just as easily as planning/RESPOND can."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self._release = threading.Event()
+        self.calls = []
+
+    def execute(self, request):
+        self.calls.append(request)
+        self.started.set()
+        self._release.wait(timeout=5)
+        return ActionResult(True, "done", "executed")
+
+    def release(self):
+        self._release.set()
+
+
+def test_stop_does_not_close_worker_connection_while_executor_still_active(tmp_path, monkeypatch):
+    """Milestone 46 adversarial review, §20: the same H1 connection-
+    ownership guarantee as the planner-blocking test above, now proven
+    while the worker is blocked inside the real execution boundary
+    (SafeTaskExecutor) instead of the planner call - the mechanism in
+    WhatsAppServer.stop()/_run_worker() is generic to WHERE inside
+    handle_task() the worker is blocked, and this pins that down
+    explicitly for the specific phase P2A newly introduced."""
+
+    import interfaces.whatsapp.server as server_module
+    import interfaces.whatsapp.task_control as task_control_module
+
+    monkeypatch.setattr(server_module, "_WORKER_JOIN_TIMEOUT_SECONDS", 0.3)
+
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+
+    blocking_executor = _BlockingExecutor()
+    monkeypatch.setattr(task_control_module, "SafeTaskExecutor", lambda *a, **k: blocking_executor)
+
+    whatsapp_config = _make_whatsapp_config()
+    db_path = tmp_path / "tasks.sqlite3"
+
+    schema_init_connection = open_writer_connection(db_path)
+    schema_init_connection.close()
+
+    real_worker_connection = open_writer_connection(db_path)
+    spy_connection = _ClosingSpyConnection(real_worker_connection)
+    worker_repository = TaskRepository(spy_connection)
+
+    tools_config = ToolsConfig(
+        approved_directories={"downloads": str(downloads_dir)},
+        approved_applications={}, approved_scripts={}, approved_repositories={}, approved_backups={},
+    )
+    client = RecordingClient()
+    handler = MessageHandler(
+        FakeOrchestrator("ordinary chat reply"),
+        client,
+        task_repository=worker_repository,
+        task_catalog=_task_catalog(),
+        planner_provider=_FakePlannerProvider([]),
+        action_registry=ActionRegistry(),
+        tools_config_loader=lambda: tools_config,
+        respond_provider=_FakeRespondProvider(),
+        authorized_sender=_AUTHORIZED_SENDER,
+    )
+    server = server_module.WhatsAppServer(
+        whatsapp_config,
+        handler,
+        task_db_path=db_path,
+        worker_task_connection=spy_connection,
+    )
+
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    # Seed a task straight into READY with a single non-sensitive ACTION
+    # step - this test is about shutdown lifecycle during execution, not
+    # ingress or planning, so neither HTTP nor a real planner call is
+    # needed to get the worker blocked inside the executor.
+    record = worker_repository.create_task("list downloads", "whatsapp", dedup_key="whatsapp:executorblock")
+    worker_repository.transition_task(record.task_id, TaskState.CREATED, TaskState.PLANNING)
+    plan = TaskPlan(
+        plan_version=1,
+        task_id=record.task_id,
+        objective="List downloads.",
+        steps=(
+            PlanStep(
+                step_id="step_1", position=1, kind=StepKind.ACTION,
+                action_name="list_files", resource_key="downloads",
+                catalog_id="action_1", description="list", expected_result="files",
+                depends_on=(), requires_confirmation=False,
+            ),
+        ),
+        created_at="2026-08-08T00:00:00+00:00",
+    )
+    task = worker_repository.persist_plan_and_ready(record.task_id, TaskState.PLANNING, serialize_plan(plan))
+    server._queue.put(TaskExecutionWork(task_id=task.task_id))
+
+    try:
+        assert blocking_executor.started.wait(timeout=2), "worker never reached the executor call"
+
+        # stop()'s bounded join times out (0.3s) while the worker is still
+        # blocked inside execute() - it must still return, and it must NOT
+        # close the worker's connection while doing so.
+        server.stop()
+
+        assert spy_connection.close_calls == 0, (
+            "stop() closed the worker's connection while the worker was still active"
+        )
+
+        # Release the blocked executor call - the worker finishes
+        # execution, then drains the already-enqueued _STOP sentinel and
+        # exits, closing its own connection only at that point.
+        blocking_executor.release()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and spy_connection.close_calls == 0:
+            time.sleep(0.02)
+
+        assert spy_connection.close_calls == 1, "worker connection was never closed after the worker exited"
+
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        blocking_executor.release()
+        thread.join(timeout=5)
+
+    verify_connection = open_writer_connection(db_path)
+    try:
+        final_task = TaskRepository(verify_connection).get_task(task.task_id)
+        assert final_task.state == TaskState.COMPLETED
     finally:
         verify_connection.close()
 
@@ -1632,12 +2188,24 @@ def test_legacy_task_router_and_confirmation_store_never_reached_for_whatsapp_ta
     try:
         assert _post(server, _envelope("wamid.legacy1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
 
+        # P2A: dispatch_task_work() continues straight from planning into
+        # execution and sends exactly one confirmation message for this
+        # sensitive open_application plan - wait for that real delivery
+        # deterministically, rather than asserting nothing was ever sent
+        # (that would no longer be true under P2A, and would not be
+        # evidence of anything - see below for what this test actually
+        # proves instead).
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(planner.calls) == 0:
+        while time.monotonic() < deadline and not client.sent:
             time.sleep(0.02)
 
         assert orchestrator.received_prompts == []
-        assert client.sent == []
+        # The one message sent is task_control.py's own confirmation
+        # delivery, never anything the legacy orchestrator/M33 router could
+        # have produced (the orchestrator was never even called - proven
+        # above) - this is the actual proof this test is about.
+        assert len(client.sent) == 1
+        assert "Action: open_application" in client.sent[0][1]
 
         # Ordinary chat, on the SAME server, still reaches the orchestrator
         # exactly as before - this is a migration, not a removal.

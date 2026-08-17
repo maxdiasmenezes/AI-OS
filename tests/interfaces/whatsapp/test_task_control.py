@@ -1,14 +1,20 @@
 """
-Tests for interfaces/whatsapp/task_control.py (Milestone 46 P1).
+Tests for interfaces/whatsapp/task_control.py (Milestone 46 P1 + P2A).
 
-Every test uses a tmp_path SQLite database (never storage/tasks/) and a
-fake ModelProvider (never a real Ollama call) - matching
-tests/kernel/task_orchestration/test_service.py's own discipline, since
-dispatch_planning() delegates directly to advance_task_planning().
+Every test uses a tmp_path SQLite database (never storage/tasks/). Planning
+tests use a fake structured-planner ModelProvider; execution tests use the
+REAL kernel.task_execution.run_task_until_blocked()/SafeTaskExecutor, with
+either a real, safe, non-destructive action (list_files against a tmp_path
+directory) or a fake RESPOND-only conversational ModelProvider - never a
+real network call, never a real sensitive action (open_application etc. is
+always proven to stop at WAITING_FOR_CONFIRMATION before SafeTaskExecutor
+is ever reached, matching tests/kernel/task_execution/test_milestone_43_p1_e2e.py's
+own "real pipeline, no real external effect" discipline).
 """
 
 import json
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -20,11 +26,21 @@ from kernel.employee_tasks import (
     open_writer_connection,
 )
 from kernel.models.base import ModelRequestOptions, ModelResponse
-from kernel.task_planner import build_catalog
+from kernel.task_execution.observation import (
+    build_action_observation,
+    build_respond_observation,
+    serialize_observation,
+)
+from kernel.task_planner import PlanStep, StepKind, TaskPlan, build_catalog, serialize_plan
 from kernel.tools.config import RepoBackupSpec, ToolsConfig
 from kernel.tools.registry import ActionRegistry
+from kernel.tools.types import ActionRequest, ActionResult
 
+from interfaces.whatsapp.client import WhatsAppClientError
 from interfaces.whatsapp.task_control import (
+    TASK_CANCELLED_TEXT,
+    TASK_COMPLETED_FALLBACK_TEXT,
+    TASK_FAILED_FALLBACK_TEXT,
     TASK_HELP_TEXT,
     DurableAcceptanceFailed,
     TaskExecutionWork,
@@ -33,8 +49,9 @@ from interfaces.whatsapp.task_control import (
     accept_task_message,
     classify_task_text,
     compute_dedup_key,
-    dispatch_planning,
+    dispatch_task_work,
     needs_dispatch,
+    select_terminal_result_text,
 )
 
 
@@ -83,9 +100,22 @@ def repo(db_path):
 
 
 @pytest.fixture
-def catalog():
+def downloads_dir(tmp_path):
+    directory = tmp_path / "downloads"
+    directory.mkdir()
+    (directory / "report.txt").write_text("hello", encoding="utf-8")
+    return directory
+
+
+@pytest.fixture
+def catalog(downloads_dir):
+    # References a real, safe, non-sensitive, non-destructive action
+    # (list_files against a tmp_path directory) rather than repo_health -
+    # P2A's dispatch_task_work() continues straight from a fresh plan into
+    # REAL execution, so planning-focused tests need an action that can
+    # genuinely execute safely, not just be referenced in a fake plan.
     tools_config = ToolsConfig(
-        approved_directories={},
+        approved_directories={"downloads": str(downloads_dir)},
         approved_applications={"notepad": object()},
         approved_scripts={},
         approved_repositories={"ai_os": object()},
@@ -94,8 +124,8 @@ def catalog():
     return build_catalog(ActionRegistry(), tools_config)
 
 
-def _valid_plan_raw(catalog, objective="Check repository health."):
-    entry = next(e for e in catalog if e.action_name == "repo_health")
+def _valid_plan_raw(catalog, objective="List the downloads folder."):
+    entry = next(e for e in catalog if e.action_name == "list_files" and e.resource_key == "downloads")
     return json.dumps(
         {
             "plan_version": 1,
@@ -105,8 +135,8 @@ def _valid_plan_raw(catalog, objective="Check repository health."):
                 {
                     "step_kind": "action",
                     "catalog_id": entry.catalog_id,
-                    "description": "Check repo health.",
-                    "expected_result": "Health known.",
+                    "description": "List the downloads folder.",
+                    "expected_result": "Files known.",
                     "depends_on": [],
                 }
             ],
@@ -116,6 +146,99 @@ def _valid_plan_raw(catalog, objective="Check repository health."):
 
 def _cannot_plan_raw():
     return json.dumps({"plan_version": 1, "result": "cannot_plan"})
+
+
+# --- P2A execution/delivery test helpers ------------------------------------
+
+
+class RecordingClient:
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    def send_text_message(self, to, body):
+        self.sent.append((to, body))
+        return "wamid.OUT1"
+
+
+class FailingClient:
+    def send_text_message(self, to, body):
+        raise WhatsAppClientError("boom")
+
+
+class _NeverCalledExecutor:
+    """Proves SafeTaskExecutor.execute() is structurally never reached for
+    a sensitive step that should stop at CONFIRMATION_REQUIRED instead -
+    mirrors tests/kernel/task_execution/test_milestone_43_p1_e2e.py's own
+    _FakeExecutor pattern."""
+
+    def __init__(self):
+        self.calls: list[ActionRequest] = []
+
+    def execute(self, request: ActionRequest) -> ActionResult:
+        self.calls.append(request)
+        raise AssertionError("SafeTaskExecutor must never be called for a step awaiting confirmation")
+
+
+_AUTHORIZED_SENDER = "15551234567"
+
+
+def _tools_config(*, approved_directories=None, approved_applications=None):
+    return ToolsConfig(
+        approved_directories=approved_directories or {},
+        approved_applications=approved_applications or {},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+    )
+
+
+def _action_step(position, action_name, resource_key, *, depends_on=()):
+    return PlanStep(
+        step_id=f"step_{position}",
+        position=position,
+        kind=StepKind.ACTION,
+        action_name=action_name,
+        resource_key=resource_key,
+        catalog_id=f"action_{position}",
+        description="do the thing",
+        expected_result="the thing is done",
+        depends_on=tuple(depends_on),
+        requires_confirmation=False,
+    )
+
+
+def _respond_step(position, *, depends_on=()):
+    return PlanStep(
+        step_id=f"step_{position}",
+        position=position,
+        kind=StepKind.RESPOND,
+        action_name=None,
+        resource_key=None,
+        catalog_id=None,
+        description="summarize",
+        expected_result="a summary",
+        depends_on=tuple(depends_on),
+        requires_confirmation=False,
+    )
+
+
+def _ready_task(repo, steps, request_text="do the plan"):
+    """Builds a task straight into READY with a directly-constructed,
+    hand-built TaskPlan - bypassing the planner entirely, exactly like
+    tests/kernel/task_execution/test_milestone_43_p1_e2e.py's own
+    _ready_task() helper. Used by every execution-focused test below, so
+    execution behavior is tested independently of planning behavior."""
+
+    record = repo.create_task(request_text, "whatsapp")
+    repo.transition_task(record.task_id, TaskState.CREATED, TaskState.PLANNING)
+    plan = TaskPlan(
+        plan_version=1,
+        task_id=record.task_id,
+        objective=request_text,
+        steps=tuple(steps),
+        created_at="2026-08-08T00:00:00+00:00",
+    )
+    return repo.persist_plan_and_ready(record.task_id, TaskState.PLANNING, serialize_plan(plan))
 
 
 # --- classify_task_text(): pure, no I/O -------------------------------------
@@ -407,49 +530,98 @@ def test_needs_dispatch_false_for_every_other_state(repo, state):
     assert needs_dispatch(fake_record) is False
 
 
-# --- dispatch_planning(): the CREATED -> planning handoff, P1's only ---------
-# --- execution boundary -----------------------------------------------------
+# --- dispatch_task_work(): P2A's CREATED -> planning -> execution -> --------
+# --- delivery flow ------------------------------------------------------
 
 
-def test_dispatch_planning_advances_created_task(repo, catalog):
-    task = repo.create_task("Check repository health.", "whatsapp")
-    provider = _FakeModelProvider([_valid_plan_raw(catalog)])
+def _dispatch(
+    repo,
+    task_id,
+    catalog,
+    planner_provider,
+    *,
+    registry=None,
+    tools_config_loader=None,
+    respond_provider=None,
+    client=None,
+    authorized_sender=_AUTHORIZED_SENDER,
+):
+    return dispatch_task_work(
+        repo,
+        task_id,
+        catalog,
+        planner_provider,
+        registry if registry is not None else ActionRegistry(),
+        tools_config_loader if tools_config_loader is not None else _tools_config,
+        respond_provider if respond_provider is not None else _FakeModelProvider([]),
+        client if client is not None else RecordingClient(),
+        authorized_sender,
+    )
 
-    dispatch_planning(repo, task.task_id, catalog, provider)
+
+def test_dispatch_task_work_plans_and_executes_in_one_call(repo, catalog, downloads_dir):
+    task = repo.create_task("Check the downloads folder.", "whatsapp")
+    planner = _FakeModelProvider([_valid_plan_raw(catalog)])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog, planner, tools_config_loader=loader, client=client)
 
     reloaded = repo.get_task(task.task_id)
-    assert reloaded.state == TaskState.READY
-    assert len(provider.calls) == 1
+    assert reloaded.state == TaskState.COMPLETED
+    assert len(planner.calls) == 1
+    assert len(client.sent) == 1
+    assert client.sent[0][0] == _AUTHORIZED_SENDER
 
 
-def test_dispatch_planning_records_failure_for_unplannable_request(repo, catalog):
+def test_dispatch_task_work_delivers_failure_for_freshly_produced_planning_failure(repo, catalog):
+    # Milestone 46 P2A design correction: a durable CREATED -> FAILED
+    # transition produced by planning must be delivered, exactly once -
+    # not silently dropped.
     task = repo.create_task("Do something impossible.", "whatsapp")
-    provider = _FakeModelProvider([_cannot_plan_raw()])
+    planner = _FakeModelProvider([_cannot_plan_raw()])
+    client = RecordingClient()
 
-    dispatch_planning(repo, task.task_id, catalog, provider)
+    _dispatch(repo, task.task_id, catalog, planner, client=client)
 
     reloaded = repo.get_task(task.task_id)
     assert reloaded.state == TaskState.FAILED
+    assert len(client.sent) == 1
+    assert client.sent[0][0] == _AUTHORIZED_SENDER
+    assert client.sent[0][1].startswith("Task failed:")
+    assert reloaded.failure_summary in client.sent[0][1]
+
+
+def test_dispatch_task_work_duplicate_dispatch_of_planning_failure_sends_no_second_message(repo, catalog):
+    task = repo.create_task("Do something impossible.", "whatsapp")
+    planner = _FakeModelProvider([_cannot_plan_raw()])
+    client = RecordingClient()
+
+    _dispatch(repo, task.task_id, catalog, planner, client=client)
+    assert len(client.sent) == 1
+
+    # A duplicate TaskExecutionWork for the same, now-FAILED task_id.
+    _dispatch(repo, task.task_id, catalog, planner, client=client)
+    assert len(client.sent) == 1
+    assert repo.get_task(task.task_id).state == TaskState.FAILED
 
 
 @pytest.mark.parametrize(
     "state",
     [
-        TaskState.READY,
-        TaskState.RUNNING,
         TaskState.WAITING_FOR_CONFIRMATION,
         TaskState.COMPLETED,
         TaskState.FAILED,
         TaskState.CANCELLED,
     ],
 )
-def test_dispatch_planning_no_ops_for_non_created_state(repo, catalog, state, monkeypatch):
-    task = repo.create_task("Check repository health.", "whatsapp")
-    provider = _FakeModelProvider([_valid_plan_raw(catalog)])
+def test_dispatch_task_work_no_ops_for_already_waiting_or_terminal_state(repo, catalog, state):
+    task = repo.create_task("Check the downloads folder.", "whatsapp")
+    planner = _FakeModelProvider([_valid_plan_raw(catalog)])
+    client = RecordingClient()
 
-    # Force the persisted state without going through the real lifecycle -
-    # only needs_dispatch()/dispatch_planning()'s own state-gating is under
-    # test here, not how the state was reached.
+    # Force the persisted state directly - only dispatch_task_work()'s own
+    # state-gating is under test here, not how the state was reached.
     conn = repo._conn
     conn.execute("UPDATE tasks SET state = ? WHERE task_id = ?", (state.value, task.task_id))
     conn.execute(
@@ -458,59 +630,43 @@ def test_dispatch_planning_no_ops_for_non_created_state(repo, catalog, state, mo
         (task.task_id, state.value),
     )
 
-    dispatch_planning(repo, task.task_id, catalog, provider)
+    _dispatch(repo, task.task_id, catalog, planner, client=client)
 
-    assert provider.calls == []
-    reloaded = repo.get_task(task.task_id)
-    assert reloaded.state == state
-
-
-def test_dispatch_planning_duplicate_dispatch_only_plans_once(repo, catalog):
-    task = repo.create_task("Check repository health.", "whatsapp")
-    provider = _FakeModelProvider([_valid_plan_raw(catalog)])
-
-    dispatch_planning(repo, task.task_id, catalog, provider)
-    assert len(provider.calls) == 1
-
-    # A second dispatch of the same task_id (e.g. a duplicate work item)
-    # reloads the now-READY state and must not plan again.
-    dispatch_planning(repo, task.task_id, catalog, provider)
-    assert len(provider.calls) == 1
-
-    reloaded = repo.get_task(task.task_id)
-    assert reloaded.state == TaskState.READY
+    assert planner.calls == []
+    assert client.sent == []
+    assert repo.get_task(task.task_id).state == state
 
 
-def test_dispatch_planning_swallows_task_not_in_created_state_error(repo, catalog, monkeypatch):
+def test_dispatch_task_work_swallows_task_not_in_created_state_error(repo, catalog, monkeypatch):
     """A direct unit test of the except-clause itself: even though the
-    real single-threaded WhatsApp worker can never reach this branch
-    today (dispatch_planning()'s own pre-check already prevents it - see
-    this module's own module docstring), the catch is real defense in
-    depth and must behave exactly as documented: swallow it silently,
-    call nothing else, never raise to the caller."""
+    real single-threaded WhatsApp worker can never reach this branch today
+    (dispatch_task_work()'s own pre-check already prevents it), the catch
+    is real defense in depth and must behave exactly as documented:
+    swallow it silently, send nothing, never raise to the caller."""
 
     import interfaces.whatsapp.task_control as task_control_module
     from kernel.task_orchestration import TaskNotInCreatedStateError
 
-    task = repo.create_task("Check repository health.", "whatsapp")
-    provider = _FakeModelProvider([_valid_plan_raw(catalog)])
+    task = repo.create_task("Check the downloads folder.", "whatsapp")
+    planner = _FakeModelProvider([_valid_plan_raw(catalog)])
+    client = RecordingClient()
 
     def raise_race(*args, **kwargs):
         raise TaskNotInCreatedStateError("simulated race")
 
     monkeypatch.setattr(task_control_module, "advance_task_planning", raise_race)
 
-    dispatch_planning(repo, task.task_id, catalog, provider)  # must not raise
+    _dispatch(repo, task.task_id, catalog, planner, client=client)  # must not raise
 
-    reloaded = repo.get_task(task.task_id)
-    assert reloaded.state == TaskState.CREATED  # untouched - the fake never really ran
+    assert client.sent == []
+    assert repo.get_task(task.task_id).state == TaskState.CREATED  # untouched
 
 
-def test_dispatch_planning_does_not_swallow_unrelated_errors(repo, catalog, monkeypatch):
+def test_dispatch_task_work_does_not_swallow_unrelated_planning_errors(repo, catalog, monkeypatch):
     import interfaces.whatsapp.task_control as task_control_module
 
-    task = repo.create_task("Check repository health.", "whatsapp")
-    provider = _FakeModelProvider([_valid_plan_raw(catalog)])
+    task = repo.create_task("Check the downloads folder.", "whatsapp")
+    planner = _FakeModelProvider([_valid_plan_raw(catalog)])
 
     def raise_something_else(*args, **kwargs):
         raise RuntimeError("a genuine defect, not a race")
@@ -518,7 +674,603 @@ def test_dispatch_planning_does_not_swallow_unrelated_errors(repo, catalog, monk
     monkeypatch.setattr(task_control_module, "advance_task_planning", raise_something_else)
 
     with pytest.raises(RuntimeError):
-        dispatch_planning(repo, task.task_id, catalog, provider)
+        _dispatch(repo, task.task_id, catalog, planner)
+
+
+# --- dispatch_task_work(): non-sensitive execution end-to-end ---------------
+
+
+def test_non_sensitive_task_completes_and_delivers_one_result(repo, downloads_dir):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.COMPLETED
+    assert len(client.sent) == 1
+    assert client.sent[0][0] == _AUTHORIZED_SENDER
+    assert "report.txt" in client.sent[0][1]
+
+
+def test_non_sensitive_task_duplicate_dispatch_sends_no_second_result(repo, downloads_dir):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+    assert len(client.sent) == 1
+
+    # Duplicate TaskExecutionWork for the same, now-COMPLETED task_id.
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+    assert len(client.sent) == 1
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+
+
+def test_oversized_action_result_still_completes_and_delivers_bounded_result(repo, tmp_path):
+    # Milestone 46 adversarial review, H1: a real, non-sensitive action can
+    # execute successfully but produce an ActionResult.message too large to
+    # persist verbatim (kernel/task_execution/service.py's
+    # _finalize_action_step() now falls back to a compact, code-owned
+    # observation rather than letting ObservationSerializationError escape
+    # uncaught - see that function's own docstring). This is the full P2A
+    # production path end to end: dispatch_task_work() must still complete
+    # the task and deliver exactly one bounded WhatsApp result, never leave
+    # it silently stuck RUNNING with the step stuck IN_PROGRESS.
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    for i in range(100):
+        name = f"Quarterly_Financial_Report_Draft_Review_Comments_Attached_{i:03d}.pdf"
+        (downloads_dir / name).write_text("x")
+
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.COMPLETED
+    assert len(client.sent) == 1
+    assert client.sent[0][0] == _AUTHORIZED_SENDER
+    assert len(client.sent[0][1]) <= 4096  # never sends raw, unbounded handler output
+
+    # A duplicate TaskExecutionWork for the same, now-COMPLETED task_id must
+    # not re-execute the action or resend the result.
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+    assert len(client.sent) == 1
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+
+
+def test_execution_failure_delivers_one_bounded_failure_message(repo):
+    # "downloads" IS registered (passes revalidation), but points at a
+    # path that does not actually exist - list_files.run() itself fails
+    # deterministically (ActionResult(False, "That directory is not
+    # available.", "failed")), a real, safe, non-destructive handler-level
+    # failure - distinct from the revalidation failure covered by
+    # test_fresh_config_revalidation_fails_closed_when_resource_removed.
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": "C:/does/not/exist/xyz"})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.FAILED
+    assert len(client.sent) == 1
+    assert client.sent[0][1].startswith("Task failed:")
+    assert "not available" in client.sent[0][1]
+
+
+def test_execution_failure_duplicate_dispatch_sends_no_second_message(repo):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": "C:/does/not/exist/xyz"})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+    assert len(client.sent) == 1
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+    assert len(client.sent) == 1
+
+
+# --- dispatch_task_work(): sensitive action -> confirmation request --------
+
+
+def test_sensitive_task_stops_at_confirmation_and_delivers_one_request(repo):
+    task = _ready_task(repo, [_action_step(1, "open_application", "notepad")])
+    client = RecordingClient()
+    executor_calls = _NeverCalledExecutor()
+    loader = lambda: _tools_config(approved_applications={"notepad": object()})
+
+    import interfaces.whatsapp.task_control as task_control_module
+
+    real_safe_task_executor = task_control_module.SafeTaskExecutor
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+                  tools_config_loader=loader, client=client)
+    finally:
+        task_control_module.SafeTaskExecutor = real_safe_task_executor
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.WAITING_FOR_CONFIRMATION
+    assert executor_calls.calls == []  # no real/sensitive side effect occurred
+
+    assert len(client.sent) == 1
+    recipient, body = client.sent[0]
+    assert recipient == _AUTHORIZED_SENDER
+    assert "Action: open_application" in body
+    assert "Resource: notepad" in body
+
+    pending = repo.get_pending_confirmation(task.task_id)
+    assert pending is not None
+    assert f"CONFIRM {pending.confirmation_id}" in body
+    assert f"REJECT {pending.confirmation_id}" in body
+    # Never a raw path, secret, tool argument, or internal DB row.
+    assert "step_position" not in body.lower()
+
+
+def test_sensitive_task_duplicate_dispatch_does_not_resend_or_execute(repo):
+    task = _ready_task(repo, [_action_step(1, "open_application", "notepad")])
+    client = RecordingClient()
+    executor_calls = _NeverCalledExecutor()
+    loader = lambda: _tools_config(approved_applications={"notepad": object()})
+
+    import interfaces.whatsapp.task_control as task_control_module
+
+    real_safe_task_executor = task_control_module.SafeTaskExecutor
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+                  tools_config_loader=loader, client=client)
+        assert len(client.sent) == 1
+
+        # Duplicate TaskExecutionWork for the same, now-WAITING_FOR_CONFIRMATION task_id.
+        _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+                  tools_config_loader=loader, client=client)
+    finally:
+        task_control_module.SafeTaskExecutor = real_safe_task_executor
+
+    assert len(client.sent) == 1  # no resend
+    assert executor_calls.calls == []  # still never executed
+    assert repo.get_task(task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+
+
+def test_missing_pending_confirmation_fails_safe_without_fabrication(repo, monkeypatch):
+    """Defensive path: CONFIRMATION_REQUIRED structurally implies a pending
+    row exists, but this is never assumed - if get_pending_confirmation()
+    somehow returns None, no token is fabricated, nothing executes, and a
+    bounded generic message is sent instead."""
+
+    task = _ready_task(repo, [_action_step(1, "open_application", "notepad")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_applications={"notepad": object()})
+
+    monkeypatch.setattr(TaskRepository, "get_pending_confirmation", lambda self, task_id: None)
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    assert len(client.sent) == 1
+    assert "CONFIRM" not in client.sent[0][1]
+    assert "REJECT" not in client.sent[0][1]
+    # The durable state the execution engine already produced is left
+    # untouched - no destructive mutation invented here.
+    assert repo.get_task(task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+
+
+def test_running_task_with_in_progress_step_fails_closed_never_retried(repo):
+    """Milestone 46 adversarial review, M47-boundary pin: a RUNNING task
+    whose next step is durably IN_PROGRESS represents genuine crash
+    uncertainty (kernel/task_execution/eligibility.py's own
+    STEP_IN_PROGRESS doctrine - the step may or may not have actually
+    happened). dispatch_task_work() accepting RUNNING as a valid input
+    state (alongside READY) must NEVER turn this into automatic retry/
+    recovery - that remains exclusively Milestone 47's scope. This seeds
+    exactly that crash-artifact shape directly (claim_step() commits the
+    IN_PROGRESS row, but nothing ever finalizes it - simulating a process
+    that died between claiming the step and executor.execute() returning),
+    then proves the existing engine's fail-closed behavior is preserved
+    unchanged through P2A's dispatch layer, and that the resulting freshly-
+    produced TASK_FAILED is delivered exactly once (transition-triggered
+    delivery still applies to this path)."""
+
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    task = repo.transition_task(task.task_id, TaskState.READY, TaskState.RUNNING)
+    repo.claim_step(task.task_id, 1)  # durably IN_PROGRESS - never finalized
+
+    client = RecordingClient()
+    executor_calls = _NeverCalledExecutor()
+    loader = lambda: _tools_config(approved_directories={"downloads": "/does/not/matter"})
+
+    import interfaces.whatsapp.task_control as task_control_module
+
+    real_safe_task_executor = task_control_module.SafeTaskExecutor
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+                  tools_config_loader=loader, client=client)
+    finally:
+        task_control_module.SafeTaskExecutor = real_safe_task_executor
+
+    assert executor_calls.calls == []  # the uncertain step is never retried
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.FAILED
+    assert reloaded.failure_code == "step_execution_uncertain"
+
+    assert len(client.sent) == 1
+    assert client.sent[0][1].startswith("Task failed:")
+
+    # A further duplicate dispatch of the same, now-terminal task must not
+    # resend the failure or touch the executor again.
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+    assert len(client.sent) == 1
+    assert executor_calls.calls == []
+
+
+def test_confirmation_message_worst_case_size_fits_the_outbound_bound_intact(repo):
+    """Milestone 46 adversarial review, §19: pins the confirmation
+    message's true worst-case size explicitly, using the actual persisted-
+    field bounds (MAX_CONFIRMATION_ACTION_NAME_CHARS/
+    MAX_CONFIRMATION_RESOURCE_KEY_CHARS/MAX_CONFIRMATION_ID_CHARS - all
+    128), rather than relying on realistic values happening to fit. The
+    confirmation_id must always appear intact - never truncated - since it
+    is the authority-bearing token CONFIRM/REJECT will need."""
+
+    from kernel.employee_tasks import (
+        MAX_CONFIRMATION_ACTION_NAME_CHARS,
+        MAX_CONFIRMATION_ID_CHARS,
+        MAX_CONFIRMATION_RESOURCE_KEY_CHARS,
+    )
+    from kernel.employee_tasks.types import PendingTaskConfirmation
+
+    import interfaces.whatsapp.task_control as task_control_module
+
+    confirmation_id = "c" * MAX_CONFIRMATION_ID_CHARS
+    pending = PendingTaskConfirmation(
+        task_id="t" * 32,
+        confirmation_id=confirmation_id,
+        step_position=1,
+        action_name="a" * MAX_CONFIRMATION_ACTION_NAME_CHARS,
+        resource_key="r" * MAX_CONFIRMATION_RESOURCE_KEY_CHARS,
+        created_at="2026-08-08T00:00:00+00:00",
+        expires_at="2026-08-08T00:02:00+00:00",
+    )
+
+    message = task_control_module._format_confirmation_message(pending)
+
+    assert len(message) <= task_control_module.MAX_OUTGOING_TEXT_LENGTH
+    # The complete token appears intact, twice (CONFIRM and REJECT) -
+    # never truncated, never a prefix/suffix of it.
+    assert f"CONFIRM {confirmation_id}" in message
+    assert f"REJECT {confirmation_id}" in message
+
+
+# --- dispatch_task_work(): fresh execution-time config revalidation --------
+
+
+def test_fresh_config_revalidation_fails_closed_when_resource_removed(repo, downloads_dir):
+    # The plan references "downloads", which was authorized when the plan
+    # was built - but the INJECTED tools_config_loader, called fresh by
+    # dispatch_task_work() immediately before execution, returns a config
+    # that no longer authorizes it. Execution must fail closed through the
+    # existing ActionRevalidationFailure path - the real list_files handler
+    # must never be reached.
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={})  # "downloads" removed
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.FAILED
+    assert reloaded.failure_code == "action_no_longer_valid"
+    assert len(client.sent) == 1
+    assert client.sent[0][1].startswith("Task failed:")
+
+
+def test_fresh_config_revalidation_succeeds_when_resource_still_authorized(repo, downloads_dir):
+    # Contrast case: the same plan, but the fresh config DOES still
+    # authorize "downloads" - execution proceeds and completes normally,
+    # proving the loader is genuinely consulted (not merely ignored).
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+    assert len(client.sent) == 1
+
+
+# --- dispatch_task_work(): RESPOND vs. non-RESPOND result selection --------
+
+
+def test_respond_result_uses_conversational_provider_not_planner_provider(repo, downloads_dir):
+    task = _ready_task(
+        repo,
+        [
+            _action_step(1, "list_files", "downloads"),
+            _respond_step(2, depends_on=(1,)),
+        ],
+    )
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+    planner_provider = _FakeModelProvider([])  # must never be called for RESPOND
+    respond_provider = _FakeModelProvider(["Here is your downloads summary."])
+
+    _dispatch(
+        repo, task.task_id, catalog=(), planner_provider=planner_provider,
+        tools_config_loader=loader, respond_provider=respond_provider, client=client,
+    )
+
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+    assert planner_provider.calls == []
+    assert len(respond_provider.calls) == 1
+    assert client.sent == [(_AUTHORIZED_SENDER, "Here is your downloads summary.")]
+
+
+def test_no_respond_result_uses_last_successful_action_summary(repo, downloads_dir):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+    assert len(client.sent) == 1
+    assert client.sent[0][0] == _AUTHORIZED_SENDER
+    assert "report.txt" in client.sent[0][1]
+
+
+def test_multi_step_result_selection_prefers_last_successful_respond_by_position(repo, downloads_dir):
+    task = _ready_task(
+        repo,
+        [
+            _action_step(1, "list_files", "downloads"),
+            _respond_step(2, depends_on=(1,)),
+            _action_step(3, "list_files", "downloads", depends_on=(2,)),
+            _respond_step(4, depends_on=(3,)),
+        ],
+    )
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+    respond_provider = _FakeModelProvider(["first summary", "second summary"])
+
+    _dispatch(
+        repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+        tools_config_loader=loader, respond_provider=respond_provider, client=client,
+    )
+
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+    # The LAST successful RESPOND (position 4) wins, not DB row order or an
+    # earlier RESPOND at position 2.
+    assert client.sent == [(_AUTHORIZED_SENDER, "second summary")]
+
+
+# --- select_terminal_result_text(): deterministic, position-based ----------
+
+
+def test_select_terminal_result_text_no_plan_json_returns_fallback(repo):
+    task = repo.create_task("request", "whatsapp")
+    assert select_terminal_result_text(repo, task) == TASK_COMPLETED_FALLBACK_TEXT
+
+
+def test_select_terminal_result_text_corrupt_plan_json_returns_fallback(repo):
+    task = repo.create_task("request", "whatsapp")
+    broken = replace(task, plan_json="not valid plan json")
+    assert select_terminal_result_text(repo, broken) == TASK_COMPLETED_FALLBACK_TEXT
+
+
+def test_select_terminal_result_text_no_successful_steps_returns_fallback(repo, downloads_dir):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    # Never claimed/executed - list_step_progress() is empty.
+    assert select_terminal_result_text(repo, task) == TASK_COMPLETED_FALLBACK_TEXT
+
+
+def _mark_respond_step(repo, task_id, position, *, success, summary):
+    """Directly claims and finalizes one RESPOND step's durable progress
+    row with a real, serialized StepObservation - bypassing
+    synthesize_response()/the model entirely, so select_terminal_result_text()
+    is tested against real persisted data, independent of RESPOND synthesis
+    itself (Milestone 46 adversarial review, §18 result-selection
+    coverage)."""
+
+    repo.claim_step(task_id, position)
+    observation = build_respond_observation(
+        position,
+        success=success,
+        safe_summary=summary,
+        failure_code=None if success else "respond_invalid_output",
+        completed_at="2026-08-08T00:00:01+00:00",
+    )
+    observation_json = serialize_observation(observation)
+    if success:
+        repo.mark_step_succeeded(task_id, position, observation_json)
+    else:
+        repo.mark_step_failed(
+            task_id, position, failure_code="respond_invalid_output",
+            failure_summary="The generated response did not meet the required format or size.",
+            result_json=observation_json,
+        )
+
+
+def test_successful_respond_followed_by_later_successful_action_respond_still_wins(repo, downloads_dir):
+    # Milestone 46 adversarial review, §18A: RESPOND wins even when a
+    # chronologically/positionally LATER ACTION step also succeeded - the
+    # documented rule is "last successful RESPOND, period", never "last
+    # successful step of any kind unless a RESPOND exists earlier."
+    task = _ready_task(
+        repo,
+        [
+            _respond_step(1),
+            _action_step(2, "list_files", "downloads", depends_on=(1,)),
+        ],
+    )
+    task = repo.transition_task(task.task_id, TaskState.READY, TaskState.RUNNING)
+    _mark_respond_step(repo, task.task_id, 1, success=True, summary="RESPOND SUMMARY")
+    repo.claim_step(task.task_id, 2)
+    action_observation = build_action_observation(
+        2, ActionResult(True, "ACTION SUMMARY", "executed"), "2026-08-08T00:00:02+00:00"
+    )
+    repo.mark_step_succeeded(task.task_id, 2, serialize_observation(action_observation))
+
+    reloaded = repo.get_task(task.task_id)
+    assert select_terminal_result_text(repo, reloaded) == "RESPOND SUMMARY"
+
+
+def test_earlier_successful_respond_followed_by_later_failed_respond_last_successful_wins(
+    repo, downloads_dir
+):
+    # Milestone 46 adversarial review, §18B: the LAST successful RESPOND
+    # wins - a later RESPOND that failed must never mask an earlier one
+    # that succeeded, and must never itself be selected.
+    task = _ready_task(
+        repo,
+        [
+            _respond_step(1),
+            _respond_step(2, depends_on=(1,)),
+        ],
+    )
+    task = repo.transition_task(task.task_id, TaskState.READY, TaskState.RUNNING)
+    _mark_respond_step(repo, task.task_id, 1, success=True, summary="FIRST SUMMARY")
+    _mark_respond_step(repo, task.task_id, 2, success=False, summary="unused")
+
+    reloaded = repo.get_task(task.task_id)
+    assert select_terminal_result_text(repo, reloaded) == "FIRST SUMMARY"
+
+
+# --- outbound message bounding / recipient / send-failure -------------------
+
+
+def test_lifecycle_message_never_exceeds_outbound_bound(repo, downloads_dir, monkeypatch):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    # Force an oversized result text without needing a genuinely oversized
+    # real observation - proves the bounding safety net itself, not just
+    # that realistic results happen to fit.
+    import interfaces.whatsapp.task_control as task_control_module
+
+    monkeypatch.setattr(task_control_module, "select_terminal_result_text", lambda repo, task: "x" * 5000)
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)
+
+    assert len(client.sent) == 1
+    sent_text = client.sent[0][1]
+    assert len(sent_text) <= 4096
+    assert "x" * 100 not in sent_text  # discarded outright, never truncated
+
+
+def test_send_failure_does_not_roll_back_task_state_or_raise(repo, downloads_dir):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = FailingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)  # must not raise
+
+    # The durable state transition already committed before the send was
+    # even attempted - a send failure never rolls it back.
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+
+
+def test_send_failure_on_planning_failure_delivery_does_not_roll_back_or_raise(repo, catalog):
+    """Milestone 46 adversarial review, M2: the completed-result case above
+    proved this once - this proves the SAME _send_lifecycle_message()
+    helper behaves identically for the planning-failure delivery call
+    site, which does not otherwise share any code path with the
+    terminal-result delivery above."""
+
+    task = repo.create_task("Do something impossible.", "whatsapp")
+    planner = _FakeModelProvider([_cannot_plan_raw()])
+    client = FailingClient()
+
+    _dispatch(repo, task.task_id, catalog, planner, client=client)  # must not raise
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.FAILED
+    assert reloaded.failure_summary  # durably recorded regardless of send outcome
+
+
+def test_send_failure_on_execution_failure_delivery_does_not_roll_back_or_raise(repo):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = FailingClient()
+    # A registered-but-nonexistent path - a genuine handler-level failure.
+    loader = lambda: _tools_config(approved_directories={"downloads": "C:/does/not/exist/xyz"})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client)  # must not raise
+
+    assert repo.get_task(task.task_id).state == TaskState.FAILED
+
+
+def test_send_failure_on_confirmation_request_delivery_does_not_roll_back_execute_or_raise(repo):
+    task = _ready_task(repo, [_action_step(1, "open_application", "notepad")])
+    client = FailingClient()
+    executor_calls = _NeverCalledExecutor()
+    loader = lambda: _tools_config(approved_applications={"notepad": object()})
+
+    import interfaces.whatsapp.task_control as task_control_module
+
+    real_safe_task_executor = task_control_module.SafeTaskExecutor
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+                  tools_config_loader=loader, client=client)  # must not raise
+    finally:
+        task_control_module.SafeTaskExecutor = real_safe_task_executor
+
+    # A send failure on the confirmation request must never be treated as
+    # authorization to proceed with the sensitive action.
+    assert executor_calls.calls == []
+    assert repo.get_task(task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+
+
+def test_recipient_is_always_the_configured_authorized_sender(repo, downloads_dir):
+    task = _ready_task(repo, [_action_step(1, "list_files", "downloads")])
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+    _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
+              tools_config_loader=loader, client=client, authorized_sender="19995551234")
+
+    assert client.sent[0][0] == "19995551234"
+
+
+def test_task_cancelled_uses_fixed_text_never_model_synthesized(repo):
+    # TASK_CANCELLED is not reachable through dispatch_task_work() in P2A
+    # (only deny_task_confirmation(), Milestone 46 P2B, ever produces it) -
+    # this proves the delivery wrapper itself is correct and ready for P2B
+    # to reuse, using a directly-constructed ExecutionAdvanceResult.
+    from kernel.task_execution import ExecutionAdvanceResult, ExecutionAdvanceStatus
+
+    import interfaces.whatsapp.task_control as task_control_module
+
+    task = repo.create_task("request", "whatsapp")
+    client = RecordingClient()
+    result = ExecutionAdvanceResult(task, ExecutionAdvanceStatus.TASK_CANCELLED)
+
+    task_control_module._deliver_execution_result(result, repo, client, _AUTHORIZED_SENDER)
+
+    assert client.sent == [(_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)]
 
 
 # --- TaskExecutionWork: minimal, trusted correlation only --------------------

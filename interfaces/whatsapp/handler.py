@@ -18,11 +18,18 @@ durable planning handoff for a "/task <request>" message already durably
 accepted in server.py's POST handling (before this worker ever sees it -
 see task_control.py's own module docstring on the connection-lifecycle
 split between request threads and this worker). Handling one is entirely
-delegated to task_control.dispatch_planning() using this handler's own
-long-lived TaskRepository instance/catalog/planner ModelProvider - this
-module still performs no planning/execution itself and, per P1's explicit
-scope, never sends any outbound WhatsApp message for a TaskExecutionWork
-(no "Task accepted" notice, no result, no confirmation - Milestone 46 P2).
+delegated to task_control.dispatch_task_work() using this handler's own
+long-lived TaskRepository instance, planning catalog/planner ModelProvider,
+execution ActionRegistry/ToolsConfig loader, and general conversational
+ModelProvider (Milestone 46 P2A) - this module still performs no
+planning/execution/delivery logic itself, only wiring. Milestone 46 P2A:
+dispatch_task_work() may now execute non-sensitive actions, synthesize
+RESPOND text, and send exactly one outbound WhatsApp lifecycle message
+(terminal result/failure, or a confirmation request) per newly-produced
+lifecycle event - see task_control.py's own module docstring for the
+transition-triggered delivery rule that prevents a duplicate dispatch from
+resending one. CONFIRM/REJECT ingress and durable approval/rejection
+remain Milestone 46 P2B - not implemented here.
 """
 
 import logging
@@ -36,7 +43,7 @@ from interfaces.whatsapp.task_control import (
     TaskFixedReply,
     TaskRequestText,
     classify_task_text,
-    dispatch_planning,
+    dispatch_task_work,
 )
 
 logger = logging.getLogger(__name__)
@@ -173,6 +180,10 @@ class MessageHandler:
         task_repository=None,
         task_catalog=None,
         planner_provider=None,
+        action_registry=None,
+        tools_config_loader=None,
+        respond_provider=None,
+        authorized_sender=None,
     ) -> None:
         self._orchestrator = orchestrator
         self._client = client
@@ -180,15 +191,29 @@ class MessageHandler:
         # Milestone 46 P1: this worker's own long-lived TaskRepository
         # instance/connection (never shared with a request thread - see
         # task_control.py's own module docstring) plus the catalog/planner
-        # ModelProvider advance_task_planning() needs. All three are only
-        # required if a TaskExecutionWork item is ever actually dispatched
-        # (see _handle_task_execution_work()) - a build that never wires
-        # them (e.g. an existing test constructing MessageHandler with just
-        # orchestrator/client) keeps working exactly as before for
-        # TextTask/FixedReplyTask.
+        # ModelProvider advance_task_planning() needs.
         self._task_repository = task_repository
         self._task_catalog = task_catalog
         self._planner_provider = planner_provider
+        # Milestone 46 P2A: execution-time dependencies. action_registry is
+        # the stateless kernel.tools.ActionRegistry(); tools_config_loader
+        # is called fresh before every execution-layer operation (never a
+        # startup-cached ToolsConfig - see task_control.py's own module
+        # docstring on why); respond_provider is the general conversational
+        # ModelProvider RESPOND synthesis uses (deliberately distinct from
+        # planner_provider); authorized_sender is the fixed, trusted
+        # recipient for every task-control lifecycle message (never derived
+        # from task data - see task_control.py's own _send_lifecycle_message()
+        # docstring).
+        self._action_registry = action_registry
+        self._tools_config_loader = tools_config_loader
+        self._respond_provider = respond_provider
+        self._authorized_sender = authorized_sender
+        # All of the above are only required if a TaskExecutionWork item is
+        # ever actually dispatched (see _handle_task_execution_work()) - a
+        # build that never wires them (e.g. an existing test constructing
+        # MessageHandler with just orchestrator/client) keeps working
+        # exactly as before for TextTask/FixedReplyTask.
 
     def handle_task(self, task) -> None:
         if isinstance(task, TextTask):
@@ -201,13 +226,22 @@ class MessageHandler:
             raise TypeError(f"unsupported task type: {type(task).__name__}")
 
     def _handle_task_execution_work(self, task: TaskExecutionWork) -> None:
-        # Milestone 46 P1's only execution boundary: the CREATED -> planning
-        # handoff, via task_control.dispatch_planning(). Never sends any
-        # outbound WhatsApp message - no "Task accepted" notice, no result,
-        # no confirmation request (all Milestone 46 P2) - and never calls
-        # SafeTaskExecutor/run_task_until_blocked/advance_task_execution.
-        dispatch_planning(
-            self._task_repository, task.task_id, self._task_catalog, self._planner_provider
+        # Milestone 46 P2A's only execution boundary: the full
+        # planning -> execution -> delivery flow, via
+        # task_control.dispatch_task_work() - see that function's own
+        # docstring for the transition-triggered delivery rule. Never
+        # calls approve_task_confirmation()/deny_task_confirmation()
+        # (Milestone 46 P2B).
+        dispatch_task_work(
+            self._task_repository,
+            task.task_id,
+            self._task_catalog,
+            self._planner_provider,
+            self._action_registry,
+            self._tools_config_loader,
+            self._respond_provider,
+            self._client,
+            self._authorized_sender,
         )
 
     def _handle_text_task(self, task: TextTask) -> None:

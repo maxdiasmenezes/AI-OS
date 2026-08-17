@@ -44,9 +44,9 @@ Both functions perform no I/O and call no model.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from kernel.employee_tasks import MAX_STEP_RESULT_JSON_CHARS
+from kernel.employee_tasks import MAX_FAILURE_CODE_CHARS, MAX_STEP_RESULT_JSON_CHARS
 from kernel.task_planner import StepKind
 from kernel.tools.types import ActionResult
 
@@ -87,6 +87,57 @@ class ObservationDeserializationError(Exception):
     kernel.task_planner.PlannerFailure."""
 
 
+# Milestone 46 adversarial re-review (M1): kernel.tools.types.ActionResult.outcome
+# is typed as a plain `str` with no length/shape constraint enforced anywhere in
+# kernel/tools/ - "one of audit.py's fixed, bounded, machine-readable codes" is a
+# convention every one of the 14 currently-registered handlers happens to follow
+# (verified by inspection of every ActionResult(...) construction site, including
+# the indirect FileResourceError.outcome path in file_metadata.py/read_text_file.py),
+# never a structural guarantee the type system provides. A future or buggy handler
+# violating that convention (an oversized, empty, non-string, or NUL-containing
+# outcome) would otherwise reach kernel.employee_tasks.TaskRepository.fail_running_step()'s
+# own failure_code validation (bounded to MAX_FAILURE_CODE_CHARS) unnormalized,
+# raising TaskInputTooLargeError uncaught - reproducing the exact "claimed
+# in_progress, action already executed, uncaught exception, silent orphan" defect
+# class this module's build_bounded_action_observation() exists to eliminate, just
+# via `outcome` instead of `message`. normalize_action_result_outcome() closes this
+# at the one place both persistence paths (the embedded StepObservation field AND
+# the standalone failure_code parameter kernel/task_execution/service.py passes to
+# fail_running_step()) originate from, so there is no second, unnormalized path.
+_ACTION_OUTCOME_INVALID_FALLBACK_CODE = "action_outcome_unavailable"
+
+
+def normalize_action_result_outcome(result: ActionResult) -> ActionResult:
+    """Returns `result` unchanged if result.outcome already satisfies the
+    exact same contract kernel.employee_tasks.TaskRepository's own
+    failure_code column validation enforces (a non-empty string, no NUL
+    character, at most MAX_FAILURE_CODE_CHARS) - true for every real
+    outcome any of the 14 currently-registered handlers actually produces.
+    Otherwise returns a copy of `result` with `outcome` replaced by a
+    fixed, short, code-owned fallback code - never a truncation of the
+    real value (which could still leak partial handler-internal detail,
+    and a truncated arbitrary string is not a stable machine-readable code
+    either way).
+
+    Callers that build a StepObservation/persist a failure_code from an
+    ActionResult MUST call this first and use the returned ActionResult
+    (not the original) - this is what makes
+    build_bounded_action_observation()'s "provably serializable regardless
+    of what result.outcome contains" claim structurally true rather than
+    convention-dependent. success/message are never touched - this
+    function normalizes machine-readable metadata only, never the action's
+    real outcome or its safe, already-bounded descriptive text."""
+
+    outcome = result.outcome
+    if (
+        isinstance(outcome, str)
+        and 1 <= len(outcome) <= MAX_FAILURE_CODE_CHARS
+        and "\x00" not in outcome
+    ):
+        return result
+    return replace(result, outcome=_ACTION_OUTCOME_INVALID_FALLBACK_CODE)
+
+
 def build_action_observation(
     step_position: int, result: ActionResult, completed_at: str
 ) -> StepObservation:
@@ -95,7 +146,24 @@ def build_action_observation(
     verbatim (both already safe-to-relay/bounded), never adds anything
     beyond them. `failure_code` is None on success, and result.outcome on
     failure - outcome is already one of audit.py's fixed, bounded,
-    machine-readable codes, so no separate mapping table is needed."""
+    machine-readable codes, so no separate mapping table is needed.
+
+    PRECONDITION (Milestone 46 adversarial re-review, M1): callers whose
+    ActionResult did not just come from a trusted, code-controlled literal
+    must pass it through normalize_action_result_outcome() first - this
+    function trusts result.outcome verbatim and performs no bounds
+    checking of its own, exactly like it already trusts result.message
+    verbatim (see the message-bounding note below).
+
+    IMPORTANT: unlike RESPOND (kernel.task_execution.respond bounds its own
+    synthesized text before this module ever sees it - see
+    MAX_RESPOND_TEXT_CHARS), nothing bounds a handler's ActionResult.message
+    - it is arbitrary, handler-owned descriptive text (e.g.
+    list_files.run()'s directory listing scales with directory contents).
+    A caller that has already executed the action and now needs to persist
+    its outcome MUST use build_bounded_action_observation() below instead of
+    this function whenever result.message is not already known to be safely
+    bounded - see that function's own docstring for why."""
 
     return StepObservation(
         observation_version=OBSERVATION_VERSION,
@@ -103,6 +171,65 @@ def build_action_observation(
         step_kind=StepKind.ACTION,
         success=result.success,
         safe_summary=result.message,
+        failure_code=None if result.success else result.outcome,
+        action_outcome=result.outcome,
+        completed_at=completed_at,
+    )
+
+
+# Fixed, code-owned, deliberately short fallback summaries - never the real
+# (oversized) ActionResult.message, never a truncation/prefix of it (no
+# partial filenames/paths could leak through a truncation). Used only by
+# build_bounded_action_observation() below when the real message cannot be
+# durably persisted within MAX_STEP_RESULT_JSON_CHARS.
+_OVERSIZED_ACTION_SUCCESS_SUMMARY = (
+    "Action completed; detailed output omitted because it exceeded the result size limit."
+)
+_OVERSIZED_ACTION_FAILURE_SUMMARY = (
+    "Action failed; detailed output omitted because it exceeded the result size limit."
+)
+
+
+def build_bounded_action_observation(
+    step_position: int, result: ActionResult, completed_at: str
+) -> StepObservation:
+    """The same mapping as build_action_observation(), except safe_summary
+    is always one of the two fixed, short constants above instead of
+    result.message - never the real (potentially oversized) descriptive
+    text, never a truncation or prefix of it. success/failure_code/
+    action_outcome are preserved EXACTLY as build_action_observation()
+    would set them: an action that actually succeeded is still recorded as
+    succeeded here, and an action that actually failed is still recorded as
+    failed with its real failure_code - an oversized DESCRIPTIVE message
+    must never be allowed to change what the engine durably believes
+    happened to the action itself.
+
+    PRECONDITION - same as build_action_observation() above: the caller
+    MUST have already passed `result` through
+    normalize_action_result_outcome() (kernel/task_execution/service.py's
+    _finalize_action_step() does this exactly once, at the top, before
+    either builder is ever called). Given that precondition holds, every
+    field this function ever sets is either a plain int/bool/enum value,
+    an ISO-8601 completed_at string, result.outcome (now GUARANTEED - not
+    merely conventionally expected - to be a non-empty, NUL-free string of
+    at most MAX_FAILURE_CODE_CHARS, by construction of the caller's own
+    contract, not by trusting handler behavior), or one of the two fixed
+    summary constants above - none of which can be arbitrarily large. The
+    resulting StepObservation is therefore structurally, not just
+    conventionally, guaranteed serializable within MAX_STEP_RESULT_JSON_CHARS
+    (MAX_FAILURE_CODE_CHARS (64) is far smaller than the JSON budget this
+    tiny, otherwise-fixed observation has to spend it from) regardless of
+    what the real result.message/result.outcome happened to contain."""
+
+    safe_summary = (
+        _OVERSIZED_ACTION_SUCCESS_SUMMARY if result.success else _OVERSIZED_ACTION_FAILURE_SUMMARY
+    )
+    return StepObservation(
+        observation_version=OBSERVATION_VERSION,
+        step_position=step_position,
+        step_kind=StepKind.ACTION,
+        success=result.success,
+        safe_summary=safe_summary,
         failure_code=None if result.success else result.outcome,
         action_outcome=result.outcome,
         completed_at=completed_at,

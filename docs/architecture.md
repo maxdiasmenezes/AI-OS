@@ -79,20 +79,22 @@ to the kernel.
   without either depending on the other, running one task through
   created -> planning -> {ready | failed}. See Planning Orchestration
   below. As of Milestone 46 P1, its production caller is the WhatsApp
-  worker thread (interfaces/whatsapp/task_control.py:dispatch_planning()),
+  worker thread (interfaces/whatsapp/task_control.py:dispatch_task_work()),
   asynchronously, off the webhook HTTP thread - the CREATED -> planning
-  handoff only; execution (kernel/task_execution/, below) is not yet
-  wired to any real caller.
+  handoff. As of Milestone 46 P2A, that same call continues straight into
+  execution (kernel/task_execution/, below) in the same worker turn.
   kernel/task_execution: implemented (Milestone 42 - Autonomous Execution
   Loop) - drives a ready/running task one step at a time (deterministic,
   model-free eligibility; action execution through SafeTaskExecutor;
   durable confirmation for sensitive actions; RESPOND synthesis through an
   injected conversational ModelProvider) plus a bounded runner that
   repeats that one-step primitive until a blocking/terminal condition.
-  See Autonomous Execution Loop below. No production caller yet - this is
-  explicitly Milestone 46 P2's scope (result delivery, confirmation
-  interaction, and the actual run_task_until_blocked()/SafeTaskExecutor
-  wiring), not P1's.
+  See Autonomous Execution Loop below. As of Milestone 46 P2A its
+  production caller is the WhatsApp worker
+  (interfaces/whatsapp/task_control.py:dispatch_task_work()) - result
+  delivery and the run_task_until_blocked()/SafeTaskExecutor wiring are
+  implemented; CONFIRM/REJECT confirmation-reply interaction remains
+  Milestone 46 P2B's scope, not P2A's.
 ```
 
 ## Layers
@@ -228,11 +230,17 @@ responsibility:
   dropped, never retried. Milestone 46 P1 adds a fifth item this same
   `handle_task(task)` dispatches on: `TaskExecutionWork(task_id)` (defined
   in `task_control.py`, queued only by `server.py`'s `do_POST`, never
-  constructed here) — handling one calls `task_control.dispatch_planning()`
+  constructed here) — handling one calls `task_control.dispatch_task_work()`
   using this handler's own long-lived, worker-owned `TaskRepository`/
-  catalog/planner `ModelProvider` (see "Milestone 46 P1" below), and sends
-  no outbound WhatsApp message of any kind — no "Task accepted" notice, no
-  result, no confirmation request (Milestone 46 P2's concern).
+  catalog/planner `ModelProvider`, plus (Milestone 46 P2A) an
+  `ActionRegistry`, a fresh-reloading `ToolsConfig` loader, and a second,
+  independent conversational `ModelProvider` for RESPOND synthesis (see
+  "Milestone 46 P1"/"Milestone 46" below). As of P2A this may send exactly
+  one outbound WhatsApp lifecycle message per newly-produced lifecycle
+  event — a planning failure, a terminal result/failure, or a confirmation
+  request — never an unconditional "Task accepted" notice, and never more
+  than one per event (CONFIRM/REJECT reply handling is Milestone 46 P2B's
+  concern, not P2A's).
 - **memory** (`memory.py`) — `FixedNamespaceMemory` is the concrete
   namespace adapter the `memory_manager` injection seam (see Orchestrator
   below) was built for: it wraps a real `MemoryManager` and pins every
@@ -1101,7 +1109,66 @@ caller — this package never opens a database connection, never loads
   `task_step_progress` already has. An `action` step's observation reuses
   `SafeTaskExecutor`'s own already-safe `ActionResult.message`/`.outcome`
   verbatim (never raw stdout/stderr, a stack trace, or a secret — see
-  Tools above). Never a separate response table.
+  Tools above) *when that message fits the bound*. Never a separate
+  response table.
+  **Milestone 46 P2A correction (adversarial review H1):** unlike a
+  RESPOND step's synthesized text (already bounded to
+  `MAX_RESPOND_TEXT_CHARS` before this layer ever sees it — see below),
+  `ActionResult.message` is arbitrary, handler-owned descriptive text with
+  no bound of its own (e.g. `list_files`'s directory listing scales with
+  directory contents). P2A's WhatsApp wiring was the first production
+  caller ever piping real, size-unbounded `ActionResult` values through
+  this path, which exposed a pre-existing gap: `service.py`'s ACTION
+  finalization had no guard against this, unlike the RESPOND path's own
+  explicit one. `service.py:_finalize_action_step()` now checks — after
+  the action has already run, since by this point `claim_step()` has
+  already committed the step `in_progress` and `SafeTaskExecutor.execute()`
+  has already returned — whether the real `ActionResult` can be persisted
+  within `MAX_STEP_RESULT_JSON_CHARS` (the serialized observation) and, on
+  the failure path only, `MAX_FAILURE_SUMMARY_CHARS` (the reused
+  `failure_summary` field). If either bound would be violated,
+  `observation.py:build_bounded_action_observation()` is used instead: the
+  same `StepObservation` shape, with a fixed, short, code-owned
+  `safe_summary` ("Action completed/failed; detailed output omitted
+  because it exceeded the result size limit.") replacing the oversized
+  text — never a truncation of it, which could still leak a partial
+  filename/path. `success` is always preserved exactly as the real
+  `ActionResult` reported it: an action that actually succeeded is still
+  finalized `succeeded`, and one that actually failed is still finalized
+  `failed` — an oversized *descriptive* message must never convert one
+  into the other, and must never leave the step stuck `in_progress`
+  (which, without this fix, an uncaught `ObservationSerializationError`
+  did — durably, since nothing in production ever re-dispatches a task
+  once it has left `created`). This prevents that synthetic uncertainty
+  from ever being manufactured in the first place; it is not new recovery
+  logic — genuine crash uncertainty (a step that is `in_progress` because
+  the process actually died mid-action) remains exactly as before, still
+  fails closed via `STEP_IN_PROGRESS`, still never automatically retried,
+  and is still Milestone 47's scope, not this correction's.
+  **Follow-up hardening (adversarial re-review, M1):** `ActionResult.outcome`
+  is typed as a plain, unconstrained string in `kernel/tools/types.py` —
+  "one of `audit.py`'s fixed codes" was, before this hardening, only a
+  convention every currently-registered handler happened to follow, not a
+  guarantee the type system enforced. `failure_code`/`action_outcome` are
+  therefore no longer assumed bounded — `observation.py:
+  normalize_action_result_outcome()` now checks the SAME contract
+  `TaskRepository`'s own `failure_code` column validation enforces (a
+  non-empty, NUL-free string of at most `MAX_FAILURE_CODE_CHARS`, 64) and
+  replaces `outcome` with a fixed fallback code (`"action_outcome_unavailable"`)
+  only when that contract is violated — a real, valid short code (e.g.
+  `"executed"`, `"failed"`) is always preserved verbatim, never replaced
+  gratuitously. `_finalize_action_step()` normalizes exactly once, before
+  either observation builder runs, so both places an outcome becomes
+  persisted state (the embedded `StepObservation` fields, and the
+  standalone `failure_code` parameter passed to `fail_running_step()`) see
+  the identical, already-bounded value — there is no second, unnormalized
+  path. This is what makes `build_bounded_action_observation()`'s bounded-
+  serialization guarantee structurally true rather than convention-
+  dependent, and closes the same failure class (an uncaught exception
+  after the action has already run, leaving a step stuck `in_progress`
+  with no delivery) for a hypothetical future handler that violates the
+  `ActionResult.outcome` convention, exactly as the message-bounding fix
+  above closed it for `ActionResult.message`.
 - **RESPOND synthesis and model-role separation.** An eligible `respond`
   step is claimed through the identical `claim_step()` boundary a
   non-sensitive action uses, then synthesized by
@@ -2517,16 +2584,18 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `kernel/tools/confirmation.py` store (P2); RESPOND-step synthesis
   through an injected general conversational `ModelProvider` — never the
   dedicated planner provider — plus `run_task_until_blocked()`, a bounded
-  driver over the one-step `advance_task_execution()` primitive (P3). Like
-  Milestones 39-41, this milestone has **no production caller**: nothing
-  in `kernel/orchestrator/`, any `capabilities/`, or
-  `interfaces/whatsapp/` invokes it, and no task is ever advanced outside
-  a test. Real task submission, runtime wiring, a scheduler, WhatsApp
-  result delivery/confirmation routing (Milestone 46), and recovery/
-  reconciliation of an uncertain `in_progress` step from a process crash
-  mid-action (Milestone 47) are explicitly not this milestone's concern —
-  a claimed step whose terminal result was never persisted is left
-  durably `in_progress` and is never retried or skipped by this layer.
+  driver over the one-step `advance_task_execution()` primitive (P3). As of
+  Milestone 46 P2A, `interfaces/whatsapp/task_control.py:dispatch_task_work()`
+  is its first production caller — `run_task_until_blocked()`,
+  `SafeTaskExecutor`, and RESPOND synthesis all run for real WhatsApp
+  `/task` submissions; nothing in `kernel/orchestrator/` or any
+  `capabilities/` invokes it directly, and `approve_task_confirmation()`/
+  `deny_task_confirmation()` still have no production caller (Milestone 46
+  P2B's concern). Recovery/reconciliation of an uncertain `in_progress`
+  step from a process crash mid-action (Milestone 47) is explicitly not
+  this milestone's concern — a claimed step whose terminal result was
+  never persisted is left durably `in_progress` and is never retried or
+  skipped by this layer.
 - Milestone 43 — Core Computer Worker: **implemented**. Adds five
   registered actions to `kernel/tools/registry.py` — `ActionRegistry` now
   holds eleven actions in total. P1 (Read-Only Inspection) adds three
@@ -2937,16 +3006,14 @@ this flow — a single call to `handle()` is one full request/response cycle.
   `advance_task_execution()` are never called), deliver any task result,
   send any confirmation request, implement `CONFIRM`/`REJECT`, or send even
   an acceptance acknowledgement ("Task accepted") over WhatsApp — a
-  successfully-planned task may sit in `READY` indefinitely until P2 lands;
+  successfully-planned task may sit in `READY` indefinitely until P2A lands;
   that is deliberate, not a bug. No schema change (`SCHEMA_VERSION` stays
   4) — the only `kernel/employee_tasks/repository.py` addition is
   `get_task_by_dedup_key()`, an exact-equality lookup reusing the existing
-  `UNIQUE` index. **Milestone 46 P2 (task execution/result delivery/
-  confirmation interaction) and P3 (security acceptance and closure)
-  remain outstanding — do not treat Milestone 46 as complete.**
+  `UNIQUE` index.
 
-  An adversarial review of this P1 implementation found and this pass
-  corrected: (1) `WhatsAppServer.stop()` could close the worker's task-DB
+  An adversarial review of this P1 implementation found and a corrections
+  pass fixed: (1) `WhatsAppServer.stop()` could close the worker's task-DB
   connection while the worker was still using it — see "WhatsApp Server
   Lifecycle" above for the corrected, precise shutdown guarantee; (2) an
   ungrounded, arbitrary 256-character provider-message-ID length limit
@@ -2955,15 +3022,76 @@ this flow — a single call to `handle()` is one full request/response cycle.
   produces, never the input, relying on the webhook body's own existing
   1 MiB hard cap for transitive boundedness.
 
+  P2A (Task Execution, Result Delivery, and Confirmation Request Delivery)
+  is also implemented: the single `TaskExecutionWork(task_id)` dispatch
+  (`interfaces/whatsapp/task_control.py:dispatch_task_work()`, replacing
+  P1's `dispatch_planning()`) now drives a task all the way from `CREATED`
+  through planning and, in the same worker turn, through
+  `kernel/task_execution/run_task_until_blocked()` — still entirely on the
+  background worker thread, never the webhook HTTP thread. Execution goes
+  through no path other than `SafeTaskExecutor`; a fresh `ToolsConfig` is
+  reloaded (`load_tools_config()`, the bare function, called anew every
+  dispatch) rather than reusing the startup-time planning-catalog snapshot,
+  so a resource revoked after planning fails closed at execution time even
+  if it was authorized when the plan was made. RESPOND-step synthesis uses
+  a second, independent conversational `ModelProvider` instance
+  (`get_provider(kernel_config)`), deliberately never the planner
+  `ModelProvider` used for planning. Non-sensitive tasks can now run to
+  completion (`TaskState.COMPLETED`); a sensitive step still always stops
+  at `TaskState.WAITING_FOR_CONFIRMATION` before `SafeTaskExecutor` is ever
+  reached (`propose_confirmation()` fires first) — `CONFIRM`/`REJECT` still
+  do not exist, so a sensitive task simply waits there until P2B. Exactly
+  one outbound WhatsApp lifecycle message is sent per *newly-produced*
+  lifecycle event — a planning failure, a terminal result/failure, or a
+  confirmation request — never one replayed from a task's already-durable
+  state: delivery is transition-triggered (gated on which operation just
+  produced the status being handled), not state-inspected, so a duplicate
+  `TaskExecutionWork` dispatch (webhook redelivery, queue retry) never
+  resends. A completed task's result text is never raw `result_json` or
+  plan JSON — it is the last successful RESPOND step's `safe_summary` by
+  position, falling back to the last successful step of any kind, falling
+  back to a fixed notice if no step ever succeeded. No new durable state,
+  no schema change, no `ActionRegistry`/sensitive-set change, no new
+  dependency. **Milestone 46 P2B (`CONFIRM`/`REJECT` ingress and durable
+  approval/rejection) and P3 (security acceptance and closure) remain
+  outstanding — do not treat Milestone 46 as complete.** P2A also gives no
+  exactly-once guarantee across a process crash mid-execution — that
+  reconciliation is explicitly Milestone 47's scope, not P2A's.
+
+  An adversarial review of this P2A implementation found and a corrections
+  pass fixed one HIGH-severity defect in shared, previously-uncalled M42
+  execution code that P2A's wiring made live for the first time: a
+  non-sensitive action could execute successfully, but its handler's
+  `ActionResult.message` (unbounded — e.g. `list_files`'s output scales
+  with directory contents) could make the persisted `StepObservation`
+  exceed `MAX_STEP_RESULT_JSON_CHARS`, raising `ObservationSerializationError`
+  uncaught and leaving the task durably `RUNNING` with its step stuck
+  `IN_PROGRESS` — silently, since nothing in production ever re-dispatches
+  a task once it has left `CREATED`. `kernel/task_execution/service.py`
+  now falls back to a compact, code-owned observation
+  (`observation.py:build_bounded_action_observation()`) whenever the real
+  result cannot be persisted verbatim, preserving the action's real
+  success/failure outcome exactly — see "StepObservation" under Autonomous
+  Execution Loop above for the full mechanism. This closes the defect at
+  its source in the shared engine, not with a WhatsApp-side band-aid: the
+  durable action outcome is always resolved, regardless of which caller
+  (WhatsApp or any future one) triggered the oversized result. A follow-up
+  adversarial re-review found the fix's own fallback still implicitly
+  trusted `ActionResult.outcome` to be short by convention rather than by
+  guarantee; `observation.py:normalize_action_result_outcome()` closes
+  that too, making the fallback's boundedness structural rather than
+  convention-dependent — see "StepObservation" above for the exact
+  mechanism.
+
 **Planned / not yet implemented:**
 
-- Milestone 46 P2/P3 (task result delivery, confirmation request/reply
-  delivery over WhatsApp, and the P3 security-acceptance closure pass —
-  see the Milestone 46 entry above for what P1 already covers), Milestone
-  47 (persistence recovery/reconciliation, especially an uncertain
-  `in_progress` external action left behind by a process crash), and
-  Milestone 48 (employee acceptance/launch). None of this exists yet; do
-  not treat any of these names as implemented. Neither Milestone 44 nor
+- Milestone 46 P2B/P3 (`CONFIRM`/`REJECT` ingress and durable
+  approval/rejection over WhatsApp, and the P3 security-acceptance closure
+  pass — see the Milestone 46 entry above for what P1/P2A already cover),
+  Milestone 47 (persistence recovery/reconciliation, especially an
+  uncertain `in_progress` external action left behind by a process crash),
+  and Milestone 48 (employee acceptance/launch). None of this exists yet;
+  do not treat any of these names as implemented. Neither Milestone 44 nor
   Milestone 45 absorbs any of this scope — a future JavaScript-enabled or
   interactive browser capability, and any future native desktop mutation
   capability, are each new, separately-designed features, not a hidden

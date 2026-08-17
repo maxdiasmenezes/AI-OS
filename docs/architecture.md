@@ -2984,7 +2984,7 @@ this flow — a single call to `handle()` is one full request/response cycle.
   closure precedent for why a dedicated acceptance pass, rather than a new
   capability, is what "closes" a milestone here.
 
-- Milestone 46 — WhatsApp Task Control: **IN PROGRESS.** P1 (Durable
+- Milestone 46 — WhatsApp Task Control: **COMPLETE.** P1 (Durable
   WhatsApp Task Ingress) is implemented: `interfaces/whatsapp/` now
   recognizes `"/task <request>"` and durably accepts it into
   `kernel/employee_tasks/` (`TaskRepository.create_task(source="whatsapp",
@@ -3203,21 +3203,102 @@ this flow — a single call to `handle()` is one full request/response cycle.
   unchanged fail-closed, never-retried M42 semantics), remain explicitly
   Milestone 47's scope.
 
+  **Milestone 46 P3 — Security Acceptance and Closure.** A dedicated
+  acceptance pass over the complete P1/P2A/P2B surface, mirroring this
+  repository's own Milestone 43/44/45 closure precedent: no new
+  production behavior, tests/docs only. Automated non-live acceptance at
+  closure: **1,993 passed, 10 skipped, 0 failed**, across
+  `tests/interfaces/whatsapp` (304), `tests/kernel/employee_tasks` (233),
+  `tests/kernel/task_execution` (180), `tests/kernel/task_orchestration`
+  (17), `tests/kernel/task_planner` (143), and the safe
+  `tests/kernel/tools` subset (1,116 passed, 10 skipped - all ten skips
+  are pre-existing, environment-specific Windows/symlink-privilege
+  conditions unrelated to M46). The M45 live UIA integration test
+  (`tests/kernel/tools/test_desktop_windows_integration.py`) was
+  deliberately excluded from this and every other M46 acceptance run: M46
+  changes no `kernel/tools/` production code (verified empty across the
+  entire milestone, `git diff` from immediately before P1 through this
+  closure), so that test validates M45's own desktop-automation surface,
+  not anything WhatsApp task control touches - and it visibly launches a
+  disruptive `AIOS-M45-Fixture-Window` on the operator's desktop, a cost
+  with no corresponding M46 assurance benefit.
+
+  P3 also performed one controlled, real end-to-end WhatsApp acceptance
+  session over the live Meta Cloud API (via an ngrok webhook tunnel) from
+  the single configured authorized sender, against the running local
+  AI-OS WhatsApp server - the first time this milestone's full stack was
+  exercised over the real transport rather than an injected test double.
+  Every essential closure gate passed: a non-sensitive `/task` (a
+  read-only `list_files` request) executed and returned one bounded
+  result with no confirmation step; a sensitive `/task`
+  (`open_application`/`notepad`) correctly stopped at a confirmation
+  request with the action NOT yet executed; the exact `CONFIRM` reply
+  caused Notepad to launch exactly once; replaying that identical
+  `CONFIRM` produced the generic invalid-confirmation reply and did not
+  relaunch anything; and a fresh sensitive task rejected via `REJECT`
+  cancelled the task without ever launching the application. No raw
+  exception, stack trace, SQL detail, or other internal detail reached
+  the WhatsApp channel at any point in the session. (Malformed-token,
+  replayed-`REJECT`, and current-config-revocation-before-`CONFIRM`
+  manual cases were judged unnecessary given the deterministic automated
+  coverage already proving each one - see P2B's own test suite.)
+
+  Milestone 46's final delivered capability, end to end: durable WhatsApp
+  `/task` ingress with dedup-safe acceptance before HTTP success (P1);
+  worker-side planning, non-sensitive execution, and terminal-result/
+  failure/confirmation-request delivery (P2A); durable `CONFIRM`/`REJECT`
+  decision handling with current-authority revalidation, consume-once
+  replay protection, and post-approval continuation through the existing
+  execution runner (P2B); and this automated-plus-live acceptance pass
+  confirming the whole surface behaves as designed under both synthetic
+  and real conditions (P3). Final security invariants holding across the
+  whole surface: every request requires a valid Meta webhook signature
+  and the one exact configured authorized sender before any task or
+  confirmation operation; `/task` is durably accepted before HTTP
+  success; the worker queue is bounded; the webhook HTTP thread never
+  executes a task action of any kind; `SafeTaskExecutor` remains the sole
+  action-execution boundary; the current `ActionRegistry`/`ToolsConfig` -
+  never the persisted plan - is what decides sensitivity and validity, at
+  both execution and approval time; a sensitive action requires a durable
+  confirmation and a bare confirmation id is never sufficient authority
+  by itself (the resolved task must also be `source="whatsapp"` and still
+  `WAITING_FOR_CONFIRMATION`); a confirmation is consume-once and a
+  replay can never re-authorize execution; `REJECT` can never execute an
+  action; the outbound recipient is always the fixed, configured
+  authorized sender, never task/model-derived; and no model ever
+  interprets a `CONFIRM`/`REJECT` command.
+
+  Marking this milestone **COMPLETE** does not retract any boundary
+  documented above or in P2B's own closure paragraphs - all remain true
+  and are restated here for closure-record purposes, not superseded by
+  it: no exactly-once guarantee for an external action's side effects, an
+  outbound lifecycle message, or a confirmation-command's processing,
+  across a process crash; no automatic restart reconciliation and no
+  recovery of a step left in an uncertain `in_progress` state; no durable
+  confirmation-command queue (a decision can be lost, though never
+  corrupted, if the process crashes after HTTP 200 but before the worker
+  consumes it); no automatic recovery of a `CREATED` task after a restart
+  without an external re-dispatch trigger (a redelivered/resent `/task`
+  resolving to the same durable row); and ordinary external dependence on
+  Meta/network availability. None of these are M46 defects - they are
+  scope boundaries this milestone states explicitly rather than silently
+  assumes away, and, where applicable, they remain Milestone 47's scope
+  to close.
+
 **Planned / not yet implemented:**
 
-- Milestone 46 P3 (the security-acceptance closure pass — see the
-  Milestone 46 entry above for what P1/P2A/P2B already cover — do not
-  treat Milestone 46 as complete until P3 closes it), Milestone 47
-  (persistence recovery/reconciliation, especially an uncertain
-  `in_progress` external action left behind by a process crash, and the
-  confirmation-command-lost-before-worker-pickup boundary P2B explicitly
-  accepted rather than solved), and Milestone 48 (employee
-  acceptance/launch). None of this exists yet; do not treat any of these
-  names as implemented. Neither Milestone 44 nor Milestone 45 absorbs any
-  of this scope — a future JavaScript-enabled or interactive browser
+- Milestone 47 (persistence recovery/reconciliation, especially an
+  uncertain `in_progress` external action left behind by a process crash,
+  and the confirmation-command-lost-before-worker-pickup boundary
+  Milestone 46 P2B explicitly accepted rather than solved), and Milestone
+  48 (employee acceptance/launch). Neither exists yet; do not treat
+  either name as implemented. Milestone 46 itself is complete — see its
+  own entry above — and does not absorb Milestone 47's scope merely by
+  closing. Neither Milestone 44 nor Milestone 45 absorbs any of this
+  scope either — a future JavaScript-enabled or interactive browser
   capability, and any future native desktop mutation capability, are each
-  new, separately-designed features, not a hidden part of any of these
-  three, and not owned by M46 either.
+  new, separately-designed features, not a hidden part of any of these,
+  and not owned by M46.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

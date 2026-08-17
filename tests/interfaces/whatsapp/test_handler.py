@@ -25,7 +25,14 @@ from interfaces.whatsapp.handler import (
     classify_message,
 )
 from interfaces.whatsapp.payload import IncomingMessage
-from interfaces.whatsapp.task_control import TASK_HELP_TEXT, TaskExecutionWork, TaskRequestText
+from interfaces.whatsapp.task_control import (
+    TASK_HELP_TEXT,
+    ConfirmationDecision,
+    TaskConfirmationWork,
+    TaskExecutionWork,
+    TaskRequestText,
+    _GENERIC_INVALID_CONFIRMATION_TEXT,
+)
 
 SENDER = "15551234567"
 PHONE_NUMBER_ID = "1234567890"
@@ -187,6 +194,71 @@ def test_knowledge_command_is_still_unaffected_by_task_routing():
     task = classify_message(_message(text="/knowledge status"))
 
     assert isinstance(task, TextTask)
+
+
+# --- classify_message(): Milestone 46 P2B "CONFIRM/REJECT" recognition -
+
+
+def test_confirm_with_token_produces_task_confirmation_work():
+    task = classify_message(_message(text="CONFIRM abc-123"))
+
+    assert isinstance(task, TaskConfirmationWork)
+    assert task.confirmation_id == "abc-123"
+    assert task.decision is ConfirmationDecision.CONFIRM
+    assert not isinstance(task, TextTask)
+
+
+def test_reject_with_token_produces_task_confirmation_work():
+    task = classify_message(_message(text="REJECT abc-123"))
+
+    assert isinstance(task, TaskConfirmationWork)
+    assert task.confirmation_id == "abc-123"
+    assert task.decision is ConfirmationDecision.REJECT
+
+
+def test_confirm_verb_is_case_insensitive_token_case_preserved():
+    task = classify_message(_message(text="confirm AbC-123"))
+
+    assert isinstance(task, TaskConfirmationWork)
+    assert task.confirmation_id == "AbC-123"  # not case-folded
+
+
+def test_bare_confirm_produces_fixed_generic_invalid_reply():
+    task = classify_message(_message(text="CONFIRM"))
+
+    assert isinstance(task, FixedReplyTask)
+    assert task.sender == SENDER
+    assert task.reply_text == _GENERIC_INVALID_CONFIRMATION_TEXT
+
+
+def test_confirm_with_extra_tokens_produces_fixed_generic_invalid_reply():
+    task = classify_message(_message(text="CONFIRM abc extra"))
+
+    assert isinstance(task, FixedReplyTask)
+    assert task.reply_text == _GENERIC_INVALID_CONFIRMATION_TEXT
+
+
+def test_confirm_glued_to_token_is_not_a_confirmation_command():
+    # No whitespace separator - never mistaken for a command shape.
+    task = classify_message(_message(text="CONFIRMabc"))
+
+    assert isinstance(task, TextTask)
+    assert task.text == "CONFIRMabc"
+
+
+def test_confirmation_prefix_mid_sentence_is_not_a_confirmation_command():
+    task = classify_message(_message(text="please confirm this"))
+
+    assert isinstance(task, TextTask)
+
+
+def test_oversized_confirmation_command_is_rejected_before_parsing():
+    task = classify_message(_message(text="CONFIRM " + "x" * MAX_INCOMING_TEXT_LENGTH))
+
+    # The ordinary whole-message oversized check fires first, exactly like
+    # any other message - never reaches confirmation parsing at all.
+    assert isinstance(task, FixedReplyTask)
+    assert task.reply_text == OVERSIZED_MESSAGE_REPLY
 
 
 # --- MessageHandler.handle_task(): no authorization, no dedup ----------
@@ -365,6 +437,70 @@ def test_task_execution_work_message_handler_adds_no_side_effects_of_its_own(mon
     # Milestone 46 P1 sends no outbound WhatsApp message of its own for a
     # TaskExecutionWork - no "Task accepted" notice, no result, no
     # confirmation (all P2).
+    assert client.sent == []
+    assert orchestrator.received_prompts == []
+
+
+# --- TaskConfirmationWork: Milestone 46 P2B's only confirmation boundary --
+
+
+def test_task_confirmation_work_dispatches_confirmation_work_with_the_wired_dependencies(monkeypatch):
+    import interfaces.whatsapp.handler as handler_module
+
+    calls = []
+
+    def fake_dispatch_confirmation_work(
+        repository, work, registry, tools_config_loader, respond_provider, client, authorized_sender,
+    ):
+        calls.append((repository, work, registry, tools_config_loader, respond_provider, client, authorized_sender))
+
+    monkeypatch.setattr(handler_module, "dispatch_confirmation_work", fake_dispatch_confirmation_work)
+
+    (
+        sentinel_repo, sentinel_registry, sentinel_loader, sentinel_respond_provider, sentinel_sender,
+    ) = (object(), object(), object(), object(), object())
+    sentinel_client = RecordingClient()
+    handler = MessageHandler(
+        FakeOrchestrator("should not be reached"),
+        sentinel_client,
+        task_repository=sentinel_repo,
+        action_registry=sentinel_registry,
+        tools_config_loader=sentinel_loader,
+        respond_provider=sentinel_respond_provider,
+        authorized_sender=sentinel_sender,
+    )
+
+    work = TaskConfirmationWork(confirmation_id="abc-123", decision=ConfirmationDecision.CONFIRM)
+    handler.handle_task(work)
+
+    assert calls == [(
+        sentinel_repo, work, sentinel_registry, sentinel_loader, sentinel_respond_provider,
+        sentinel_client, sentinel_sender,
+    )]
+
+
+def test_task_confirmation_work_message_handler_adds_no_side_effects_of_its_own(monkeypatch):
+    # MessageHandler._handle_confirmation_work() is a thin wrapper - with
+    # dispatch_confirmation_work() itself neutralized, MessageHandler must
+    # not independently call the orchestrator or send anything.
+    import interfaces.whatsapp.handler as handler_module
+
+    monkeypatch.setattr(handler_module, "dispatch_confirmation_work", lambda *a, **k: None)
+
+    orchestrator = FakeOrchestrator("should not be reached")
+    client = RecordingClient()
+    handler = MessageHandler(
+        orchestrator,
+        client,
+        task_repository=object(),
+        action_registry=object(),
+        tools_config_loader=object(),
+        respond_provider=object(),
+        authorized_sender=object(),
+    )
+
+    handler.handle_task(TaskConfirmationWork(confirmation_id="abc-123", decision=ConfirmationDecision.REJECT))
+
     assert client.sent == []
     assert orchestrator.received_prompts == []
 

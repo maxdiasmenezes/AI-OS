@@ -30,7 +30,12 @@ from interfaces.whatsapp.server import (
     WhatsAppServer,
     build_orchestrator,
 )
-from interfaces.whatsapp.task_control import TaskExecutionWork, compute_dedup_key
+from interfaces.whatsapp.task_control import (
+    ConfirmationDecision,
+    TaskConfirmationWork,
+    TaskExecutionWork,
+    compute_dedup_key,
+)
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.employee_tasks import (
@@ -43,7 +48,7 @@ from kernel.models.base import ModelProvider, ModelRequestOptions, ModelResponse
 from kernel.task_planner import PlanStep, StepKind, TaskPlan, build_catalog, serialize_plan
 from kernel.tools.config import RepoBackupSpec, ToolsConfig
 from kernel.tools.registry import ActionRegistry
-from kernel.tools.types import ActionResult
+from kernel.tools.types import ActionRequest, ActionResult
 
 _APP_SECRET = "test-app-secret"
 _VERIFY_TOKEN = "test-verify-token"
@@ -2219,12 +2224,15 @@ def test_legacy_task_router_and_confirmation_store_never_reached_for_whatsapp_ta
         thread.join(timeout=5)
 
 
-def test_standalone_confirm_and_reject_remain_ordinary_chat_in_p1(tmp_path):
-    # Milestone 46 adversarial review, §14: bare "CONFIRM <id>"/"REJECT <id>"
-    # (not "/task confirm"/"/task cancel") are NOT intercepted in P1 - they
-    # must reach the orchestrator as ordinary conversational text, never
-    # enter durable task-confirmation handling, and never touch the legacy
-    # ConfirmationStore either. P2 will intercept these; P1 must not.
+def test_standalone_confirm_and_reject_are_recognized_and_resolved_in_p2b(tmp_path):
+    # Milestone 46 P2B: bare "CONFIRM <id>"/"REJECT <id>" (not "/task
+    # confirm"/"/task cancel") are now recognized command shapes -
+    # superseding the P1-era boundary (this test's own prior name/behavior,
+    # preserved in git history) where they were still ordinary chat.
+    # "abc-123" is a well-formed token shape but not a real pending
+    # confirmation, so both must resolve to the generic invalid reply,
+    # NEVER reach the orchestrator, and never touch TaskRepository/the
+    # legacy ConfirmationStore.
     orchestrator = FakeOrchestrator("ordinary chat response")
     planner = _FakePlannerProvider()
     server, client, db_path = _make_server_with_tasks(tmp_path, planner, orchestrator=orchestrator)
@@ -2237,15 +2245,15 @@ def test_standalone_confirm_and_reject_remain_ordinary_chat_in_p1(tmp_path):
         assert _post(server, _envelope("wamid.reject1", _AUTHORIZED_SENDER, text="REJECT abc-123")) == 200
 
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(orchestrator.received_prompts) < 2:
+        while time.monotonic() < deadline and len(client.sent) < 2:
             time.sleep(0.02)
 
-        # Reached the orchestrator as plain text, verbatim - never
-        # specially parsed, never diverted into a durable TaskRecord.
-        assert orchestrator.received_prompts == ["CONFIRM abc-123", "REJECT abc-123"]
+        # Never reached the orchestrator - recognized and resolved entirely
+        # within task_control's own confirmation handling.
+        assert orchestrator.received_prompts == []
         assert client.sent == [
-            (_AUTHORIZED_SENDER, "ordinary chat response"),
-            (_AUTHORIZED_SENDER, "ordinary chat response"),
+            (_AUTHORIZED_SENDER, "That confirmation is no longer valid."),
+            (_AUTHORIZED_SENDER, "That confirmation is no longer valid."),
         ]
         assert _list_tasks(db_path) == []
         assert planner.calls == []
@@ -2501,3 +2509,359 @@ def test_build_orchestrator_passes_the_same_scoped_memory_to_the_capability_load
     orchestrator.handle("What wine goes with steak?")
 
     assert isinstance(captured["memory"], FixedNamespaceMemory)
+
+
+# =============================================================================
+# Milestone 46 P2B: CONFIRM/REJECT ingress, real HTTP + worker E2E
+# =============================================================================
+
+
+class _FakeSuccessExecutor:
+    """Records every ActionRequest it receives and always reports success -
+    used so a real CONFIRM can genuinely reach and pass through the
+    execution boundary without ever running a real computer action."""
+
+    def __init__(self):
+        self.calls: list[ActionRequest] = []
+
+    def execute(self, request: ActionRequest) -> ActionResult:
+        self.calls.append(request)
+        return ActionResult(True, f"'{request.resource_key}' launched.", "executed")
+
+
+def _confirmation_id_from_message(text: str) -> str:
+    for line in text.splitlines():
+        if line.startswith("CONFIRM "):
+            return line[len("CONFIRM "):]
+    raise AssertionError(f"no CONFIRM line found in confirmation message: {text!r}")
+
+
+def test_valid_confirm_via_real_http_executes_and_delivers_terminal_result(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    try:
+        assert _post(server, _envelope("wamid.p2bconfirm1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        assert len(client.sent) == 1
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        assert _post(
+            server, _envelope("wamid.p2bconfirm2", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        ) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 2:
+            time.sleep(0.02)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    assert len(executor_calls.calls) == 1
+    assert len(client.sent) == 2
+    tasks = _list_tasks(db_path)
+    assert len(tasks) == 1
+    assert tasks[0].state == TaskState.COMPLETED
+
+
+def test_valid_reject_via_real_http_cancels_task(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.p2breject1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        assert _post(
+            server, _envelope("wamid.p2breject2", _AUTHORIZED_SENDER, text=f"REJECT {confirmation_id}")
+        ) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 2:
+            time.sleep(0.02)
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+    assert client.sent[1] == (_AUTHORIZED_SENDER, "Task cancelled.")
+    tasks = _list_tasks(db_path)
+    assert len(tasks) == 1
+    assert tasks[0].state == TaskState.CANCELLED
+
+
+def test_confirmation_queue_full_returns_503_confirmation_remains_pending(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner, queue_capacity=1)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        assert _post(server, _envelope("wamid.p2bqueue1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        # Block the WORKER itself (not merely occupy a queue slot - a
+        # single idle worker dequeues immediately, so one blocking item
+        # alone never leaves the queue "full"): the first blocking message
+        # is dequeued and blocks the worker in place; a SECOND ordinary
+        # message then genuinely occupies the queue's one free slot,
+        # unconsumed, while the worker is busy.
+        blocking = BlockingOrchestrator()
+        server._message_handler._orchestrator = blocking
+        assert _post(server, _envelope("wamid.p2bblock1", _AUTHORIZED_SENDER, text="hello")) == 200
+        assert blocking.started.wait(timeout=2)
+        assert _post(server, _envelope("wamid.p2bblock2", _AUTHORIZED_SENDER, text="hello again")) == 200
+
+        status = _post(
+            server, _envelope("wamid.p2bqueuefull", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        )
+        assert status == 503
+
+        # Confirmation remains fully pending/unconsumed - no durable
+        # mutation happened on the HTTP thread.
+        tasks = _list_tasks(db_path)
+        assert tasks[0].state == TaskState.WAITING_FOR_CONFIRMATION
+
+        blocking.release()
+
+        # A retry (Meta redelivery of the same message) can now queue
+        # successfully once the worker has drained the backlog.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and tasks[0].state == TaskState.WAITING_FOR_CONFIRMATION:
+            tasks = _list_tasks(db_path)
+            time.sleep(0.02)
+        assert _post(
+            server, _envelope("wamid.p2bqueuefull", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        ) == 200
+    finally:
+        blocking.release()
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_two_pending_tasks_confirming_one_leaves_the_other_untouched(tmp_path):
+    planner = _FakePlannerProvider(
+        [_valid_plan_raw(_task_catalog(), objective="Open notepad.") for _ in range(2)]
+    )
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    try:
+        assert _post(server, _envelope("wamid.p2btwoA", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_a = _confirmation_id_from_message(client.sent[0][1])
+
+        assert _post(
+            server, _envelope("wamid.p2btwoB", _AUTHORIZED_SENDER, text="/task open notepad again")
+        ) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 2:
+            time.sleep(0.02)
+        confirmation_b = _confirmation_id_from_message(client.sent[1][1])
+        assert confirmation_a != confirmation_b
+
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        assert _post(
+            server, _envelope("wamid.p2btwoC", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_b}")
+        ) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 3:
+            time.sleep(0.02)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    tasks = {t.request_text: t for t in _list_tasks(db_path)}
+    assert tasks["open notepad"].state == TaskState.WAITING_FOR_CONFIRMATION  # A untouched
+    assert tasks["open notepad again"].state == TaskState.COMPLETED  # B confirmed/completed
+    assert len(executor_calls.calls) == 1
+
+
+def test_duplicate_confirmation_work_items_second_gets_generic_invalid(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    try:
+        assert _post(server, _envelope("wamid.p2bdup1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        # Manually enqueue the SAME TaskConfirmationWork twice - proves
+        # durable consume-once semantics independent of transport dedup.
+        work = TaskConfirmationWork(confirmation_id=confirmation_id, decision=ConfirmationDecision.CONFIRM)
+        server._queue.put(work)
+        server._queue.put(work)
+
+        # Three total messages expected: the original confirmation request,
+        # the first work item's real terminal result, and the second (now
+        # already-consumed) work item's generic invalid reply.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 3:
+            time.sleep(0.02)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    assert len(executor_calls.calls) == 1
+    assert len(client.sent) == 3
+    assert client.sent[2][1] == "That confirmation is no longer valid."
+    assert _list_tasks(db_path)[0].state == TaskState.COMPLETED
+
+
+def test_concurrent_confirm_and_reject_worker_serializes_confirm_wins(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    try:
+        assert _post(server, _envelope("wamid.p2brace1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        # Deterministic ordering: enqueue CONFIRM directly ahead of REJECT
+        # (no wall-clock race) - the single worker thread guarantees
+        # strict FIFO processing, so CONFIRM is guaranteed to be resolved
+        # first.
+        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.CONFIRM))
+        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.REJECT))
+
+        # Three total messages: confirmation request, CONFIRM's real
+        # result, REJECT's generic invalid reply.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 3:
+            time.sleep(0.02)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    assert len(executor_calls.calls) == 1  # CONFIRM executed
+    assert client.sent[1][1] == "'notepad' launched."  # CONFIRM's real result
+    assert client.sent[2][1] == "That confirmation is no longer valid."  # REJECT lost the race
+    assert _list_tasks(db_path)[0].state == TaskState.COMPLETED  # never CANCELLED
+
+
+def test_concurrent_confirm_and_reject_worker_serializes_reject_wins(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    try:
+        assert _post(server, _envelope("wamid.p2brace2", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.REJECT))
+        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.CONFIRM))
+
+        # Three total messages: confirmation request, REJECT's real
+        # cancellation, CONFIRM's generic invalid reply.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 3:
+            time.sleep(0.02)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    assert len(executor_calls.calls) == 0  # CONFIRM never executed - REJECT already won
+    assert client.sent[1][1] == "Task cancelled."  # REJECT's real result
+    assert client.sent[2][1] == "That confirmation is no longer valid."  # CONFIRM lost the race
+    assert _list_tasks(db_path)[0].state == TaskState.CANCELLED  # never COMPLETED
+
+
+def test_http_thread_never_executes_confirm_action(tmp_path):
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    blocking_executor = _BlockingExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    try:
+        assert _post(server, _envelope("wamid.p2bhttp1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        task_control_module.SafeTaskExecutor = lambda *a, **k: blocking_executor
+
+        # The webhook POST must complete and return 200 WITHOUT ever
+        # waiting on the (currently blocked) executor call - a call-path
+        # proof, not a timing race: urlopen() only returns once the HTTP
+        # response has actually been sent.
+        status = _post(
+            server, _envelope("wamid.p2bhttp2", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        )
+        assert status == 200
+
+        # Only now does the worker thread reach the (still-blocked)
+        # executor call - proving execution genuinely happens, just
+        # asynchronously, off the webhook HTTP thread.
+        assert blocking_executor.started.wait(timeout=2)
+        assert len(client.sent) == 1  # the terminal result has not been sent yet
+    finally:
+        blocking_executor.release()
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)

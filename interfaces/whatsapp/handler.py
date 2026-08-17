@@ -28,8 +28,21 @@ RESPOND text, and send exactly one outbound WhatsApp lifecycle message
 (terminal result/failure, or a confirmation request) per newly-produced
 lifecycle event - see task_control.py's own module docstring for the
 transition-triggered delivery rule that prevents a duplicate dispatch from
-resending one. CONFIRM/REJECT ingress and durable approval/rejection
-remain Milestone 46 P2B - not implemented here.
+resending one.
+
+Milestone 46 P2B adds a THIRD, likewise unrelated kind of queued work:
+task_control.py's TaskConfirmationWork(confirmation_id, decision) - the
+durable approve/deny handoff for a "CONFIRM <id>"/"REJECT <id>" message.
+Handling one is entirely delegated to
+task_control.dispatch_confirmation_work(), reusing the exact same
+long-lived TaskRepository/ActionRegistry/ToolsConfig loader/general
+conversational ModelProvider already wired for TaskExecutionWork above -
+no separate confirmation-specific dependency exists. This module still
+performs no reverse lookup, authorization, approval, denial, or execution
+logic itself, only wiring - see dispatch_confirmation_work()'s own
+docstring for why approve_task_confirmation() (which may execute a
+sensitive action synchronously) must never be reachable except from here,
+on the worker, never the webhook HTTP thread.
 """
 
 import logging
@@ -39,10 +52,14 @@ from kernel.orchestrator.context import RequestContext
 
 from interfaces.whatsapp.client import WhatsAppClientError
 from interfaces.whatsapp.task_control import (
+    ConfirmationFixedReply,
+    TaskConfirmationWork,
     TaskExecutionWork,
     TaskFixedReply,
     TaskRequestText,
+    classify_confirmation_text,
     classify_task_text,
+    dispatch_confirmation_work,
     dispatch_task_work,
 )
 
@@ -110,9 +127,20 @@ def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_
     confirm/cancel migration notice - none of these ever reach
     TaskRepository) or a TaskRequestText, unchanged, for server.py's POST
     handling to durably accept - this function itself performs no I/O and
-    creates no TaskRecord. Every other message (including ordinary text
-    that doesn't match the /task prefix) is classified exactly as before
-    Milestone 46."""
+    creates no TaskRecord.
+
+    Milestone 46 P2B: a "CONFIRM <id>"/"REJECT <id>" message (checked only
+    after the "/task" check above has already ruled it out - the two
+    grammars are mutually exclusive by construction) is likewise
+    recognized here via task_control.classify_confirmation_text() and
+    returned as either a ConfirmationFixedReply-wrapping FixedReplyTask
+    (a malformed command shape - never reaches TaskRepository) or a
+    TaskConfirmationWork, unchanged, for the worker to resolve/authorize/
+    act on - this function still performs no I/O, no reverse lookup, and
+    no authorization decision of any kind.
+
+    Every other message (including ordinary text that doesn't match
+    either grammar) is classified exactly as before Milestone 46."""
 
     if message.message_type != "text":
         return FixedReplyTask(message.sender, UNSUPPORTED_MESSAGE_REPLY)
@@ -129,6 +157,12 @@ def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_
         return FixedReplyTask(message.sender, task_classification.reply_text)
     if isinstance(task_classification, TaskRequestText):
         return task_classification
+
+    confirmation_classification = classify_confirmation_text(text)
+    if isinstance(confirmation_classification, ConfirmationFixedReply):
+        return FixedReplyTask(message.sender, confirmation_classification.reply_text)
+    if isinstance(confirmation_classification, TaskConfirmationWork):
+        return confirmation_classification
 
     return TextTask(message.sender, text)
 
@@ -222,21 +256,45 @@ class MessageHandler:
             self._reply(task.sender, task.reply_text)
         elif isinstance(task, TaskExecutionWork):
             self._handle_task_execution_work(task)
+        elif isinstance(task, TaskConfirmationWork):
+            self._handle_confirmation_work(task)
         else:
             raise TypeError(f"unsupported task type: {type(task).__name__}")
 
     def _handle_task_execution_work(self, task: TaskExecutionWork) -> None:
-        # Milestone 46 P2A's only execution boundary: the full
-        # planning -> execution -> delivery flow, via
-        # task_control.dispatch_task_work() - see that function's own
-        # docstring for the transition-triggered delivery rule. Never
-        # calls approve_task_confirmation()/deny_task_confirmation()
-        # (Milestone 46 P2B).
+        # Milestone 46 P2A's execution boundary: the full planning ->
+        # execution -> delivery flow, via task_control.dispatch_task_work()
+        # - see that function's own docstring for the transition-triggered
+        # delivery rule. Never calls approve_task_confirmation()/
+        # deny_task_confirmation() - that is _handle_confirmation_work()'s
+        # boundary alone (Milestone 46 P2B), reached only via a distinct
+        # queued work-item type, never from here.
         dispatch_task_work(
             self._task_repository,
             task.task_id,
             self._task_catalog,
             self._planner_provider,
+            self._action_registry,
+            self._tools_config_loader,
+            self._respond_provider,
+            self._client,
+            self._authorized_sender,
+        )
+
+    def _handle_confirmation_work(self, task: TaskConfirmationWork) -> None:
+        # Milestone 46 P2B's only confirmation-decision boundary: the full
+        # reverse-lookup -> authorization -> approve/deny -> (for CONFIRM)
+        # post-approval continuation -> delivery flow, via
+        # task_control.dispatch_confirmation_work() - see that function's
+        # own docstring for the exact authority order and why
+        # approve_task_confirmation() (which may execute a sensitive
+        # action synchronously) must never be reachable from the webhook
+        # HTTP thread. Reuses the exact same execution-time dependencies
+        # already wired for TaskExecutionWork - no separate confirmation
+        # config/provider/registry exists.
+        dispatch_confirmation_work(
+            self._task_repository,
+            task,
             self._action_registry,
             self._tools_config_loader,
             self._respond_provider,

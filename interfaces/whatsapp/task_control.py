@@ -22,10 +22,32 @@ execution boundary this module ever calls - never a handler, never a tool
 directly), RESPOND synthesis through an injected general conversational
 ModelProvider (never the structured planner provider), terminal
 result/failure delivery, and confirmation-*request* delivery when a
-sensitive step blocks. This module still never calls
-approve_task_confirmation()/deny_task_confirmation() and never resolves a
-confirmation_id back to a task - CONFIRM/REJECT ingress, durable
-approval/rejection, and post-confirmation continuation are Milestone 46 P2B.
+sensitive step blocks.
+
+P2B scope: deterministic "CONFIRM <id>"/"REJECT <id>" command recognition
+(classify_confirmation_text()), resolving a confirmation_id back to its
+durably-waiting task (TaskRepository.get_task_by_pending_confirmation_id()),
+WhatsApp-source/current-state authorization, and durable approval/denial
+through the SAME existing approve_task_confirmation()/
+deny_task_confirmation() functions this module previously only referenced
+in comments - see dispatch_confirmation_work()'s own docstring for the
+full authority order, the post-approval continuation (still exclusively
+through run_task_until_blocked(), never a duplicated execution loop), and
+why every kind of invalid/stale/wrong-source confirmation attempt produces
+the identical generic reply. Like dispatch_task_work(), this is reachable
+only from the worker thread - never the webhook HTTP thread - because
+approve_task_confirmation() may execute a sensitive action synchronously.
+No new durable state, no schema change: get_task_by_pending_confirmation_id()
+is a plain read against confirmation_id's existing UNIQUE constraint.
+HTTP 200 for a CONFIRM/REJECT message means the command was accepted onto
+the in-memory worker queue for processing - it is not a durable-decision
+acknowledgement, and does not by itself guarantee the decision survives a
+process crash before the worker consumes it (see
+dispatch_confirmation_work()'s own docstring and docs/architecture.md for
+why this is a deliberately accepted boundary, not an oversight: the
+pending confirmation itself remains fully durable and safely re-sendable
+either way, unlike a brand-new "/task" request P1 durably accepts before
+ever returning success).
 
 TRANSITION-TRIGGERED DELIVERY (load-bearing - see dispatch_task_work()'s and
 _deliver_execution_result()'s own docstrings for the exact mechanics): a
@@ -90,10 +112,17 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass
+from enum import Enum
 
 from kernel.employee_tasks import (
+    ConfirmationMismatchError,
     DuplicateTaskError,
+    InvalidTransitionError,
+    NoPendingConfirmationError,
+    StepAlreadyClaimedError,
     StepStatus,
+    TaskInputTooLargeError,
+    TaskNotFoundError,
     TaskRecord,
     TaskRepository,
     TaskState,
@@ -102,6 +131,8 @@ from kernel.employee_tasks import (
 from kernel.task_execution import (
     ExecutionAdvanceStatus,
     ObservationDeserializationError,
+    approve_task_confirmation,
+    deny_task_confirmation,
     deserialize_observation,
     run_task_until_blocked,
 )
@@ -148,6 +179,29 @@ _TASK_PREFIX_PATTERN = re.compile(r"^/task(\s|$)", re.IGNORECASE)
 # to become ordinary natural-language request text below.
 _LEGACY_HELP_VERBS = frozenset({"help"})
 _LEGACY_MIGRATION_VERBS = frozenset({"confirm", "cancel"})
+
+# Milestone 46 P2B: the CONFIRM/REJECT command grammar - deterministic,
+# no LLM, no fuzzy matching (mirrors _TASK_PREFIX_PATTERN's own discipline
+# exactly). The verb is matched case-insensitively; the zero-width
+# (?=\s|$) lookahead (rather than a consuming group, as _TASK_PREFIX_PATTERN
+# uses) means match.end() lands immediately after the verb with nothing
+# extra to strip off, and - critically - means "CONFIRMabc"/"REJECTIONxyz"
+# (no separator, or a longer word that merely starts with the verb) never
+# matches at all, since the lookahead requires the very next character to
+# be whitespace or end-of-string. Ordinary prose that happens to start
+# with these words as a longer word ("CONFIRMATION is important",
+# "REJECTION reason") is therefore never mistaken for a command - see
+# classify_confirmation_text()'s own docstring for the full grammar.
+_CONFIRMATION_PREFIX_PATTERN = re.compile(r"^(CONFIRM|REJECT)(?=\s|$)", re.IGNORECASE)
+
+# Milestone 46 P2B: one fixed, code-owned reply for every way a CONFIRM/
+# REJECT command can fail to produce a real durable decision - malformed
+# shape, a repository-invalid token, an unknown token, an already-
+# consumed/rejected token, a wrong-source token, or a wrong-state token.
+# Deliberately identical text for every one of these - see
+# dispatch_confirmation_work()'s own docstring for why disclosing which
+# case actually happened would be an oracle leak.
+_GENERIC_INVALID_CONFIRMATION_TEXT = "That confirmation is no longer valid."
 
 TASK_SOURCE = "whatsapp"
 
@@ -230,6 +284,111 @@ def classify_task_text(text: str) -> TaskFixedReply | TaskRequestText | None:
         return TaskFixedReply(_TASK_MIGRATION_TEXT)
 
     return TaskRequestText(remainder)
+
+
+class ConfirmationDecision(Enum):
+    """What a well-formed CONFIRM/REJECT command asked for - never
+    anything else; there is no third decision, and no interactive
+    clarification of an ambiguous one (see classify_confirmation_text()'s
+    own docstring for the exact grammar that produces this)."""
+
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True)
+class TaskConfirmationWork:
+    """Minimal, trusted correlation handed to the WhatsApp worker queue for
+    a CONFIRM/REJECT command - confirmation_id and decision only, exactly
+    like TaskExecutionWork carries only a bare task_id (see that
+    dataclass's own docstring for why). Deliberately carries no task_id,
+    sender, provider message ID, raw message text, action_name,
+    resource_key, or anything else: the worker derives every authorization
+    decision from durable state, reached by resolving confirmation_id
+    itself via TaskRepository.get_task_by_pending_confirmation_id() (see
+    dispatch_confirmation_work()) - never by trusting anything this queue
+    item happens to carry."""
+
+    confirmation_id: str
+    decision: ConfirmationDecision
+
+
+@dataclass(frozen=True)
+class ConfirmationFixedReply:
+    """A pre-decided fixed reply for a recognized-but-malformed CONFIRM/
+    REJECT command that never touches TaskRepository - the command-shape
+    equivalent of TaskFixedReply for bare/malformed "/task ...". Always
+    carries _GENERIC_INVALID_CONFIRMATION_TEXT today; a distinct dataclass
+    from TaskFixedReply purely so a caller can route it through the exact
+    same authorized-sender-derived FixedReplyTask delivery path without
+    conflating the two command families' own docstrings."""
+
+    reply_text: str
+
+
+def classify_confirmation_text(text: str) -> ConfirmationFixedReply | TaskConfirmationWork | None:
+    """Pure - no I/O, no database access, no repository-bound validation
+    of confirmation_id itself (that remains
+    TaskRepository.get_task_by_pending_confirmation_id()'s job - see this
+    module's own module docstring on why the parser deliberately does not
+    duplicate it).
+
+    PRECONDITION (adversarial review): `text` must already be stripped of
+    leading/trailing whitespace by the caller - this function's own
+    `_CONFIRMATION_PREFIX_PATTERN` is anchored at position 0 and does not
+    skip leading whitespace itself, exactly like classify_task_text()'s
+    own `_TASK_PREFIX_PATTERN` has the identical precondition for "/task".
+    interfaces/whatsapp/handler.py:classify_message() (this function's
+    sole production caller) already strips every inbound message
+    (`text = (message.text or "").strip()`) before calling either parser,
+    so in production, leading/trailing whitespace around "CONFIRM"/"REJECT"
+    is transparently tolerated (confirmed empirically: "   CONFIRM abc",
+    "\\tCONFIRM abc", and "\\nCONFIRM abc" all correctly parse once passed
+    through classify_message()) - but calling this function directly, in
+    isolation, with unstripped leading whitespace returns None instead of
+    the expected command, exactly as classify_task_text() would.
+
+    Returns None if `text` is not a CONFIRM/REJECT command
+    at all (ordinary chat, unchanged - the caller should fall through to
+    the existing conversational path exactly like a non-"/task" message
+    already does).
+
+    Grammar: the verb (CONFIRM or REJECT) is matched case-insensitively,
+    and only when immediately followed by whitespace or end-of-string
+    (_CONFIRMATION_PREFIX_PATTERN's own zero-width lookahead) - so
+    "CONFIRMabc", "CONFIRMATION is important", and "REJECTION reason" are
+    never mistaken for a command; they fall through as ordinary chat
+    exactly like any other prose. Once the prefix matches, the remainder
+    is whitespace-stripped and split on any run of whitespace (handles
+    multiple spaces, tabs, or embedded newlines identically - Python's own
+    str.split() with no arguments). Exactly one resulting word is a
+    well-formed command - that word becomes confirmation_id, preserved
+    EXACTLY as typed (never case-folded, never trimmed further - the
+    repository's own confirmation_id comparison is exact-equality and
+    case-sensitive, since real confirmation_id values are lowercase UUID7
+    text and a case-mismatched CONFIRM/REJECT must fail exactly like an
+    unknown token does, not be "helpfully" normalized into a match nobody
+    asked for). Zero words (a bare "CONFIRM"/"REJECT") or two-or-more
+    words ("CONFIRM abc extra", "CONFIRM token token") are BOTH
+    recognized-but-malformed - the identical ConfirmationFixedReply either
+    way, decided entirely here with no repository/worker involvement at
+    all, and no different from an unknown-but-well-formed token's eventual
+    worker-side reply (see dispatch_confirmation_work()'s own docstring on
+    why every one of these must produce indistinguishable text)."""
+
+    match = _CONFIRMATION_PREFIX_PATTERN.match(text)
+    if match is None:
+        return None
+
+    decision = (
+        ConfirmationDecision.CONFIRM if match.group(1).upper() == "CONFIRM" else ConfirmationDecision.REJECT
+    )
+    remainder = text[match.end():].strip()
+    parts = remainder.split()
+    if len(parts) != 1:
+        return ConfirmationFixedReply(_GENERIC_INVALID_CONFIRMATION_TEXT)
+
+    return TaskConfirmationWork(confirmation_id=parts[0], decision=decision)
 
 
 class DurableAcceptanceFailed(Exception):
@@ -619,4 +778,178 @@ def dispatch_task_work(
     tools_config = tools_config_loader()
     executor = SafeTaskExecutor(tools_config, registry)
     result = run_task_until_blocked(task, repository, registry, tools_config, executor, respond_provider)
+    _deliver_execution_result(result, repository, client, authorized_sender)
+
+
+# Milestone 46 adversarial review, "narrow expected-exception handling":
+# every one of these is what a genuine, already-lost race for the SAME
+# confirmation_id looks like from approve_task_confirmation()/
+# deny_task_confirmation()'s own internals - the pending row or task state
+# changed out from under a call that had just, moments earlier in this
+# exact worker turn, observed it as valid. Structurally near-unreachable
+# given the worker's own single-threaded serialization (see
+# dispatch_confirmation_work()'s own docstring), but never assumed away,
+# exactly like dispatch_task_work() catches TaskNotInCreatedStateError as
+# defense in depth. TaskStorageUnavailableError and
+# TaskNotWaitingForConfirmationError are deliberately NOT in this set -
+# the former is a genuine storage defect, and the latter would only ever
+# fire if this module's own pre-call state check below had a bug - both
+# must propagate to the worker's own generic error boundary, never be
+# mislabeled as an ordinary invalid confirmation.
+_CONFIRMATION_RACE_LOST_EXCEPTIONS = (
+    NoPendingConfirmationError,
+    ConfirmationMismatchError,
+    InvalidTransitionError,
+    StepAlreadyClaimedError,
+    TaskNotFoundError,
+)
+
+
+def dispatch_confirmation_work(
+    repository: TaskRepository,
+    work: TaskConfirmationWork,
+    registry,
+    tools_config_loader,
+    respond_provider,
+    client,
+    authorized_sender: str,
+) -> None:
+    """Worker-side: the full Milestone 46 P2B reverse-lookup -> source/
+    state authorization -> approve-or-deny -> (for CONFIRM only) post-
+    approval continuation -> delivery flow for one CONFIRM/REJECT command.
+    This is P2B's ONLY confirmation-decision boundary - never called from
+    the webhook HTTP thread (see this module's own module docstring on the
+    connection-lifecycle split, and interfaces/whatsapp/server.py's do_POST,
+    which only ever parses/queues a TaskConfirmationWork, never resolves,
+    authorizes, or executes one).
+
+    AUTHORITY ORDER (security-critical - every check below MUST precede
+    any mutating call): (1) resolve confirmation_id via
+    TaskRepository.get_task_by_pending_confirmation_id() - a bare token
+    alone proves nothing; (2) the resolved task must exist; (3) its source
+    must be TASK_SOURCE ("whatsapp") - a valid confirmation_id belonging to
+    some OTHER source's task must never be actionable from this channel,
+    even though today's deployment has exactly one authorized WhatsApp
+    sender; (4) its state must still be WAITING_FOR_CONFIRMATION. Only once
+    all four hold does this function ever call
+    approve_task_confirmation()/deny_task_confirmation() - see
+    _GENERIC_INVALID_CONFIRMATION_TEXT's own docstring for why every
+    failure of any of these four checks, plus a malformed/oversized token
+    (TaskInputTooLargeError from the reverse lookup itself) and the narrow
+    race-lost exception set below, all produce the exact same reply: never
+    disclosing whether a token ever existed, which source it belonged to,
+    or its current/former state.
+
+    EXCEPTION SCOPE (Milestone 46 adversarial review, H1 correction -
+    load-bearing): _CONFIRMATION_RACE_LOST_EXCEPTIONS is caught ONLY around
+    the approve_task_confirmation()/deny_task_confirmation() call itself -
+    never around the post-approval run_task_until_blocked() continuation
+    below. Once approve_task_confirmation() has returned successfully, the
+    confirmation was genuinely valid, has already been durably consumed,
+    and (for a sensitive step) the approved action has already executed -
+    "is this confirmation still valid" is no longer a meaningful question
+    for anything that happens afterward. run_task_until_blocked() from
+    that point on is ordinary autonomous execution, identical in kind to
+    dispatch_task_work()'s own call to the same function - which is
+    likewise never wrapped in any confirmation-specific exception
+    handling. An exception escaping the continuation therefore propagates
+    UNCAUGHT to the caller's own generic worker-error boundary, exactly
+    like dispatch_task_work()'s does - it must never be mapped to
+    "That confirmation is no longer valid.", which would both lie to the
+    user (their confirmation WAS valid and DID execute) and silently hide
+    a genuine execution-engine defect from every log/monitor that would
+    otherwise see it as worker_error.
+
+    CONFIRM: reloads ToolsConfig fresh (see this module's own module
+    docstring on why - never a snapshot from whenever the confirmation was
+    originally proposed, possibly minutes or hours earlier) and constructs
+    a fresh SafeTaskExecutor from it, then calls
+    approve_task_confirmation() - the ONLY function this module ever calls
+    that may execute a sensitive action; this module never calls
+    SafeTaskExecutor.execute() directly. approve_task_confirmation() only
+    ever returns STEP_SUCCEEDED (the approved step executed; more of the
+    plan may remain) or TASK_FAILED (current-config revalidation failure,
+    plan-integrity failure, or genuine confirmation expiry - the latter
+    handled entirely inside approve_task_confirmation() itself via
+    ConfirmationExpiredError, never surfacing here as an exception) -
+    verified directly from kernel/task_execution/service.py's own source,
+    never assumed. STEP_SUCCEEDED continues, unconditionally and OUTSIDE
+    the race-lost try/except (see above), through the EXISTING
+    run_task_until_blocked() - never a second, duplicated execution loop -
+    which may itself complete the task, fail it, execute further
+    non-sensitive steps, synthesize a RESPOND step, or reach a LATER
+    sensitive step and propose a brand-new, distinct confirmation_id
+    (unlimited bounded-by-plan confirmation rounds - no "already used
+    once" assumption anywhere in this module).
+
+    REJECT: calls deny_task_confirmation() only - no ToolsConfig load, no
+    SafeTaskExecutor, no model, matching that function's own signature
+    (it needs neither), and no continuation of any kind (deny never
+    produces STEP_SUCCEEDED). deny_confirmation() (the repository layer
+    beneath it) does NOT check confirmation_id's expires_at at all - a
+    plain rejection can never authorize or execute anything, so an exact
+    REJECT against a still-pending, still-WAITING_FOR_CONFIRMATION row is
+    allowed to cancel the task even past its nominal TTL. This is
+    deliberate, not an inconsistency with CONFIRM's own expiry
+    enforcement: CONFIRM must fail closed on expiry because it is an
+    authorization decision; REJECT never was one.
+
+    DELIVERY: whatever result either path produces - TASK_FAILED,
+    TASK_CANCELLED, or (via the run_task_until_blocked() continuation)
+    TASK_COMPLETED/CONFIRMATION_REQUIRED - is delivered through the
+    EXISTING, unmodified _deliver_execution_result() (P2A's own
+    transition-triggered delivery boundary - see that function's and this
+    module's own module docstring for the exact proof). No standalone
+    "Confirmation accepted" acknowledgement is ever sent for a successful
+    CONFIRM - the eventual result (or the next confirmation request) is
+    the only message a successful approval ever produces, deliberately
+    avoiding both extra lifecycle noise and a second place duplicate
+    delivery would need to be proven safe.
+
+    `repository` is the caller's own long-lived TaskRepository instance
+    (see this module's own module docstring) - never opened or closed
+    here. Every send uses `authorized_sender` only - never derived from
+    `task`, the confirmation lookup, work.confirmation_id, or model
+    output."""
+
+    try:
+        task = repository.get_task_by_pending_confirmation_id(work.confirmation_id)
+    except TaskInputTooLargeError:
+        _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+        return
+
+    if task is None or task.source != TASK_SOURCE or task.state is not TaskState.WAITING_FOR_CONFIRMATION:
+        _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+        return
+
+    if work.decision is ConfirmationDecision.REJECT:
+        try:
+            result = deny_task_confirmation(task, repository, work.confirmation_id)
+        except _CONFIRMATION_RACE_LOST_EXCEPTIONS:
+            _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+            return
+    else:
+        tools_config = tools_config_loader()
+        executor = SafeTaskExecutor(tools_config, registry)
+        try:
+            result = approve_task_confirmation(
+                task, repository, registry, tools_config, executor, work.confirmation_id
+            )
+        except _CONFIRMATION_RACE_LOST_EXCEPTIONS:
+            _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+            return
+
+        # Outside the race-lost try/except, deliberately: the confirmation
+        # has already been validly consumed by this point (see this
+        # function's own EXCEPTION SCOPE docstring section above) - any
+        # exception from here on is ordinary execution-engine behavior,
+        # never a stale-confirmation condition, and must reach the
+        # worker's own generic error boundary uncaught, exactly like
+        # dispatch_task_work()'s own unwrapped run_task_until_blocked()
+        # call.
+        if result.status is ExecutionAdvanceStatus.STEP_SUCCEEDED:
+            result = run_task_until_blocked(
+                result.task, repository, registry, tools_config, executor, respond_provider
+            )
+
     _deliver_execution_result(result, repository, client, authorized_sender)

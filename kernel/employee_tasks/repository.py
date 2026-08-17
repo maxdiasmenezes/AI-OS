@@ -1228,6 +1228,54 @@ class TaskRepository:
             return None
         return _row_to_pending_confirmation(row)
 
+    def get_task_by_pending_confirmation_id(self, confirmation_id: str) -> TaskRecord | None:
+        """Milestone 46 P2B: the reverse-lookup CONFIRM/REJECT ingress
+        needs - confirmation_id -> the task currently awaiting it. None
+        means no pending confirmation currently has this confirmation_id -
+        never a task-identity check, and never raises TaskNotFoundError,
+        exactly like get_pending_confirmation() above (never assumed to
+        already know the task_id, unlike every other method in this
+        class). Deliberately naive about WHY a confirmation_id might not
+        resolve - already approved, already rejected, expired-and-lazily-
+        resolved, or never issued at all are all structurally
+        indistinguishable here: every one of consume_confirmation_and_claim_step()/
+        deny_confirmation()/fail_pending_confirmation() deletes the pending
+        row in the same atomic transaction as its own state transition, so
+        a once-valid, now-resolved confirmation_id and a token that was
+        never real produce the identical None here - the caller's own
+        generic "no longer valid" response for both is what keeps a wrong-
+        or-stale-token attempt from disclosing which case actually
+        happened.
+
+        confirmation_id is bounded/validated exactly like every other
+        confirmation-id parameter in this class (_validate_confirmation_id())
+        - not because this method mutates anything, but so a malformed
+        caller-supplied token (wrong type, empty, oversized, or NUL-
+        containing) fails the same way it would anywhere else in this
+        class, via the same TaskInputTooLargeError, rather than silently
+        matching nothing or reaching SQLite as an unvalidated value.
+
+        A plain, parameterized equality lookup against confirmation_id's
+        existing UNIQUE constraint (kernel/employee_tasks/db.py's own
+        task_pending_confirmation table - no new index, no schema change).
+        task_id here is never treated as a source/channel authority
+        decision - this method performs no source filtering of its own
+        (see TaskRecord.source, a plain column this method already returns
+        via get_task() below) - that policy belongs entirely to the
+        caller, exactly like every other authorization decision in this
+        codebase lives outside kernel/employee_tasks/ (see this package's
+        own "policy-free" doctrine, referenced throughout this module).
+        Performs no mutation of any kind."""
+
+        confirmation_id = _validate_confirmation_id(confirmation_id)
+        row = self._conn.execute(
+            "SELECT task_id FROM task_pending_confirmation WHERE confirmation_id = ?",
+            (confirmation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_task(row[0])
+
     def consume_confirmation_and_claim_step(
         self,
         task_id: str,

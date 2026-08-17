@@ -75,8 +75,24 @@ sensitive step blocks. All of that still happens exclusively on the
 background worker thread, never here in do_POST - see
 task_control.py:dispatch_task_work()'s own docstring for the exact
 transition-triggered delivery rule and the full execution/delivery
-boundary. CONFIRM/REJECT ingress remains Milestone 46 P2B - not
-implemented here; a message like "CONFIRM abc-123" is still ordinary chat.
+boundary.
+
+Milestone 46 P2B: a "CONFIRM <id>"/"REJECT <id>" message needs NO new
+handling in do_POST at all - interfaces.whatsapp.handler.classify_message()
+now recognizes it and returns either a FixedReplyTask (a malformed command
+shape) or a task_control.TaskConfirmationWork, and both fall through this
+function's EXISTING generic-message branch below (SeenMessageCache
+dedup, then work_queue.put_nowait()) exactly like ordinary chat always
+has - TaskConfirmationWork is opaque to do_POST, which only ever
+special-cases TaskRequestText above. Resolving, authorizing, approving,
+denying, and delivering a confirmation decision all happen exclusively on
+the worker thread, via task_control.py:dispatch_confirmation_work()'s own
+docstring, for the same reason execution does: approve_task_confirmation()
+may run a sensitive action synchronously and must never be reachable from
+this request thread. HTTP 200 for a CONFIRM/REJECT message means the
+command was accepted onto the in-memory worker queue - not a durable-
+decision acknowledgement; see task_control.py's own module docstring for
+why this is a deliberately accepted, documented boundary.
 """
 
 import hashlib

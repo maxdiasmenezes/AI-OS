@@ -11,6 +11,7 @@ import pytest
 from kernel.employee_tasks.db import open_reader_connection, open_writer_connection
 from kernel.employee_tasks.repository import TaskRepository
 from kernel.employee_tasks.types import (
+    MAX_CONFIRMATION_ID_CHARS,
     MAX_DEDUP_KEY_CHARS,
     MAX_FAILURE_CODE_CHARS,
     MAX_FAILURE_SUMMARY_CHARS,
@@ -985,5 +986,92 @@ def test_plan_and_transition_journal_are_atomic_on_crash(db_path):
 
     transitions = repo.list_transitions(record.task_id)
     assert [t.to_state for t in transitions] == [TaskState.CREATED, TaskState.PLANNING]
-
     conn.close()
+
+
+# --- Milestone 46 P2B: get_task_by_pending_confirmation_id() ----------------
+
+
+def _waiting_task(repo, request_text="request", source="whatsapp"):
+    """Builds a task straight through to WAITING_FOR_CONFIRMATION with one
+    real pending confirmation row - the exact shape
+    get_task_by_pending_confirmation_id() needs to resolve. Returns
+    (task_record, pending_confirmation)."""
+
+    record = repo.create_task(request_text, source)
+    tid = record.task_id
+    repo.transition_task(tid, "created", "planning")
+    repo.transition_task(tid, "planning", "ready")
+    repo.transition_task(tid, "ready", "running")
+    task = repo.propose_confirmation(tid, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(tid)
+    return task, pending
+
+
+def test_get_task_by_pending_confirmation_id_finds_exact_pending_task(repo):
+    task, pending = _waiting_task(repo)
+
+    found = repo.get_task_by_pending_confirmation_id(pending.confirmation_id)
+
+    assert found is not None
+    assert found.task_id == task.task_id
+    assert found.state == TaskState.WAITING_FOR_CONFIRMATION
+
+
+def test_get_task_by_pending_confirmation_id_unknown_token_returns_none(repo):
+    _waiting_task(repo)  # a real pending confirmation exists, but for a different token
+
+    assert repo.get_task_by_pending_confirmation_id(generate_task_id()) is None
+
+
+def test_get_task_by_pending_confirmation_id_consumed_token_returns_none(repo):
+    task, pending = _waiting_task(repo)
+    repo.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+
+    assert repo.get_task_by_pending_confirmation_id(pending.confirmation_id) is None
+
+
+def test_get_task_by_pending_confirmation_id_rejected_token_returns_none(repo):
+    task, pending = _waiting_task(repo)
+    repo.deny_confirmation(task.task_id, pending.confirmation_id)
+
+    assert repo.get_task_by_pending_confirmation_id(pending.confirmation_id) is None
+
+
+def test_get_task_by_pending_confirmation_id_two_pending_tasks_resolve_independently(repo):
+    task_a, pending_a = _waiting_task(repo, request_text="request a")
+    task_b, pending_b = _waiting_task(repo, request_text="request b")
+
+    assert pending_a.confirmation_id != pending_b.confirmation_id
+
+    found_a = repo.get_task_by_pending_confirmation_id(pending_a.confirmation_id)
+    found_b = repo.get_task_by_pending_confirmation_id(pending_b.confirmation_id)
+
+    assert found_a.task_id == task_a.task_id
+    assert found_b.task_id == task_b.task_id
+    assert found_a.task_id != found_b.task_id
+
+
+def test_get_task_by_pending_confirmation_id_oversized_token_raises_same_validation_error(repo):
+    _waiting_task(repo)
+
+    with pytest.raises(TaskInputTooLargeError):
+        repo.get_task_by_pending_confirmation_id("x" * (MAX_CONFIRMATION_ID_CHARS + 1))
+
+
+def test_get_task_by_pending_confirmation_id_empty_token_raises_same_validation_error(repo):
+    with pytest.raises(TaskInputTooLargeError):
+        repo.get_task_by_pending_confirmation_id("")
+
+
+def test_get_task_by_pending_confirmation_id_performs_no_mutation(repo):
+    task, pending = _waiting_task(repo)
+    before = repo.get_task(task.task_id)
+
+    repo.get_task_by_pending_confirmation_id(pending.confirmation_id)
+
+    after = repo.get_task(task.task_id)
+    assert after == before  # identical version, state, everything - a pure read
+    assert repo.get_pending_confirmation(task.task_id) is not None  # still there, untouched

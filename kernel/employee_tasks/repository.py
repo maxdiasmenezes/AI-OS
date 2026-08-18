@@ -508,6 +508,28 @@ class TaskRepository:
             raise TaskNotFoundError(display_id)
         return _row_to_record(row)
 
+    def get_task_by_dedup_key(self, dedup_key: str) -> TaskRecord | None:
+        """Exact-equality lookup by dedup_key, using the column's existing
+        UNIQUE index (see kernel/employee_tasks/db.py's tasks table DDL) -
+        no table scan, no new index. Unlike get_task()/get_task_by_display_id(),
+        returns None rather than raising when nothing matches: this is a
+        plain existence check for the Milestone 46 WhatsApp durable-ingress
+        caller (create_task() -> DuplicateTaskError -> this lookup to find
+        the row that already won the race), not an identity assertion about
+        a caller-known task_id/display_id. Applies the same bounded-input
+        validation create_task() itself applies to dedup_key - never a
+        source-filtered query, since dedup_key is already namespaced by its
+        own caller (e.g. "whatsapp:<digest>") and the column's UNIQUE
+        constraint is global, not composite with source."""
+
+        dedup_key = _validate_bounded_text(dedup_key, "dedup_key", 1, MAX_DEDUP_KEY_CHARS)
+        row = self._conn.execute(
+            f"SELECT {_SELECT_COLUMNS} FROM tasks WHERE dedup_key = ?", (dedup_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_record(row)
+
     def list_tasks(self, limit: int = DEFAULT_LIST_LIMIT) -> list[TaskRecord]:
         limit = _validate_limit(limit)
         rows = self._conn.execute(
@@ -1205,6 +1227,54 @@ class TaskRepository:
         if row is None:
             return None
         return _row_to_pending_confirmation(row)
+
+    def get_task_by_pending_confirmation_id(self, confirmation_id: str) -> TaskRecord | None:
+        """Milestone 46 P2B: the reverse-lookup CONFIRM/REJECT ingress
+        needs - confirmation_id -> the task currently awaiting it. None
+        means no pending confirmation currently has this confirmation_id -
+        never a task-identity check, and never raises TaskNotFoundError,
+        exactly like get_pending_confirmation() above (never assumed to
+        already know the task_id, unlike every other method in this
+        class). Deliberately naive about WHY a confirmation_id might not
+        resolve - already approved, already rejected, expired-and-lazily-
+        resolved, or never issued at all are all structurally
+        indistinguishable here: every one of consume_confirmation_and_claim_step()/
+        deny_confirmation()/fail_pending_confirmation() deletes the pending
+        row in the same atomic transaction as its own state transition, so
+        a once-valid, now-resolved confirmation_id and a token that was
+        never real produce the identical None here - the caller's own
+        generic "no longer valid" response for both is what keeps a wrong-
+        or-stale-token attempt from disclosing which case actually
+        happened.
+
+        confirmation_id is bounded/validated exactly like every other
+        confirmation-id parameter in this class (_validate_confirmation_id())
+        - not because this method mutates anything, but so a malformed
+        caller-supplied token (wrong type, empty, oversized, or NUL-
+        containing) fails the same way it would anywhere else in this
+        class, via the same TaskInputTooLargeError, rather than silently
+        matching nothing or reaching SQLite as an unvalidated value.
+
+        A plain, parameterized equality lookup against confirmation_id's
+        existing UNIQUE constraint (kernel/employee_tasks/db.py's own
+        task_pending_confirmation table - no new index, no schema change).
+        task_id here is never treated as a source/channel authority
+        decision - this method performs no source filtering of its own
+        (see TaskRecord.source, a plain column this method already returns
+        via get_task() below) - that policy belongs entirely to the
+        caller, exactly like every other authorization decision in this
+        codebase lives outside kernel/employee_tasks/ (see this package's
+        own "policy-free" doctrine, referenced throughout this module).
+        Performs no mutation of any kind."""
+
+        confirmation_id = _validate_confirmation_id(confirmation_id)
+        row = self._conn.execute(
+            "SELECT task_id FROM task_pending_confirmation WHERE confirmation_id = ?",
+            (confirmation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_task(row[0])
 
     def consume_confirmation_and_claim_step(
         self,

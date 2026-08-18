@@ -11,6 +11,38 @@ retries anywhere in this module, and no log line here ever includes a
 sender ID (masked or otherwise), message text, AI response text, or any
 detail of an exception - only a generic category (processing_error,
 outbound_failure).
+
+Milestone 46 P1 adds a second, unrelated kind of queued work:
+interfaces/whatsapp/task_control.py's TaskExecutionWork(task_id) - the
+durable planning handoff for a "/task <request>" message already durably
+accepted in server.py's POST handling (before this worker ever sees it -
+see task_control.py's own module docstring on the connection-lifecycle
+split between request threads and this worker). Handling one is entirely
+delegated to task_control.dispatch_task_work() using this handler's own
+long-lived TaskRepository instance, planning catalog/planner ModelProvider,
+execution ActionRegistry/ToolsConfig loader, and general conversational
+ModelProvider (Milestone 46 P2A) - this module still performs no
+planning/execution/delivery logic itself, only wiring. Milestone 46 P2A:
+dispatch_task_work() may now execute non-sensitive actions, synthesize
+RESPOND text, and send exactly one outbound WhatsApp lifecycle message
+(terminal result/failure, or a confirmation request) per newly-produced
+lifecycle event - see task_control.py's own module docstring for the
+transition-triggered delivery rule that prevents a duplicate dispatch from
+resending one.
+
+Milestone 46 P2B adds a THIRD, likewise unrelated kind of queued work:
+task_control.py's TaskConfirmationWork(confirmation_id, decision) - the
+durable approve/deny handoff for a "CONFIRM <id>"/"REJECT <id>" message.
+Handling one is entirely delegated to
+task_control.dispatch_confirmation_work(), reusing the exact same
+long-lived TaskRepository/ActionRegistry/ToolsConfig loader/general
+conversational ModelProvider already wired for TaskExecutionWork above -
+no separate confirmation-specific dependency exists. This module still
+performs no reverse lookup, authorization, approval, denial, or execution
+logic itself, only wiring - see dispatch_confirmation_work()'s own
+docstring for why approve_task_confirmation() (which may execute a
+sensitive action synchronously) must never be reachable except from here,
+on the worker, never the webhook HTTP thread.
 """
 
 import logging
@@ -19,6 +51,17 @@ from kernel.models.base import ModelResponse
 from kernel.orchestrator.context import RequestContext
 
 from interfaces.whatsapp.client import WhatsAppClientError
+from interfaces.whatsapp.task_control import (
+    ConfirmationFixedReply,
+    TaskConfirmationWork,
+    TaskExecutionWork,
+    TaskFixedReply,
+    TaskRequestText,
+    classify_confirmation_text,
+    classify_task_text,
+    dispatch_confirmation_work,
+    dispatch_task_work,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +118,29 @@ class FixedReplyTask:
 
 def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_LENGTH):
     """Turn an already-authorized IncomingMessage into a Task. Pure - no I/O,
-    no authorization, no deduplication."""
+    no authorization, no deduplication.
+
+    Milestone 46 P1: a "/task ..." message is recognized here (delegating
+    the actual grammar to task_control.classify_task_text(), which is
+    itself pure) and returned as either a TaskFixedReply-wrapping
+    FixedReplyTask (bare /task, /task help, or the legacy /task
+    confirm/cancel migration notice - none of these ever reach
+    TaskRepository) or a TaskRequestText, unchanged, for server.py's POST
+    handling to durably accept - this function itself performs no I/O and
+    creates no TaskRecord.
+
+    Milestone 46 P2B: a "CONFIRM <id>"/"REJECT <id>" message (checked only
+    after the "/task" check above has already ruled it out - the two
+    grammars are mutually exclusive by construction) is likewise
+    recognized here via task_control.classify_confirmation_text() and
+    returned as either a ConfirmationFixedReply-wrapping FixedReplyTask
+    (a malformed command shape - never reaches TaskRepository) or a
+    TaskConfirmationWork, unchanged, for the worker to resolve/authorize/
+    act on - this function still performs no I/O, no reverse lookup, and
+    no authorization decision of any kind.
+
+    Every other message (including ordinary text that doesn't match
+    either grammar) is classified exactly as before Milestone 46."""
 
     if message.message_type != "text":
         return FixedReplyTask(message.sender, UNSUPPORTED_MESSAGE_REPLY)
@@ -86,6 +151,18 @@ def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_
 
     if len(text) > max_incoming_text_length:
         return FixedReplyTask(message.sender, OVERSIZED_MESSAGE_REPLY)
+
+    task_classification = classify_task_text(text)
+    if isinstance(task_classification, TaskFixedReply):
+        return FixedReplyTask(message.sender, task_classification.reply_text)
+    if isinstance(task_classification, TaskRequestText):
+        return task_classification
+
+    confirmation_classification = classify_confirmation_text(text)
+    if isinstance(confirmation_classification, ConfirmationFixedReply):
+        return FixedReplyTask(message.sender, confirmation_classification.reply_text)
+    if isinstance(confirmation_classification, TaskConfirmationWork):
+        return confirmation_classification
 
     return TextTask(message.sender, text)
 
@@ -133,18 +210,97 @@ class MessageHandler:
         orchestrator,
         client,
         max_outgoing_text_length: int = MAX_OUTGOING_TEXT_LENGTH,
+        *,
+        task_repository=None,
+        task_catalog=None,
+        planner_provider=None,
+        action_registry=None,
+        tools_config_loader=None,
+        respond_provider=None,
+        authorized_sender=None,
     ) -> None:
         self._orchestrator = orchestrator
         self._client = client
         self._max_outgoing_text_length = max_outgoing_text_length
+        # Milestone 46 P1: this worker's own long-lived TaskRepository
+        # instance/connection (never shared with a request thread - see
+        # task_control.py's own module docstring) plus the catalog/planner
+        # ModelProvider advance_task_planning() needs.
+        self._task_repository = task_repository
+        self._task_catalog = task_catalog
+        self._planner_provider = planner_provider
+        # Milestone 46 P2A: execution-time dependencies. action_registry is
+        # the stateless kernel.tools.ActionRegistry(); tools_config_loader
+        # is called fresh before every execution-layer operation (never a
+        # startup-cached ToolsConfig - see task_control.py's own module
+        # docstring on why); respond_provider is the general conversational
+        # ModelProvider RESPOND synthesis uses (deliberately distinct from
+        # planner_provider); authorized_sender is the fixed, trusted
+        # recipient for every task-control lifecycle message (never derived
+        # from task data - see task_control.py's own _send_lifecycle_message()
+        # docstring).
+        self._action_registry = action_registry
+        self._tools_config_loader = tools_config_loader
+        self._respond_provider = respond_provider
+        self._authorized_sender = authorized_sender
+        # All of the above are only required if a TaskExecutionWork item is
+        # ever actually dispatched (see _handle_task_execution_work()) - a
+        # build that never wires them (e.g. an existing test constructing
+        # MessageHandler with just orchestrator/client) keeps working
+        # exactly as before for TextTask/FixedReplyTask.
 
     def handle_task(self, task) -> None:
         if isinstance(task, TextTask):
             self._handle_text_task(task)
         elif isinstance(task, FixedReplyTask):
             self._reply(task.sender, task.reply_text)
+        elif isinstance(task, TaskExecutionWork):
+            self._handle_task_execution_work(task)
+        elif isinstance(task, TaskConfirmationWork):
+            self._handle_confirmation_work(task)
         else:
             raise TypeError(f"unsupported task type: {type(task).__name__}")
+
+    def _handle_task_execution_work(self, task: TaskExecutionWork) -> None:
+        # Milestone 46 P2A's execution boundary: the full planning ->
+        # execution -> delivery flow, via task_control.dispatch_task_work()
+        # - see that function's own docstring for the transition-triggered
+        # delivery rule. Never calls approve_task_confirmation()/
+        # deny_task_confirmation() - that is _handle_confirmation_work()'s
+        # boundary alone (Milestone 46 P2B), reached only via a distinct
+        # queued work-item type, never from here.
+        dispatch_task_work(
+            self._task_repository,
+            task.task_id,
+            self._task_catalog,
+            self._planner_provider,
+            self._action_registry,
+            self._tools_config_loader,
+            self._respond_provider,
+            self._client,
+            self._authorized_sender,
+        )
+
+    def _handle_confirmation_work(self, task: TaskConfirmationWork) -> None:
+        # Milestone 46 P2B's only confirmation-decision boundary: the full
+        # reverse-lookup -> authorization -> approve/deny -> (for CONFIRM)
+        # post-approval continuation -> delivery flow, via
+        # task_control.dispatch_confirmation_work() - see that function's
+        # own docstring for the exact authority order and why
+        # approve_task_confirmation() (which may execute a sensitive
+        # action synchronously) must never be reachable from the webhook
+        # HTTP thread. Reuses the exact same execution-time dependencies
+        # already wired for TaskExecutionWork - no separate confirmation
+        # config/provider/registry exists.
+        dispatch_confirmation_work(
+            self._task_repository,
+            task,
+            self._action_registry,
+            self._tools_config_loader,
+            self._respond_provider,
+            self._client,
+            self._authorized_sender,
+        )
 
     def _handle_text_task(self, task: TextTask) -> None:
         try:

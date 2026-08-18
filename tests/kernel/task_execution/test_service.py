@@ -13,6 +13,9 @@ from pathlib import Path
 import pytest
 
 from kernel.employee_tasks import (
+    MAX_FAILURE_CODE_CHARS,
+    MAX_FAILURE_SUMMARY_CHARS,
+    MAX_STEP_RESULT_JSON_CHARS,
     TaskAlreadyTerminalError,
     TaskRepository,
     TaskState,
@@ -21,8 +24,12 @@ from kernel.employee_tasks import (
 )
 from kernel.models.base import ModelResponse
 from kernel.task_execution.observation import (
+    _ACTION_OUTCOME_INVALID_FALLBACK_CODE,
+    _OVERSIZED_ACTION_FAILURE_SUMMARY,
+    _OVERSIZED_ACTION_SUCCESS_SUMMARY,
     build_action_observation,
     deserialize_observation,
+    normalize_action_result_outcome,
     serialize_observation,
 )
 from kernel.task_execution.service import (
@@ -235,6 +242,327 @@ def test_non_sensitive_action_failure_fails_task_and_step_atomically(repo, regis
     step = repo.get_step_progress(task.task_id, 1)
     assert step.status.value == "failed"
     assert step.failure_code == "failed"
+
+
+# --- oversized ActionResult.message (Milestone 46 adversarial-review H1) ------
+#
+# An action handler's ActionResult.message has no bound of its own (unlike
+# RESPOND's already-bounded synthesized text - see the escaping-bound tests
+# further down). By the time _finalize_action_step() runs, claim_step() has
+# already committed the step as durably in_progress and executor.execute()
+# has already returned - so an oversized message must never leave the step
+# stuck in_progress, and must never flip a real success into a failure (or
+# vice versa) merely because its descriptive text was too large to persist
+# verbatim. Every test below proves this deterministically for both the
+# MAX_STEP_RESULT_JSON_CHARS bound (the serialized StepObservation itself)
+# and the independent MAX_FAILURE_SUMMARY_CHARS bound (failure_summary,
+# reused only on the failure path) - see _finalize_action_step()'s own
+# docstring for why both are checked.
+
+
+def test_oversized_successful_action_message_finalizes_succeeded_with_bounded_fallback(
+    repo, registry, tools_config
+):
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    oversized_message = "X" * (MAX_STEP_RESULT_JSON_CHARS + 1000)
+    executor = _FakeExecutor([ActionResult(True, oversized_message, "executed")])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.STEP_SUCCEEDED
+    assert result.task.state == TaskState.RUNNING
+    assert len(executor.calls) == 1
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert step.status.value == "succeeded"
+    assert len(step.result_json) <= MAX_STEP_RESULT_JSON_CHARS
+
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is True
+    assert observation.safe_summary == _OVERSIZED_ACTION_SUCCESS_SUMMARY
+    assert oversized_message not in step.result_json
+
+
+def test_oversized_failed_action_message_finalizes_failed_with_bounded_fallback(
+    repo, registry, tools_config
+):
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    oversized_message = "X" * (MAX_STEP_RESULT_JSON_CHARS + 1000)
+    executor = _FakeExecutor([ActionResult(False, oversized_message, "failed")])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.TASK_FAILED
+    assert result.task.state == TaskState.FAILED
+    assert result.task.failure_code == "failed"
+    assert len(executor.calls) == 1
+
+    assert result.task.failure_summary == _OVERSIZED_ACTION_FAILURE_SUMMARY
+    assert len(result.task.failure_summary) <= MAX_FAILURE_SUMMARY_CHARS
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert step.status.value == "failed"
+    assert step.failure_code == "failed"
+    assert len(step.result_json) <= MAX_STEP_RESULT_JSON_CHARS
+
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is False
+    assert observation.safe_summary == _OVERSIZED_ACTION_FAILURE_SUMMARY
+    assert oversized_message not in step.result_json
+
+
+def test_failure_message_between_failure_summary_and_json_bounds_still_finalizes_failed(
+    repo, registry, tools_config
+):
+    """A message that fits within MAX_STEP_RESULT_JSON_CHARS on its own but
+    exceeds the narrower MAX_FAILURE_SUMMARY_CHARS bound - a distinct
+    trigger from the JSON-overflow case above, since serialize_observation()
+    alone would not catch it (repository.fail_running_step()'s own
+    failure_summary validation would, uncaught, without this function's
+    fix)."""
+
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    assert MAX_FAILURE_SUMMARY_CHARS < MAX_STEP_RESULT_JSON_CHARS
+    midsized_message = "X" * (MAX_FAILURE_SUMMARY_CHARS + 100)
+    executor = _FakeExecutor([ActionResult(False, midsized_message, "failed")])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.TASK_FAILED
+    assert result.task.state == TaskState.FAILED
+    assert len(executor.calls) == 1
+    assert result.task.failure_summary == _OVERSIZED_ACTION_FAILURE_SUMMARY
+
+
+def test_ordinary_bounded_action_message_is_unaffected_by_the_oversized_fallback(
+    repo, registry, tools_config
+):
+    """The counterpart to the three tests above: an ordinary, already-small
+    message is persisted verbatim, exactly as before this correction -
+    proving the fallback path only activates when actually needed."""
+
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    executor = _FakeExecutor([ActionResult(True, "3 files found.", "executed")])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.STEP_SUCCEEDED
+    step = repo.get_step_progress(task.task_id, 1)
+    observation = deserialize_observation(step.result_json)
+    assert observation.safe_summary == "3 files found."
+
+
+def test_real_list_files_with_many_long_filenames_completes_without_orphaning(
+    tmp_path, repo, registry
+):
+    """Turns the adversarial-review reproduction into a permanent
+    regression: the REAL list_files handler, the REAL SafeTaskExecutor, and
+    the real execution service, against a real tmp_path directory
+    containing 100 Windows-valid, realistically long filenames - no
+    fakes/mocks anywhere in the execution path itself. Before this
+    correction, this reproducibly raised ObservationSerializationError and
+    left the task RUNNING with the step stuck IN_PROGRESS."""
+
+    from kernel.tools.executor import SafeTaskExecutor
+
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    for i in range(100):
+        # Windows-valid: no reserved characters, well under MAX_PATH for a
+        # single component, but long enough (65 chars) that 100 of them
+        # comfortably overflow MAX_STEP_RESULT_JSON_CHARS when joined.
+        name = f"Quarterly_Financial_Report_Draft_Review_Comments_Attached_{i:03d}.pdf"
+        (downloads_dir / name).write_text("x")
+
+    tools_config = ToolsConfig(
+        approved_directories={"downloads": str(downloads_dir)},
+        approved_applications={},
+        approved_scripts={},
+        approved_repositories={},
+        approved_backups={},
+    )
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    executor = SafeTaskExecutor(tools_config, registry)
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.STEP_SUCCEEDED
+    assert result.task.state == TaskState.RUNNING
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert step.status.value == "succeeded"
+    assert len(step.result_json) <= MAX_STEP_RESULT_JSON_CHARS
+
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is True
+    assert observation.safe_summary == _OVERSIZED_ACTION_SUCCESS_SUMMARY
+
+    # A second advance now completes the (single-step) task normally -
+    # proving the fallback observation did not leave anything uncertain.
+    result2 = advance_task_execution(result.task, repo, registry, tools_config, executor, model_provider)
+    assert result2.status == ExecutionAdvanceStatus.TASK_COMPLETED
+    assert result2.task.state == TaskState.COMPLETED
+
+
+# --- oversized ActionResult.outcome (Milestone 46 adversarial re-review, M1) --
+#
+# ActionResult.outcome (kernel/tools/types.py) is typed as a plain,
+# unconstrained str - "one of audit.py's fixed codes" is a convention every
+# one of the 14 currently-registered handlers happens to follow, never a
+# structural guarantee. normalize_action_result_outcome() closes the second-
+# order gap this left in build_bounded_action_observation()'s own "provably
+# bounded" claim: an oversized/empty/malformed outcome must be replaced by a
+# fixed, short, code-owned fallback code BEFORE it ever reaches either the
+# embedded StepObservation fields or the standalone failure_code parameter
+# threaded into repository.fail_running_step() (bounded to
+# MAX_FAILURE_CODE_CHARS, independent of and tighter than
+# MAX_STEP_RESULT_JSON_CHARS) - never a truncation of the real value.
+
+
+def test_oversized_outcome_with_normal_message_succeeds_normally(repo, registry, tools_config):
+    # Message overflow and outcome overflow are independent triggers - this
+    # isolates outcome overflow alone, with an otherwise completely normal,
+    # already-short success message.
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    oversized_outcome = "X" * (MAX_FAILURE_CODE_CHARS + 1000)
+    executor = _FakeExecutor([ActionResult(True, "3 files found.", oversized_outcome)])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.STEP_SUCCEEDED
+    assert result.task.state == TaskState.RUNNING
+    assert len(executor.calls) == 1
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert step.status.value == "succeeded"
+    assert len(step.result_json) <= MAX_STEP_RESULT_JSON_CHARS
+
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is True
+    # The real, short message is preserved verbatim - only the oversized
+    # machine-readable outcome was out of bounds.
+    assert observation.safe_summary == "3 files found."
+    assert observation.action_outcome == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    assert oversized_outcome not in step.result_json
+
+
+def test_oversized_outcome_with_normal_message_fails_normally(repo, registry, tools_config):
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    oversized_outcome = "Y" * (MAX_FAILURE_CODE_CHARS + 1000)
+    executor = _FakeExecutor([ActionResult(False, "small failure", oversized_outcome)])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.TASK_FAILED
+    assert result.task.state == TaskState.FAILED
+    assert len(executor.calls) == 1
+
+    # failure_code is normalized (it would otherwise violate
+    # MAX_FAILURE_CODE_CHARS uncaught inside fail_running_step()) - but
+    # failure_summary is the REAL short message, since only the outcome,
+    # not the message, was out of bounds.
+    assert result.task.failure_code == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    assert len(result.task.failure_code) <= MAX_FAILURE_CODE_CHARS
+    assert result.task.failure_summary == "small failure"
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert step.status.value == "failed"
+    assert step.failure_code == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is False
+    assert observation.action_outcome == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    assert oversized_outcome not in step.result_json
+
+
+def test_both_message_and_outcome_oversized_succeeds_normally(repo, registry, tools_config):
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    oversized_message = "M" * (MAX_STEP_RESULT_JSON_CHARS + 1000)
+    oversized_outcome = "O" * (MAX_FAILURE_CODE_CHARS + 1000)
+    executor = _FakeExecutor([ActionResult(True, oversized_message, oversized_outcome)])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.STEP_SUCCEEDED
+    assert len(executor.calls) == 1
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert step.status.value == "succeeded"
+    assert len(step.result_json) <= MAX_STEP_RESULT_JSON_CHARS
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is True
+    assert observation.safe_summary == _OVERSIZED_ACTION_SUCCESS_SUMMARY
+    assert observation.action_outcome == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    assert oversized_message not in step.result_json
+    assert oversized_outcome not in step.result_json
+
+
+def test_both_message_and_outcome_oversized_fails_normally(repo, registry, tools_config):
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    oversized_message = "M" * (MAX_STEP_RESULT_JSON_CHARS + 1000)
+    oversized_outcome = "O" * (MAX_FAILURE_CODE_CHARS + 1000)
+    executor = _FakeExecutor([ActionResult(False, oversized_message, oversized_outcome)])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.TASK_FAILED
+    assert result.task.state == TaskState.FAILED
+    assert len(executor.calls) == 1
+
+    assert result.task.failure_code == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    assert result.task.failure_summary == _OVERSIZED_ACTION_FAILURE_SUMMARY
+
+    step = repo.get_step_progress(task.task_id, 1)
+    assert len(step.result_json) <= MAX_STEP_RESULT_JSON_CHARS
+    observation = deserialize_observation(step.result_json)
+    assert observation.success is False
+    assert observation.safe_summary == _OVERSIZED_ACTION_FAILURE_SUMMARY
+    assert observation.action_outcome == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+    assert oversized_message not in step.result_json
+    assert oversized_outcome not in step.result_json
+
+
+def test_normal_short_outcome_is_unaffected_by_outcome_normalization(repo, registry, tools_config):
+    """The counterpart to the oversized-outcome tests above: a real,
+    already-short outcome code is preserved verbatim, exactly as before
+    this correction - proving normalization only activates when actually
+    needed, never gratuitously replacing a legitimate short code."""
+
+    task = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    executor = _FakeExecutor([ActionResult(True, "3 files found.", "executed")])
+
+    result = advance_task_execution(task, repo, registry, tools_config, executor, model_provider)
+
+    assert result.status == ExecutionAdvanceStatus.STEP_SUCCEEDED
+    step = repo.get_step_progress(task.task_id, 1)
+    observation = deserialize_observation(step.result_json)
+    assert observation.action_outcome == "executed"
+
+    # The failure-path counterpart, in one more advance.
+    task2 = _running_task(repo, [_action_step(1, "list_files", "downloads")])
+    executor2 = _FakeExecutor([ActionResult(False, "not available", "failed")])
+    result2 = advance_task_execution(task2, repo, registry, tools_config, executor2, model_provider)
+    assert result2.task.failure_code == "failed"
+
+
+def test_normalize_action_result_outcome_preserves_valid_outcomes_unchanged():
+    for outcome in ("executed", "failed", "rejected", "timed_out"):
+        result = ActionResult(True, "message", outcome)
+        assert normalize_action_result_outcome(result) is result
+
+
+def test_normalize_action_result_outcome_replaces_invalid_outcomes():
+    cases = [
+        "X" * (MAX_FAILURE_CODE_CHARS + 1),  # too long
+        "",  # too short (empty)
+        "has\x00nul",  # NUL character
+    ]
+    for outcome in cases:
+        result = ActionResult(True, "message", outcome)
+        normalized = normalize_action_result_outcome(result)
+        assert normalized.outcome == _ACTION_OUTCOME_INVALID_FALLBACK_CODE
+        assert normalized.success == result.success
+        assert normalized.message == result.message
+        assert len(normalized.outcome) <= MAX_FAILURE_CODE_CHARS
 
 
 # --- sensitive action / durable confirmation ----------------------------------

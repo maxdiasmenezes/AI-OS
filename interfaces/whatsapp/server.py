@@ -102,12 +102,18 @@ import logging
 import queue
 import socket
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from capabilities.loader import CapabilityLoader
 from kernel.config.config import Config, load_config
-from kernel.employee_tasks import TaskRepository, open_writer_connection, resolve_database_path
+from kernel.employee_tasks import (
+    TaskRepository,
+    acquire_runtime_ownership,
+    open_writer_connection,
+    resolve_database_path,
+)
 from kernel.memory import MemoryManager
 from kernel.models import get_planner_provider, get_provider
 from kernel.orchestrator import Orchestrator
@@ -137,6 +143,11 @@ _WEBHOOK_PATH = "/webhook"
 # All are constructor parameters so tests can inject different values.
 DEFAULT_MAX_BODY_BYTES = 1_000_000
 DEFAULT_QUEUE_CAPACITY = 16
+# Milestone 47 P1: how often the worker loop guarantees itself one bounded
+# recovery checkpoint (see WhatsAppServer._run_worker()'s own docstring) -
+# an application-level cadence choice, not a claim about any external
+# system's own timing.
+DEFAULT_RECOVERY_INTERVAL_SECONDS = 60.0
 
 _WORKER_JOIN_TIMEOUT_SECONDS = 5.0
 
@@ -409,10 +420,41 @@ def _make_handler_class(
     return WebhookRequestHandler
 
 
-class _ThreadingHTTPServerIPv6(ThreadingHTTPServer):
+class _QuiescentThreadingHTTPServer(ThreadingHTTPServer):
+    """Milestone 47 P1 adversarial-review correction (MEDIUM-3): makes the
+    request-thread quiescence guarantee WhatsAppServer.stop()'s own
+    runtime-lock release ordering depends on EXPLICIT, never an
+    accidentally-inherited stdlib default.
+
+    socketserver.ThreadingMixIn's own class defaults - daemon_threads=False,
+    block_on_close=True - already happen to provide exactly what is
+    needed: with both at their stdlib default, server_close() genuinely
+    blocks (via ThreadingMixIn._threads.join()) until every currently
+    in-flight, non-daemon request-handling thread has fully finished -
+    including one still inside accept_task_message()'s durable `/task`
+    write. That is precisely the property required before this process's
+    runtime-ownership lock is ever safe to release (see
+    WhatsAppServer.stop()'s own docstring for the full 5-step release
+    sequence this makes possible). Leaving that as an unstated, merely-
+    inherited default is fragile: a future contributor adding
+    `daemon_threads = True` to some subclass, for a "faster shutdown"
+    optimization, would silently remove this exact guarantee, with
+    nothing here to catch it. Restating both attributes explicitly, right
+    here, turns an accident into a documented, load-bearing invariant -
+    verified by
+    tests/interfaces/whatsapp/test_server.py::test_stop_does_not_release_runtime_ownership_while_a_request_thread_is_still_active."""
+
+    daemon_threads = False
+    block_on_close = True
+
+
+class _ThreadingHTTPServerIPv6(_QuiescentThreadingHTTPServer):
     """ThreadingHTTPServer defaults to AF_INET; this variant is selected
     whenever the validated host is an IPv6 literal (e.g. "::1"), since
-    binding an IPv6 address on an AF_INET socket fails outright."""
+    binding an IPv6 address on an AF_INET socket fails outright. Inherits
+    the same explicit daemon_threads/block_on_close invariant from
+    _QuiescentThreadingHTTPServer - the IPv6 path must never be a weaker
+    quiescence guarantee than the IPv4 one."""
 
     address_family = socket.AF_INET6
 
@@ -420,8 +462,13 @@ class _ThreadingHTTPServerIPv6(ThreadingHTTPServer):
 def _select_server_class(host: str) -> type[ThreadingHTTPServer]:
     # config.py only ever produces "localhost", an IPv4 loopback literal,
     # or "::1" - a literal colon is a reliable, simple IPv6 marker across
-    # that whole set.
-    return _ThreadingHTTPServerIPv6 if ":" in host else ThreadingHTTPServer
+    # that whole set. Both branches now return a server class with the
+    # SAME explicit quiescence guarantee (_QuiescentThreadingHTTPServer's
+    # own daemon_threads=False/block_on_close=True) - never plain,
+    # unmodified ThreadingHTTPServer, whose own class defaults happen to
+    # match today but are never asserted here as this codebase's own
+    # stated contract.
+    return _ThreadingHTTPServerIPv6 if ":" in host else _QuiescentThreadingHTTPServer
 
 
 class WhatsAppServer:
@@ -437,6 +484,8 @@ class WhatsAppServer:
         *,
         task_db_path=None,
         worker_task_connection=None,
+        runtime_lock=None,
+        recovery_interval_seconds: float = DEFAULT_RECOVERY_INTERVAL_SECONDS,
     ) -> None:
         self._dedup = dedup if dedup is not None else SeenMessageCache()
         self._queue: "queue.Queue" = queue.Queue(maxsize=queue_capacity)
@@ -448,6 +497,16 @@ class WhatsAppServer:
         # connection (opened per-request inside accept_task_message(),
         # never held here), and never closed by any other thread.
         self._worker_task_connection = worker_task_connection
+        # Milestone 47 P1: the database-scoped runtime-ownership lock (if
+        # any - see kernel/employee_tasks/runtime_lock.py), acquired by
+        # build_server() BEFORE this object was ever constructed. Released
+        # only by stop() below, and only once every component that could
+        # still touch the task database (the worker thread, and whatever
+        # it may still be running - see this milestone's own recovery
+        # checkpoint) is confirmed quiescent - never released merely
+        # because the worker thread was asked to stop.
+        self._runtime_lock = runtime_lock
+        self._recovery_interval_seconds = recovery_interval_seconds
         handler_class = _make_handler_class(
             whatsapp_config, self._queue, self._dedup, max_body_bytes, task_db_path
         )
@@ -470,27 +529,62 @@ class WhatsAppServer:
     def stop(self) -> None:
         """Shut down the HTTP server and signal the worker to stop.
 
-        Joins the worker up to the existing bounded timeout, exactly as
-        before. Milestone 46 P1 correction: this method never closes the
-        worker's own task-DB connection itself, whether or not the join
-        completed in time - only the worker thread may ever close a
-        connection it might still be using (kernel/employee_tasks/db.py's
-        own module docstring is explicit that sqlite3 does not serialize
-        concurrent calls on the same connection object across threads; the
-        original version of this method violated that by closing the
-        connection here regardless of whether join() actually returned
-        because the worker finished, or merely timed out while the worker
-        was still active inside dispatch_planning() - empirically proven to
-        leave a task permanently stuck in TaskState.PLANNING). See
-        _run_worker()'s own docstring/finally block: it closes its own
-        connection itself, only after its own loop has actually exited.
+        Milestone 47 P1 adversarial-review correction (MEDIUM-3): the full
+        release sequence, stated explicitly, in order - every step below
+        must complete before the next is safe to rely on:
 
-        If the worker is still alive once the join timeout elapses, this
-        method still returns - it never blocks indefinitely and never forces
-        the worker to stop (P1 owns no recovery/reconciliation system; a
-        worker still finishing its current item, then draining the already-
-        enqueued _STOP sentinel on its own schedule, is a normal bounded-
-        shutdown outcome, not a failure this method needs to correct)."""
+          1. self._httpd.shutdown() - stops serve_forever() from accepting
+             any further connection.
+          2. self._httpd.server_close() - closes the listening socket AND
+             (see _QuiescentThreadingHTTPServer's own docstring for why
+             this is now an explicit, asserted class attribute rather than
+             a merely-inherited stdlib default) BLOCKS until every
+             currently in-flight, non-daemon request-handling thread has
+             fully finished - including one still inside
+             accept_task_message()'s durable `/task` write. By the time
+             this call returns, no request thread capable of a durable
+             task-DB write can still be running.
+          3. self._queue.put(_STOP) + self._worker_thread.join(timeout=...) -
+             signals and waits (up to the existing bounded timeout) for the
+             worker thread to finish.
+          4. If the join succeeds: _run_worker()'s own finally block (which
+             closes the worker's task-DB connection) has, by construction,
+             already run by the time join() returns with is_alive() False -
+             so "worker joined" and "worker's DB resources are quiescent"
+             are the same moment.
+          5. Runtime ownership is released LAST, only after steps 2-4 have
+             all completed - i.e. only once BOTH every request thread and
+             the worker thread are provably done touching the task
+             database.
+
+        Milestone 46 P1 correction (unchanged by the above): this method
+        never closes the worker's own task-DB connection itself, whether
+        or not the join completed in time - only the worker thread may
+        ever close a connection it might still be using (kernel/
+        employee_tasks/db.py's own module docstring is explicit that
+        sqlite3 does not serialize concurrent calls on the same connection
+        object across threads; the original version of this method
+        violated that by closing the connection here regardless of
+        whether join() actually returned because the worker finished, or
+        merely timed out while the worker was still active inside
+        dispatch_planning() - empirically proven to leave a task
+        permanently stuck in TaskState.PLANNING).
+
+        If the worker is still alive once the join timeout elapses (step 3
+        fails), this method still returns - it never blocks indefinitely
+        and never forces the worker to stop (a worker still finishing its
+        current item, then draining the already-enqueued _STOP sentinel on
+        its own schedule, is a normal bounded-shutdown outcome, not a
+        failure this method needs to correct). In that case, step 5
+        deliberately does NOT run: the runtime-ownership lock remains held
+        by this still-live process (correctly - the worker may still be
+        mid-write), and is released, automatically, by the OS whenever
+        this process actually terminates (see
+        kernel/employee_tasks/runtime_lock.py's own docstring for why that
+        is always safe, never a stale-lock risk). Releasing early here
+        would let a second runtime start reconciling the same database
+        while this process's worker might still be touching it - exactly
+        the hazard database-scoped ownership exists to prevent."""
 
         self._httpd.shutdown()
         self._httpd.server_close()
@@ -502,35 +596,78 @@ class WhatsAppServer:
             # provider detail. The worker keeps running; it will still
             # close its own connection when _run_worker() actually exits.
             logger.warning("worker_shutdown_pending")
+            return
+        if self._runtime_lock is not None:
+            self._runtime_lock.release()
 
     def _run_worker(self) -> None:
         # No authorization or deduplication happens here - only pre-cleared
         # tasks ever reach this loop. Processes one task at a time,
         # preserving the queue's FIFO order, and never retries a failed
-        # outbound send.
+        # outbound send for an ordinary task.
+        #
+        # Milestone 47 P1: a monotonic recovery deadline is interleaved with
+        # normal queue consumption - queue.get() only ever blocks up to that
+        # deadline (never indefinitely), and the deadline is re-checked
+        # after EVERY normal item too, not only when the queue happens to go
+        # idle - so an unbounded SEQUENCE of short queued items can never
+        # starve recovery indefinitely (a naive "only check when idle"
+        # design could not make even that guarantee). This is single-worker
+        # serialization, not preemption: this loop processes one item at a
+        # time to completion, so a single long-running handle_task() call
+        # can still delay the next recovery checkpoint past
+        # self._recovery_interval_seconds - the deadline is only ever
+        # re-checked BETWEEN items, never used to interrupt one already in
+        # progress. Each recovery checkpoint is itself bounded to at most
+        # one external send (see
+        # task_control.run_outbound_lifecycle_recovery_checkpoint()'s own
+        # docstring) - this is what keeps recovery from ever starving
+        # normal queue responsiveness in the other direction. _STOP is
+        # still dequeued and honored with the same priority as any other
+        # item - a recovery checkpoint never delays shutdown, since it only
+        # ever runs strictly between two item-processing steps, never
+        # instead of consuming _STOP.
+        next_recovery_deadline = time.monotonic() + self._recovery_interval_seconds
         try:
             while True:
-                item = self._queue.get()
+                remaining = max(0.0, next_recovery_deadline - time.monotonic())
                 try:
-                    if item is _STOP:
-                        break
+                    item = self._queue.get(timeout=remaining)
+                except queue.Empty:
+                    item = None
+
+                if item is not None:
                     try:
-                        self._message_handler.handle_task(item)
+                        if item is _STOP:
+                            break
+                        try:
+                            self._message_handler.handle_task(item)
+                        except Exception:
+                            # No traceback, no exception message, no task
+                            # detail - only a generic category, and the loop
+                            # continues with the next queued task rather
+                            # than dying or retrying this one.
+                            logger.warning("worker_error")
+                    finally:
+                        self._queue.task_done()
+
+                if time.monotonic() >= next_recovery_deadline:
+                    try:
+                        self._message_handler.run_recovery_checkpoint()
                     except Exception:
-                        # No traceback, no exception message, no task detail -
-                        # only a generic category, and the loop continues with
-                        # the next queued task rather than dying or retrying
-                        # this one.
-                        logger.warning("worker_error")
-                finally:
-                    self._queue.task_done()
+                        # Same no-detail discipline as worker_error above -
+                        # a recovery-checkpoint defect must never crash the
+                        # worker thread or block normal queue processing.
+                        logger.warning("worker_recovery_error")
+                    next_recovery_deadline = time.monotonic() + self._recovery_interval_seconds
         finally:
             # Milestone 46 P1: only this thread - the one that actually used
             # this connection - ever closes it, and only once this loop has
             # genuinely finished (normal _STOP exit, or any exception
             # escaping the loop above, though none currently does since
-            # handle_task() is already caught inside it). See stop()'s own
-            # docstring for the invariant this preserves.
+            # handle_task()/run_recovery_checkpoint() are already caught
+            # inside it). See stop()'s own docstring for the invariant this
+            # preserves.
             if self._worker_task_connection is not None:
                 self._worker_task_connection.close()
 
@@ -542,85 +679,108 @@ def build_server() -> WhatsAppServer:
     kernel_config = load_config()
     capability_loader = CapabilityLoader().load
 
-    orchestrator = build_orchestrator(kernel_config, capability_loader)
-    client = WhatsAppClient(
-        whatsapp_config.access_token,
-        whatsapp_config.phone_number_id,
-        whatsapp_config.api_version,
-    )
-
     # Milestone 46 P1: durable task-ingress wiring.
     task_db_path = resolve_database_path()
 
-    # Ensure/verify the schema exactly once, synchronously, before
-    # ThreadingHTTPServer ever begins accepting concurrent requests - this
-    # is what makes every later per-request open_writer_connection() call
-    # hit the cheap, already-current-schema path rather than racing another
-    # connection through first-ever schema creation (see task_control.py's
-    # own module docstring and the Milestone 46 P1 design report's
-    # empirical concurrency validation for why concurrent first-ever
-    # schema creation can otherwise leak a raw sqlite3.OperationalError).
-    schema_init_connection = open_writer_connection(task_db_path)
-    schema_init_connection.close()
-
-    task_registry = ActionRegistry()
-    tools_config = load_tools_config()
-    task_catalog = build_catalog(task_registry, tools_config)
-    planner_provider = get_planner_provider(kernel_config)
-
-    # Milestone 46 P2A: a second, independent conversational ModelProvider
-    # instance, dedicated to RESPOND synthesis - deliberately never the
-    # planner_provider above (see kernel/task_execution/__init__.py's
-    # model-role-separation contract). Orchestrator constructs its own
-    # provider internally with no injection seam, so this is a second
-    # instance rather than a shared one; verified harmless (a ModelProvider
-    # is a stateless config wrapper - kernel/models/ollama.py's
-    # OllamaProvider holds only four plain attributes, no connection pool,
-    # no persistent socket) - not worth adding an Orchestrator seam for.
-    respond_provider = get_provider(kernel_config)
-
-    # The single WhatsApp worker's own long-lived connection/repository -
-    # opened once here, reused for the life of the process. Ownership
-    # transfers to the returned WhatsAppServer (whose worker thread closes
-    # it - see _run_worker()'s own finally block) only once construction
-    # below actually succeeds; never shared with a request thread's own
-    # per-request connection (see task_control.py's own module docstring).
-    worker_task_connection = open_writer_connection(task_db_path)
+    # Milestone 47 P1: database-scoped runtime ownership, acquired BEFORE
+    # schema initialization, before any TaskRepository is constructed,
+    # before any worker or recovery activity of any kind - see
+    # kernel/employee_tasks/runtime_lock.py's own module docstring for the
+    # exact OS-level guarantee this provides and why it is scoped to the
+    # database file itself rather than this interface's own HTTP port.
+    # RuntimeOwnershipUnavailableError propagates uncaught: a second live
+    # runtime against the same database must fail this process's startup
+    # closed, before touching any durable task state, never silently
+    # continue without recovery ownership.
+    runtime_lock = acquire_runtime_ownership(task_db_path)
     try:
-        worker_task_repository = TaskRepository(worker_task_connection)
-
-        message_handler = MessageHandler(
-            orchestrator,
-            client,
-            task_repository=worker_task_repository,
-            task_catalog=task_catalog,
-            planner_provider=planner_provider,
-            # Milestone 46 P2A execution-time dependencies. action_registry
-            # reuses the same stateless task_registry instance built above
-            # for planning - ActionRegistry has no config dependency, so
-            # there is no freshness concern in sharing it. tools_config_loader
-            # is the bare load_tools_config function, called fresh by
-            # dispatch_task_work() before every execution-layer operation -
-            # never the startup-time `tools_config` snapshot planning uses
-            # (see task_control.py's own module docstring for why that
-            # distinction is security-relevant).
-            action_registry=task_registry,
-            tools_config_loader=load_tools_config,
-            respond_provider=respond_provider,
-            authorized_sender=whatsapp_config.authorized_sender_id,
+        orchestrator = build_orchestrator(kernel_config, capability_loader)
+        client = WhatsAppClient(
+            whatsapp_config.access_token,
+            whatsapp_config.phone_number_id,
+            whatsapp_config.api_version,
         )
 
-        return WhatsAppServer(
-            whatsapp_config,
-            message_handler,
-            task_db_path=task_db_path,
-            worker_task_connection=worker_task_connection,
-        )
+        # Ensure/verify the schema exactly once, synchronously, before
+        # ThreadingHTTPServer ever begins accepting concurrent requests -
+        # this is what makes every later per-request
+        # open_writer_connection() call hit the cheap, already-current-
+        # schema path rather than racing another connection through
+        # first-ever schema creation (see task_control.py's own module
+        # docstring and the Milestone 46 P1 design report's empirical
+        # concurrency validation for why concurrent first-ever schema
+        # creation can otherwise leak a raw sqlite3.OperationalError). Safe
+        # to run exactly once, exclusively, precisely because runtime
+        # ownership is already held by this point.
+        schema_init_connection = open_writer_connection(task_db_path)
+        schema_init_connection.close()
+
+        task_registry = ActionRegistry()
+        tools_config = load_tools_config()
+        task_catalog = build_catalog(task_registry, tools_config)
+        planner_provider = get_planner_provider(kernel_config)
+
+        # Milestone 46 P2A: a second, independent conversational ModelProvider
+        # instance, dedicated to RESPOND synthesis - deliberately never the
+        # planner_provider above (see kernel/task_execution/__init__.py's
+        # model-role-separation contract). Orchestrator constructs its own
+        # provider internally with no injection seam, so this is a second
+        # instance rather than a shared one; verified harmless (a ModelProvider
+        # is a stateless config wrapper - kernel/models/ollama.py's
+        # OllamaProvider holds only four plain attributes, no connection pool,
+        # no persistent socket) - not worth adding an Orchestrator seam for.
+        respond_provider = get_provider(kernel_config)
+
+        # The single WhatsApp worker's own long-lived connection/repository -
+        # opened once here, reused for the life of the process. Ownership
+        # transfers to the returned WhatsAppServer (whose worker thread closes
+        # it - see _run_worker()'s own finally block) only once construction
+        # below actually succeeds; never shared with a request thread's own
+        # per-request connection (see task_control.py's own module docstring).
+        worker_task_connection = open_writer_connection(task_db_path)
+        try:
+            worker_task_repository = TaskRepository(worker_task_connection)
+
+            message_handler = MessageHandler(
+                orchestrator,
+                client,
+                task_repository=worker_task_repository,
+                task_catalog=task_catalog,
+                planner_provider=planner_provider,
+                # Milestone 46 P2A execution-time dependencies. action_registry
+                # reuses the same stateless task_registry instance built above
+                # for planning - ActionRegistry has no config dependency, so
+                # there is no freshness concern in sharing it. tools_config_loader
+                # is the bare load_tools_config function, called fresh by
+                # dispatch_task_work() before every execution-layer operation -
+                # never the startup-time `tools_config` snapshot planning uses
+                # (see task_control.py's own module docstring for why that
+                # distinction is security-relevant).
+                action_registry=task_registry,
+                tools_config_loader=load_tools_config,
+                respond_provider=respond_provider,
+                authorized_sender=whatsapp_config.authorized_sender_id,
+            )
+
+            return WhatsAppServer(
+                whatsapp_config,
+                message_handler,
+                task_db_path=task_db_path,
+                worker_task_connection=worker_task_connection,
+                runtime_lock=runtime_lock,
+            )
+        except Exception:
+            # Construction failed after the connection was already opened, so
+            # WhatsAppServer never took ownership of it (its worker thread will
+            # never run to close it) - close it here instead of leaking it.
+            worker_task_connection.close()
+            raise
     except Exception:
-        # Construction failed after the connection was already opened, so
-        # WhatsAppServer never took ownership of it (its worker thread will
-        # never run to close it) - close it here instead of leaking it.
-        worker_task_connection.close()
+        # Construction failed after runtime ownership was already acquired,
+        # so no WhatsAppServer exists to release it via stop() - release it
+        # here instead of leaking it (see RuntimeLock.release()'s own
+        # idempotency guarantee).
+        runtime_lock.release()
         raise
 
 

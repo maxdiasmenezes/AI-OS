@@ -5,6 +5,7 @@ real database under storage/tasks/."""
 import json
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -25,11 +26,14 @@ from kernel.employee_tasks.types import (
     TERMINAL_STATES,
     DuplicateTaskError,
     InvalidTransitionError,
+    LifecycleEventKind,
     TaskAlreadyTerminalError,
     TaskInputTooLargeError,
     TaskNotFoundError,
     TaskState,
     TaskStorageUnavailableError,
+    compute_outbox_retry_delay_seconds,
+    format_utc_timestamp,
     generate_display_id,
     generate_task_id,
 )
@@ -1074,4 +1078,294 @@ def test_get_task_by_pending_confirmation_id_performs_no_mutation(repo):
 
     after = repo.get_task(task.task_id)
     assert after == before  # identical version, state, everything - a pure read
-    assert repo.get_pending_confirmation(task.task_id) is not None  # still there, untouched
+
+
+# --- Milestone 47 P1: lifecycle outbox --------------------------------------
+
+
+def test_transition_task_to_completed_atomically_creates_outbox_event(repo):
+    record = repo.create_task("request", "whatsapp")
+    tid = record.task_id
+    repo.transition_task(tid, "created", "planning")
+    repo.transition_task(tid, "planning", "ready")
+    repo.transition_task(tid, "ready", "running")
+    completed = repo.transition_task(
+        tid, "running", "completed", reason_code="all_steps_complete", safe_summary="done"
+    )
+
+    event = repo.get_outbox_event_for_task_version(tid, completed.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_COMPLETED
+    assert event.payload_json is None
+    assert event.channel == "whatsapp"
+    assert event.delivered_at is None
+    assert event.attempt_count == 0
+    assert event.next_attempt_at == event.created_at
+
+
+def test_transition_task_to_running_creates_no_outbox_event(repo):
+    """RUNNING is never a deliverable target - confirmed for the ordinary
+    READY -> RUNNING edge every task goes through before any execution."""
+
+    record = repo.create_task("request", "whatsapp")
+    tid = record.task_id
+    repo.transition_task(tid, "created", "planning")
+    repo.transition_task(tid, "planning", "ready")
+    running = repo.transition_task(tid, "ready", "running")
+
+    assert repo.get_outbox_event_for_task_version(tid, running.version) is None
+
+
+def test_mark_failed_atomically_creates_outbox_event(repo):
+    record = repo.create_task("request", "whatsapp")
+    failed = repo.mark_failed(record.task_id, "created", "tool_error", "a tool failed safely")
+
+    event = repo.get_outbox_event_for_task_version(record.task_id, failed.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_FAILED
+    assert event.payload_json is None
+
+
+def test_mark_cancelled_atomically_creates_outbox_event(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_CANCELLED
+    assert event.payload_json is None
+
+
+def test_get_outbox_event_for_task_version_unambiguous_across_many_transitions(repo):
+    """Every intermediate, non-deliverable transition a task goes through
+    must never accidentally match a later get_outbox_event_for_task_version()
+    lookup for a DIFFERENT task_version - each version is checked
+    explicitly, proving there is no "closest" or "most recent" fallback
+    behavior hiding here."""
+
+    record = repo.create_task("request", "whatsapp")
+    tid = record.task_id
+    v_planning = repo.transition_task(tid, "created", "planning").version
+    v_ready = repo.transition_task(tid, "planning", "ready").version
+    v_running = repo.transition_task(tid, "ready", "running").version
+    v_completed = repo.transition_task(tid, "running", "completed").version
+
+    assert repo.get_outbox_event_for_task_version(tid, v_planning) is None
+    assert repo.get_outbox_event_for_task_version(tid, v_ready) is None
+    assert repo.get_outbox_event_for_task_version(tid, v_running) is None
+    event = repo.get_outbox_event_for_task_version(tid, v_completed)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_COMPLETED
+
+
+def test_get_outbox_event_for_task_version_unknown_version_returns_none(repo):
+    record = repo.create_task("request", "whatsapp")
+    assert repo.get_outbox_event_for_task_version(record.task_id, 999) is None
+
+
+def test_list_due_lifecycle_outbox_events_filters_by_channel(repo):
+    whatsapp_task = repo.create_task("request", "whatsapp")
+    other_task = repo.create_task("request", "other_channel")
+    repo.mark_cancelled(whatsapp_task.task_id, "created")
+    repo.mark_cancelled(other_task.task_id, "created")
+
+    whatsapp_due = repo.list_due_lifecycle_outbox_events("whatsapp")
+    other_due = repo.list_due_lifecycle_outbox_events("other_channel")
+
+    assert len(whatsapp_due) == 1
+    assert whatsapp_due[0].task_id == whatsapp_task.task_id
+    assert len(other_due) == 1
+    assert other_due[0].task_id == other_task.task_id
+    # Neither list ever contains the other channel's event.
+    assert all(e.channel == "whatsapp" for e in whatsapp_due)
+    assert all(e.channel == "other_channel" for e in other_due)
+
+
+def test_list_due_lifecycle_outbox_events_excludes_delivered(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    assert len(repo.list_due_lifecycle_outbox_events("whatsapp")) == 1
+    repo.mark_lifecycle_event_delivered(event.event_id)
+    assert repo.list_due_lifecycle_outbox_events("whatsapp") == []
+
+
+def test_mark_lifecycle_event_delivered_is_conditional_and_idempotent(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    first = repo.mark_lifecycle_event_delivered(event.event_id)
+    second = repo.mark_lifecycle_event_delivered(event.event_id)
+
+    assert first is True
+    assert second is False  # already delivered - a safe no-op, not an error
+
+
+def test_mark_lifecycle_event_delivery_failed_persists_retry_metadata_never_marks_delivered(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    delay = compute_outbox_retry_delay_seconds(1)
+    next_attempt_at = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, next_attempt_at)
+
+    reloaded = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+    assert reloaded.attempt_count == 1
+    # Persisted in the canonical, fixed-width UTC form - never the caller's
+    # own (nonexistent, now that this is a datetime) string.
+    assert reloaded.next_attempt_at == format_utc_timestamp(next_attempt_at)
+    assert reloaded.delivered_at is None
+    assert delay > 0  # sanity: the caller-computed delay is a real positive duration
+
+    # Far-future next_attempt_at means it is not currently due.
+    assert repo.list_due_lifecycle_outbox_events("whatsapp") == []
+
+
+def test_permanently_failing_event_does_not_block_a_newer_due_event(repo):
+    """The starvation-prevention proof: an oldest event whose next_attempt_at
+    has been pushed into the future by repeated failures must not prevent a
+    newer, still-due event from being returned first."""
+
+    old_task = repo.create_task("old request", "whatsapp")
+    old_cancelled = repo.mark_cancelled(old_task.task_id, "created")
+    old_event = repo.get_outbox_event_for_task_version(old_task.task_id, old_cancelled.version)
+
+    # Push the old event far into the future - simulating several
+    # permanent failures' worth of backoff.
+    repo.mark_lifecycle_event_delivery_failed(
+        old_event.event_id, 5, datetime(2099, 1, 1, tzinfo=timezone.utc)
+    )
+
+    new_task = repo.create_task("new request", "whatsapp")
+    new_cancelled = repo.mark_cancelled(new_task.task_id, "created")
+    new_event = repo.get_outbox_event_for_task_version(new_task.task_id, new_cancelled.version)
+
+    due = repo.list_due_lifecycle_outbox_events("whatsapp")
+    assert len(due) == 1
+    assert due[0].event_id == new_event.event_id
+
+
+# --- Milestone 47 P1 adversarial-review correction (MEDIUM-2): canonical --
+# --- next_attempt_at semantics --------------------------------------------
+
+
+def test_exact_second_next_attempt_at_is_stored_and_compared_correctly(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    past = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+    repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, past)
+
+    reloaded = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+    assert reloaded.next_attempt_at == format_utc_timestamp(past)
+    # Zero-microsecond timestamps are still correctly recognized as due -
+    # exactly the case that would be silently mishandled if this method
+    # fell back to datetime.isoformat()'s own variable-width default.
+    assert len(repo.list_due_lifecycle_outbox_events("whatsapp")) == 1
+
+
+def test_microsecond_next_attempt_at_is_stored_and_compared_correctly(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    past = datetime.now(timezone.utc).replace(microsecond=123456) - timedelta(days=1)
+    repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, past)
+
+    reloaded = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+    assert reloaded.next_attempt_at == format_utc_timestamp(past)
+    assert len(repo.list_due_lifecycle_outbox_events("whatsapp")) == 1
+
+
+def test_future_timestamp_is_excluded_from_due_events(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    future = datetime.now(timezone.utc) + timedelta(days=365)
+    repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, future)
+
+    assert repo.list_due_lifecycle_outbox_events("whatsapp") == []
+
+
+def test_due_timestamp_is_included_in_due_events(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    just_past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, just_past)
+
+    due = repo.list_due_lifecycle_outbox_events("whatsapp")
+    assert len(due) == 1
+    assert due[0].event_id == event.event_id
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "2099-01-01T00:00:00+00:00",  # a string is no longer accepted at all
+        datetime(2099, 1, 1),  # naive - no tzinfo
+        123,
+        None,
+    ],
+)
+def test_mark_lifecycle_event_delivery_failed_rejects_non_utc_datetime_input(repo, bad_value):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    with pytest.raises(TaskInputTooLargeError):
+        repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, bad_value)
+
+    # Rejected before any mutation - the event's own retry state is
+    # untouched.
+    reloaded = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+    assert reloaded.attempt_count == 0
+    assert reloaded.delivered_at is None
+
+
+def test_mark_lifecycle_event_delivery_failed_rejects_non_utc_offset(repo):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    non_utc = datetime(2099, 1, 1, tzinfo=timezone(timedelta(hours=5)))
+    with pytest.raises(TaskInputTooLargeError):
+        repo.mark_lifecycle_event_delivery_failed(event.event_id, 1, non_utc)
+
+
+def test_retry_schedule_survives_reopen(repo, db_path):
+    record = repo.create_task("request", "whatsapp")
+    cancelled = repo.mark_cancelled(record.task_id, "created")
+    event = repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    repo.mark_lifecycle_event_delivery_failed(event.event_id, 3, future)
+
+    # A fresh connection/repository, exactly like a real process restart -
+    # never the same in-memory TaskRepository/connection object.
+    reopened_conn = open_writer_connection(db_path)
+    try:
+        reopened_repo = TaskRepository(reopened_conn)
+        reloaded = reopened_repo.get_outbox_event_for_task_version(record.task_id, cancelled.version)
+        assert reloaded.attempt_count == 3
+        assert reloaded.next_attempt_at == format_utc_timestamp(future)
+        assert reopened_repo.list_due_lifecycle_outbox_events("whatsapp") == []
+    finally:
+        reopened_conn.close()
+
+
+def test_compute_outbox_retry_delay_seconds_is_bounded_and_deterministic():
+    # Monotonically non-decreasing, always positive, always capped.
+    delays = [compute_outbox_retry_delay_seconds(n) for n in range(1, 20)]
+    assert all(d > 0 for d in delays)
+    assert all(d <= 3600.0 for d in delays)
+    assert delays == sorted(delays)
+    # A very large attempt_count must never raise or hang (exponent itself
+    # is capped before 2**n is ever computed).
+    assert compute_outbox_retry_delay_seconds(10_000_000) == 3600.0

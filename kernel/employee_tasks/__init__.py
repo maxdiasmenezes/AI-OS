@@ -78,6 +78,11 @@ from kernel.employee_tasks.db import (
     resolve_database_path,
 )
 from kernel.employee_tasks.repository import TaskRepository
+from kernel.employee_tasks.runtime_lock import (
+    RuntimeLock,
+    RuntimeOwnershipUnavailableError,
+    acquire_runtime_ownership,
+)
 from kernel.employee_tasks.types import (
     ALLOWED_TRANSITIONS,
     DEFAULT_LIST_LIMIT,
@@ -88,6 +93,8 @@ from kernel.employee_tasks.types import (
     MAX_DISPLAY_ID_ATTEMPTS,
     MAX_FAILURE_CODE_CHARS,
     MAX_FAILURE_SUMMARY_CHARS,
+    MAX_LIFECYCLE_CHANNEL_CHARS,
+    MAX_LIFECYCLE_PAYLOAD_JSON_CHARS,
     MAX_LIST_LIMIT,
     MAX_METADATA_JSON_CHARS,
     MAX_PLAN_JSON_CHARS,
@@ -99,12 +106,18 @@ from kernel.employee_tasks.types import (
     MIN_LIST_LIMIT,
     MIN_REQUEST_TEXT_CHARS,
     MIN_SOURCE_CHARS,
+    OUTBOX_BASE_DELAY_SECONDS,
+    OUTBOX_MAX_DELAY_SECONDS,
     SCHEMA_VERSION,
     TERMINAL_STATES,
     ConfirmationExpiredError,
     ConfirmationMismatchError,
+    ConfirmationRequiredPayload,
     DuplicateTaskError,
     InvalidTransitionError,
+    LifecycleEventKind,
+    LifecycleEventPayloadError,
+    LifecycleOutboxEvent,
     NoPendingConfirmationError,
     PendingTaskConfirmation,
     StepAlreadyClaimedError,
@@ -121,9 +134,13 @@ from kernel.employee_tasks.types import (
     TaskStorageError,
     TaskStorageUnavailableError,
     TaskTransition,
+    compute_outbox_retry_delay_seconds,
+    deserialize_confirmation_required_payload,
+    format_utc_timestamp,
     generate_display_id,
     generate_task_id,
     parse_task_timestamp,
+    serialize_confirmation_required_payload,
 )
 
 __all__ = [
@@ -178,4 +195,19 @@ __all__ = [
     "open_writer_connection",
     "open_reader_connection",
     "check_integrity",
+    "RuntimeLock",
+    "RuntimeOwnershipUnavailableError",
+    "acquire_runtime_ownership",
+    "LifecycleEventKind",
+    "LifecycleOutboxEvent",
+    "ConfirmationRequiredPayload",
+    "LifecycleEventPayloadError",
+    "MAX_LIFECYCLE_CHANNEL_CHARS",
+    "MAX_LIFECYCLE_PAYLOAD_JSON_CHARS",
+    "OUTBOX_BASE_DELAY_SECONDS",
+    "OUTBOX_MAX_DELAY_SECONDS",
+    "serialize_confirmation_required_payload",
+    "deserialize_confirmation_required_payload",
+    "compute_outbox_retry_delay_seconds",
+    "format_utc_timestamp",
 ]

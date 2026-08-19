@@ -14,6 +14,8 @@ from kernel.employee_tasks.types import (
     ConfirmationExpiredError,
     ConfirmationMismatchError,
     InvalidTransitionError,
+    LifecycleEventKind,
+    LifecycleEventPayloadError,
     NoPendingConfirmationError,
     StepAlreadyClaimedError,
     StepNotInProgressError,
@@ -22,6 +24,7 @@ from kernel.employee_tasks.types import (
     TaskInputTooLargeError,
     TaskState,
     TaskStorageCorruptError,
+    deserialize_confirmation_required_payload,
 )
 
 _STATE_PATH = {
@@ -728,3 +731,165 @@ def test_consume_confirmation_accepts_confirmation_id_at_exactly_max_length(repo
         task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
     )
     assert result.state == TaskState.RUNNING
+
+
+# --- Milestone 47 P1: atomic lifecycle-outbox event creation ---------------
+
+
+def test_propose_confirmation_atomically_creates_confirmation_required_event(repo, task):
+    waiting = repo.propose_confirmation(
+        task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120
+    )
+    pending = repo.get_pending_confirmation(task.task_id)
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, waiting.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.CONFIRMATION_REQUIRED
+    assert event.channel == "whatsapp"
+    assert event.delivered_at is None
+    assert event.attempt_count == 0
+
+    payload = deserialize_confirmation_required_payload(event.payload_json)
+    assert payload.confirmation_id == pending.confirmation_id
+    assert payload.action_name == "repository_backup"
+    assert payload.resource_key == "ai_os"
+
+
+def test_consume_confirmation_and_claim_step_creates_no_outbox_event(repo, task):
+    """RUNNING is never a deliverable target - approval continuing
+    execution produces no standalone WhatsApp acknowledgement (see
+    interfaces/whatsapp/task_control.py's own docstring on why)."""
+
+    waiting = repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+    running = repo.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+
+    assert repo.get_outbox_event_for_task_version(task.task_id, running.version) is None
+    # The earlier CONFIRMATION_REQUIRED event is untouched by this call.
+    assert repo.get_outbox_event_for_task_version(task.task_id, waiting.version) is not None
+
+
+def test_deny_confirmation_atomically_creates_task_cancelled_event(repo, task):
+    repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+
+    cancelled = repo.deny_confirmation(task.task_id, pending.confirmation_id)
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, cancelled.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_CANCELLED
+    assert event.payload_json is None
+    assert event.channel == "whatsapp"
+
+
+def test_fail_pending_confirmation_atomically_creates_task_failed_event(repo, task):
+    repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+
+    failed = repo.fail_pending_confirmation(
+        task.task_id, pending.confirmation_id, "confirmation_expired", "The confirmation window expired."
+    )
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, failed.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_FAILED
+    assert event.payload_json is None
+
+
+def test_fail_running_step_atomically_creates_task_failed_event(repo, task):
+    repo.claim_step(task.task_id, 1)
+
+    failed = repo.fail_running_step(task.task_id, 1, "failed", "That action could not be completed.")
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, failed.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_FAILED
+    assert event.payload_json is None
+    assert event.channel == "whatsapp"
+
+
+def test_fail_running_step_task_already_terminal_creates_no_second_event(repo, task):
+    """When a concurrent writer already moved the task to a terminal state
+    before fail_running_step()'s own UPDATE runs, TaskAlreadyTerminalError
+    is raised BEFORE this method's own task_transitions/outbox insert -
+    the terminal state that actually won already has its own event from
+    whatever produced IT; this call must not create a second, spurious
+    one."""
+
+    repo.claim_step(task.task_id, 1)
+    cancelled = repo.mark_cancelled(task.task_id, TaskState.RUNNING)
+    winning_event = repo.get_outbox_event_for_task_version(task.task_id, cancelled.version)
+    assert winning_event is not None
+
+    with pytest.raises(TaskAlreadyTerminalError):
+        repo.fail_running_step(task.task_id, 1, "failed", "too late")
+
+    # Still exactly the one event the winning CANCELLED transition created -
+    # fail_running_step()'s own failed attempt never got far enough to
+    # insert a second, spurious one.
+    assert repo.get_outbox_event_for_task_version(task.task_id, cancelled.version) == winning_event
+
+
+def test_historical_confirmation_event_survives_being_replaced_by_a_later_round(repo, task):
+    """The central reconstruction-safety proof (Milestone 47 design): round
+    1's own confirmation_required event must remain fully intact and
+    correctly rendered even after its pending row is consumed and a
+    SECOND, DIFFERENT confirmation round is proposed for the same task -
+    never silently overwritten, never reinterpreted as round 2's data."""
+
+    round1 = repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending1 = repo.get_pending_confirmation(task.task_id)
+    round1_version = round1.version
+
+    repo.consume_confirmation_and_claim_step(
+        task.task_id, pending1.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    repo.mark_step_succeeded(task.task_id, 1, '{"ok": true}')
+
+    # A fresh RUNNING task with a second sensitive step proposes a second,
+    # DIFFERENT confirmation round.
+    round2 = repo.propose_confirmation(task.task_id, 2, "open_application", "notepad", ttl_seconds=120)
+    pending2 = repo.get_pending_confirmation(task.task_id)
+    assert pending2.confirmation_id != pending1.confirmation_id
+
+    # Round 1's historical event is untouched by round 2 ever happening.
+    event1 = repo.get_outbox_event_for_task_version(task.task_id, round1_version)
+    payload1 = deserialize_confirmation_required_payload(event1.payload_json)
+    assert payload1.confirmation_id == pending1.confirmation_id
+    assert payload1.action_name == "repository_backup"
+    assert payload1.resource_key == "ai_os"
+
+    event2 = repo.get_outbox_event_for_task_version(task.task_id, round2.version)
+    payload2 = deserialize_confirmation_required_payload(event2.payload_json)
+    assert payload2.confirmation_id == pending2.confirmation_id
+    assert payload2.action_name == "open_application"
+    assert payload2.resource_key == "notepad"
+
+    assert event1.event_id != event2.event_id
+    assert event1.transition_id != event2.transition_id
+
+
+def test_outbox_insert_failure_rolls_back_the_whole_confirmation_proposal(repo, task, monkeypatch):
+    """The atomicity invariant, adversarially proven: if the outbox insert
+    step itself fails (here, forcing serialize_confirmation_required_payload()
+    to raise), NOTHING commits - no state transition, no task_pending_confirmation
+    row, no task_transitions row, no outbox row. Either everything commits
+    together, or nothing does."""
+
+    import kernel.employee_tasks.repository as repository_module
+
+    def _raising_serializer(payload):
+        raise LifecycleEventPayloadError("forced failure for this test")
+
+    monkeypatch.setattr(repository_module, "serialize_confirmation_required_payload", _raising_serializer)
+
+    with pytest.raises(LifecycleEventPayloadError):
+        repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.RUNNING  # never moved to WAITING_FOR_CONFIRMATION
+    assert reloaded.version == task.version  # no version bump at all
+    assert repo.get_pending_confirmation(task.task_id) is None
+    assert repo.get_step_progress(task.task_id, 1) is None  # never claimed either

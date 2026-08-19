@@ -61,6 +61,7 @@ from interfaces.whatsapp.task_control import (
     classify_task_text,
     dispatch_confirmation_work,
     dispatch_task_work,
+    run_outbound_lifecycle_recovery_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -260,6 +261,26 @@ class MessageHandler:
             self._handle_confirmation_work(task)
         else:
             raise TypeError(f"unsupported task type: {type(task).__name__}")
+
+    def run_recovery_checkpoint(self) -> None:
+        """Milestone 47 P1: the worker's own bounded, periodic lifecycle-
+        outbox recovery opportunity - see
+        interfaces/whatsapp/server.py:WhatsAppServer._run_worker()'s own
+        docstring for the monotonic-deadline scheduling that calls this at
+        most once per checkpoint, interleaved with normal queue
+        consumption. Delegates entirely to
+        task_control.run_outbound_lifecycle_recovery_checkpoint(), which
+        attempts at most one due, undelivered WhatsApp lifecycle-outbox
+        redelivery - never task-state recovery, never durable
+        confirmation-decision pickup (neither exists yet - see this
+        milestone's own P1 scope boundary). Reuses the exact same
+        long-lived TaskRepository/client/authorized_sender already wired
+        for TaskExecutionWork/TaskConfirmationWork above - no separate
+        recovery-specific dependency exists."""
+
+        run_outbound_lifecycle_recovery_checkpoint(
+            self._task_repository, self._client, self._authorized_sender
+        )
 
     def _handle_task_execution_work(self, task: TaskExecutionWork) -> None:
         # Milestone 46 P2A's execution boundary: the full planning ->

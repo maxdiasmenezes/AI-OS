@@ -114,10 +114,14 @@ import sqlite3
 from dataclasses import dataclass
 from enum import Enum
 
+from datetime import datetime, timedelta, timezone
+
 from kernel.employee_tasks import (
     ConfirmationMismatchError,
     DuplicateTaskError,
     InvalidTransitionError,
+    LifecycleEventKind,
+    LifecycleEventPayloadError,
     NoPendingConfirmationError,
     StepAlreadyClaimedError,
     StepStatus,
@@ -127,6 +131,8 @@ from kernel.employee_tasks import (
     TaskRepository,
     TaskState,
     TaskStorageError,
+    compute_outbox_retry_delay_seconds,
+    deserialize_confirmation_required_payload,
 )
 from kernel.task_execution import (
     ExecutionAdvanceStatus,
@@ -158,9 +164,34 @@ _LIFECYCLE_MESSAGE_TOO_LONG_TEXT = (
 TASK_FAILED_FALLBACK_TEXT = "Task failed."
 TASK_COMPLETED_FALLBACK_TEXT = "Task completed."
 TASK_CANCELLED_TEXT = "Task cancelled."
-_CONFIRMATION_UNAVAILABLE_TEXT = (
-    "That task requires confirmation, but the confirmation details are not "
-    "available right now. Please try again."
+# Milestone 47 P1: the defensive fallback for the structurally-shouldn't-
+# happen case where a deliverable ExecutionAdvanceStatus has no
+# corresponding task_lifecycle_outbox row at all - see
+# _deliver_execution_result()'s own docstring. Deliberately generic across
+# every event kind (confirmation-required or terminal alike), matching
+# this module's established "never disclose which specific case happened"
+# discipline.
+_LIFECYCLE_EVENT_UNAVAILABLE_TEXT = (
+    "A task update could not be delivered right now. Please check task status directly."
+)
+# Milestone 47 P1 adversarial-review correction (LOW-2), stated explicitly so
+# this is never mistaken for a second, independent delivery path: this text
+# is sent only from the "no outbox row found for this transition" branch
+# inside _deliver_execution_result() below, which is reachable only if the
+# task_lifecycle_outbox
+# atomicity invariant documented on TaskRepository has ALREADY been
+# violated by something upstream of this function. It is a best-effort,
+# fail-safe notice for an already-broken invariant, not itself part of the
+# at-least-once delivery guarantee - that guarantee is provided entirely by
+# the outbox row (_deliver_outbox_event()/run_outbound_lifecycle_recovery_
+# checkpoint()), which this fallback does not create, retry, or backfill.
+# Milestone 47 P1: sent instead of a confirmation-required message whose
+# durable payload could not be deserialized (a structurally-unreachable,
+# read-time defense-in-depth case - see
+# kernel.employee_tasks.LifecycleEventPayloadError's own docstring) -
+# never the raw JSON, never a stack trace.
+_MALFORMED_OUTBOX_PAYLOAD_TEXT = (
+    "A task confirmation notification could not be reconstructed. Please check task status directly."
 )
 
 # Milestone 33's strict "/task" command prefix, reused here verbatim
@@ -656,6 +687,112 @@ def _send_lifecycle_message(client, recipient: str, text: str) -> None:
         logger.warning("task_control_outbound_failure")
 
 
+# Milestone 47 P1: exactly the ExecutionAdvanceStatus values that ever
+# correspond to a durable task_lifecycle_outbox row - kept as one shared
+# set so this mapping cannot silently diverge from
+# kernel.employee_tasks.TaskRepository's own
+# _DELIVERABLE_EVENT_KIND_BY_TARGET_STATE (WAITING_FOR_CONFIRMATION's own
+# CONFIRMATION_REQUIRED status is included here even though it is not a
+# key in that other mapping - propose_confirmation() inserts its own
+# outbox row directly, see that method's own docstring).
+_DELIVERABLE_STATUSES = frozenset(
+    {
+        ExecutionAdvanceStatus.CONFIRMATION_REQUIRED,
+        ExecutionAdvanceStatus.TASK_COMPLETED,
+        ExecutionAdvanceStatus.TASK_FAILED,
+        ExecutionAdvanceStatus.TASK_CANCELLED,
+    }
+)
+
+
+def _render_outbox_event_text(event, repository: TaskRepository) -> str:
+    """Render the exact user-facing text for one durable
+    task_lifecycle_outbox event - the same rendering rules
+    _deliver_execution_result() always used, just fed from the durable
+    event rather than an ExecutionAdvanceResult, so a fresh send and a
+    later recovery redelivery are indistinguishable in content.
+
+    For CONFIRMATION_REQUIRED: deserializes the event's OWN captured,
+    immutable payload - never a live task_pending_confirmation row, which
+    may already have been replaced by a later confirmation round (see
+    kernel.employee_tasks.ConfirmationRequiredPayload's own docstring for
+    why). A malformed/undeserializable payload (structurally unreachable
+    through this module's own write path - see
+    kernel.employee_tasks.LifecycleEventPayloadError's own docstring) gets
+    a fixed, bounded, code-owned fallback notice instead - never raw JSON,
+    never a stack trace, never silently treated as "nothing to send".
+
+    For every terminal kind (TASK_COMPLETED/TASK_FAILED/TASK_CANCELLED):
+    re-derives from CURRENT task/step-progress state, which is provably
+    safe here (unlike the confirmation case) because every terminal
+    transition's own inputs - plan_json, terminal step-progress rows,
+    failure_summary - are permanently immutable the instant that
+    transition commits (terminal states have no outgoing edges - see
+    kernel.employee_tasks.ALLOWED_TRANSITIONS), so "current" and
+    "at-creation-time" state are provably identical forever for a
+    terminal task."""
+
+    if event.event_kind is LifecycleEventKind.CONFIRMATION_REQUIRED:
+        if event.payload_json is None:
+            logger.warning("task_control_malformed_outbox_payload")
+            return _MALFORMED_OUTBOX_PAYLOAD_TEXT
+        try:
+            payload = deserialize_confirmation_required_payload(event.payload_json)
+        except LifecycleEventPayloadError:
+            logger.warning("task_control_malformed_outbox_payload")
+            return _MALFORMED_OUTBOX_PAYLOAD_TEXT
+        return _format_confirmation_message(payload)
+
+    task = repository.get_task(event.task_id)
+    if event.event_kind is LifecycleEventKind.TASK_COMPLETED:
+        return select_terminal_result_text(repository, task)
+    if event.event_kind is LifecycleEventKind.TASK_FAILED:
+        return _format_failure_message(task.failure_summary)
+    # LifecycleEventKind.TASK_CANCELLED - the only remaining member of the
+    # closed enum.
+    return TASK_CANCELLED_TEXT
+
+
+def _deliver_outbox_event(
+    event, repository: TaskRepository, client, authorized_sender: str
+) -> None:
+    """The single render+send+record path for every durable
+    task_lifecycle_outbox event, whether reached immediately (via
+    _deliver_execution_result(), right after the transition that produced
+    it) or later, via run_outbound_lifecycle_recovery_checkpoint() - both
+    paths render, send, and record success/failure identically, which is
+    what makes this module's at-least-once delivery guarantee actually
+    uniform rather than depending on which path happened to run.
+
+    On success: durably marks `event` delivered (conditional - a no-op if
+    something else already marked it, e.g. a defensive-in-depth race under
+    this milestone's single-runtime-ownership guarantee) - no further
+    retry. On failure: never marks delivered; persists bounded,
+    deterministic retry metadata (attempt_count, next_attempt_at - a
+    capped exponential backoff, see
+    kernel.employee_tasks.compute_outbox_retry_delay_seconds()) - never
+    the raw provider error/exception text itself, matching this module's
+    own no-detail logging discipline throughout."""
+
+    text = _render_outbox_event_text(event, repository)
+    try:
+        client.send_text_message(authorized_sender, _bounded_lifecycle_text(text))
+    except WhatsAppClientError:
+        logger.warning("task_control_outbound_failure")
+        attempt_count = event.attempt_count + 1
+        delay_seconds = compute_outbox_retry_delay_seconds(attempt_count)
+        # Milestone 47 P1 adversarial-review correction: a real,
+        # timezone-aware UTC datetime, never a pre-formatted string -
+        # mark_lifecycle_event_delivery_failed() is now the sole authority
+        # for how this gets canonically serialized (see that method's own
+        # docstring for why).
+        next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        repository.mark_lifecycle_event_delivery_failed(event.event_id, attempt_count, next_attempt_at)
+        return
+
+    repository.mark_lifecycle_event_delivered(event.event_id)
+
+
 def _deliver_execution_result(
     result, repository: TaskRepository, client, authorized_sender: str
 ) -> None:
@@ -665,39 +802,69 @@ def _deliver_execution_result(
     can only ever mean "freshly proposed on this exact call", and why every
     caller of this function has already gated on the task's PRE-CALL state
     so that a terminal status reaching here can only mean this call is what
-    produced it."""
+    produced it.
 
-    if result.status is ExecutionAdvanceStatus.CONFIRMATION_REQUIRED:
-        pending = repository.get_pending_confirmation(result.task.task_id)
-        if pending is None:
-            # Structurally shouldn't happen - CONFIRMATION_REQUIRED means
-            # propose_confirmation() committed a matching row in this same
-            # call - but never assumed away. No fabricated token, no
-            # execution, no destructive mutation - a bounded generic
-            # notice only, and the task's durable state is left exactly as
-            # the execution engine already left it.
-            logger.warning("task_control_missing_pending_confirmation")
-            _send_lifecycle_message(client, authorized_sender, _CONFIRMATION_UNAVAILABLE_TEXT)
-            return
-        _send_lifecycle_message(client, authorized_sender, _format_confirmation_message(pending))
+    Milestone 47 P1: delivery is now durable-event-backed end to end -
+    every status in _DELIVERABLE_STATUSES corresponds to EXACTLY one
+    task_lifecycle_outbox row, atomically created by TaskRepository in the
+    SAME transaction as the transition that produced it (see that
+    module's own docstring for the exact atomicity invariant: the
+    transition commits with its outbox row, or neither commits). This
+    function looks that event up via result.task's own (task_id, version)
+    - an exact, unambiguous correlation, never an "oldest/latest pending"
+    guess even across many historical confirmation rounds - then renders
+    and sends through the SAME _deliver_outbox_event() path
+    run_outbound_lifecycle_recovery_checkpoint() also uses."""
+
+    if result.status not in _DELIVERABLE_STATUSES:
+        # ExecutionAdvanceStatus.WAITING_FOR_CONFIRMATION (already
+        # delivered on a prior advance) or STEP_SUCCEEDED (unreachable
+        # from run_task_until_blocked()'s own stopping set) - nothing to
+        # deliver.
         return
 
-    if result.status is ExecutionAdvanceStatus.TASK_COMPLETED:
-        text = select_terminal_result_text(repository, result.task)
-        _send_lifecycle_message(client, authorized_sender, text)
+    event = repository.get_outbox_event_for_task_version(result.task.task_id, result.task.version)
+    if event is None:
+        # Structurally shouldn't happen - every deliverable transition
+        # atomically creates its own outbox row in the SAME transaction
+        # (see kernel.employee_tasks.TaskRepository's own module
+        # docstring) - but never assumed away. No fabricated content, no
+        # execution, no destructive mutation - a bounded generic notice
+        # only, and the task's durable state is left exactly as the
+        # execution engine already left it. This notice is best-effort
+        # only (see _LIFECYCLE_EVENT_UNAVAILABLE_TEXT's own comment): it is
+        # sent once, here, with no outbox row of its own, so it is never
+        # retried by run_outbound_lifecycle_recovery_checkpoint() and is
+        # not covered by this module's at-least-once delivery guarantee -
+        # that guarantee applies only to events that DO have an outbox row.
+        logger.warning("task_control_missing_outbox_event")
+        _send_lifecycle_message(client, authorized_sender, _LIFECYCLE_EVENT_UNAVAILABLE_TEXT)
         return
 
-    if result.status is ExecutionAdvanceStatus.TASK_FAILED:
-        _send_lifecycle_message(client, authorized_sender, _format_failure_message(result.task.failure_summary))
-        return
+    _deliver_outbox_event(event, repository, client, authorized_sender)
 
-    if result.status is ExecutionAdvanceStatus.TASK_CANCELLED:
-        _send_lifecycle_message(client, authorized_sender, TASK_CANCELLED_TEXT)
-        return
 
-    # ExecutionAdvanceStatus.WAITING_FOR_CONFIRMATION (already delivered on
-    # a prior advance) or STEP_SUCCEEDED (unreachable from
-    # run_task_until_blocked()'s own stopping set) - nothing to deliver.
+def run_outbound_lifecycle_recovery_checkpoint(
+    repository: TaskRepository, client, authorized_sender: str
+) -> None:
+    """Milestone 47 P1: attempt AT MOST ONE due, undelivered WhatsApp
+    lifecycle-outbox redelivery per call - deliberately bounded to exactly
+    one external send, never a whole page, so a burst of pending
+    notifications (or a permanently-failing one) can never block the
+    worker's own normal queue responsiveness for longer than one outbound
+    Cloud API attempt (see interfaces/whatsapp/server.py's own
+    monotonic-deadline recovery-checkpoint scheduling, which calls this
+    function at most once per checkpoint). Filters strictly on
+    channel=TASK_SOURCE ("whatsapp") - this is what makes it structurally
+    impossible for this function to ever consume, and therefore ever
+    misdeliver, a different source/channel's lifecycle event (see
+    kernel.employee_tasks.LifecycleOutboxEvent's own docstring). A
+    complete no-op, cheaply, if nothing is currently due."""
+
+    due_events = repository.list_due_lifecycle_outbox_events(channel=TASK_SOURCE, limit=1)
+    if not due_events:
+        return
+    _deliver_outbox_event(due_events[0], repository, client, authorized_sender)
 
 
 def dispatch_task_work(

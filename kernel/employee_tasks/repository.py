@@ -101,8 +101,11 @@ from kernel.employee_tasks.types import (
     TERMINAL_STATES,
     ConfirmationExpiredError,
     ConfirmationMismatchError,
+    ConfirmationRequiredPayload,
     DuplicateTaskError,
     InvalidTransitionError,
+    LifecycleEventKind,
+    LifecycleOutboxEvent,
     NoPendingConfirmationError,
     PendingTaskConfirmation,
     StepAlreadyClaimedError,
@@ -116,9 +119,11 @@ from kernel.employee_tasks.types import (
     TaskStepProgress,
     TaskStorageUnavailableError,
     TaskTransition,
+    format_utc_timestamp,
     generate_display_id,
     generate_task_id,
     parse_task_timestamp,
+    serialize_confirmation_required_payload,
 )
 
 _TERMINAL_STATE_VALUES = frozenset(state.value for state in TERMINAL_STATES)
@@ -138,6 +143,31 @@ _PENDING_CONFIRMATION_SELECT_COLUMNS = (
     "task_id, confirmation_id, step_position, action_name, resource_key, "
     "created_at, expires_at"
 )
+
+_OUTBOX_SELECT_COLUMNS = (
+    "event_id, task_id, transition_id, channel, event_kind, payload_json, "
+    "created_at, delivered_at, attempt_count, next_attempt_at"
+)
+
+# Milestone 47 P1: the exhaustive, closed mapping from a transition's
+# TARGET TaskState to the LifecycleEventKind it obligates - every
+# transition-producing method that can ever commit one of these three
+# target states (via _apply_transition()) or CANCELLED/FAILED via
+# _resolve_pending_confirmation() atomically inserts the corresponding
+# outbox row in the same transaction (see this module's own docstring for
+# the full atomicity invariant). WAITING_FOR_CONFIRMATION is deliberately
+# absent here - it is never reachable through _apply_transition() or
+# _resolve_pending_confirmation() at all (see
+# _reject_generic_waiting_for_confirmation()'s own docstring); its own
+# single legal entry point, propose_confirmation(), inserts its
+# CONFIRMATION_REQUIRED outbox row directly, since it alone has the
+# action_name/resource_key/confirmation_id payload data that event kind
+# needs.
+_DELIVERABLE_EVENT_KIND_BY_TARGET_STATE: dict[TaskState, LifecycleEventKind] = {
+    TaskState.COMPLETED: LifecycleEventKind.TASK_COMPLETED,
+    TaskState.FAILED: LifecycleEventKind.TASK_FAILED,
+    TaskState.CANCELLED: LifecycleEventKind.TASK_CANCELLED,
+}
 
 
 def _now() -> str:
@@ -326,19 +356,94 @@ def _row_to_pending_confirmation(row) -> PendingTaskConfirmation:
     )
 
 
-def _select_task_state_for_update(conn: sqlite3.Connection, task_id: str) -> tuple[str, int]:
-    """Must be called after BEGIN IMMEDIATE, inside the write-locked
-    transaction that will act on the result. Returns (state, version) for
-    an existing task, or raises TaskNotFoundError. Shared by every method
-    (claim_step, propose_confirmation, consume_confirmation_and_claim_step,
-    deny_confirmation, fail_pending_confirmation, fail_running_step) that
-    needs to check the task's CURRENT state before acting on it - never a
-    caller-held, possibly-stale TaskRecord."""
+def _row_to_outbox_event(row) -> LifecycleOutboxEvent:
+    return LifecycleOutboxEvent(
+        event_id=row[0],
+        task_id=row[1],
+        transition_id=row[2],
+        channel=row[3],
+        event_kind=LifecycleEventKind(row[4]),
+        payload_json=row[5],
+        created_at=row[6],
+        delivered_at=row[7],
+        attempt_count=row[8],
+        next_attempt_at=row[9],
+    )
 
-    row = conn.execute("SELECT state, version FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+
+def _insert_outbox_event(
+    conn: sqlite3.Connection,
+    now: str,
+    task_id: str,
+    source: str,
+    transition_id: int,
+    event_kind: LifecycleEventKind,
+    payload_json: str | None,
+) -> None:
+    """Milestone 47 P1: MUST be called from inside an already-open BEGIN
+    IMMEDIATE transaction, immediately after the task_transitions INSERT
+    that produced `transition_id` (that row's own cursor.lastrowid) - see
+    this module's own docstring for the exact atomicity invariant this
+    upholds: the state transition, its journal row, and this outbox row
+    all commit together, or none of them do. `source` becomes `channel`
+    verbatim - the caller is responsible for having read it from the SAME
+    `tasks` row this transaction is already acting on (never a second,
+    independent lookup), so a WhatsApp-only delivery/recovery path can
+    filter on it and never consume a different channel's event.
+
+    Milestone 47 P1 adversarial-review correction: created_at/
+    next_attempt_at are stored in the CANONICAL, fixed-width,
+    always-microsecond-precision UTC form
+    (kernel.employee_tasks.types.format_utc_timestamp()) - never `now`
+    verbatim - so list_due_lifecycle_outbox_events()'s own plain lexical
+    SQL comparison is provably, not merely coincidentally, equivalent to
+    chronological ordering (see that method's own docstring for the exact
+    invariant). `now` is re-parsed via parse_task_timestamp() rather than
+    calling datetime.now() a second time here, so this row's own
+    created_at/next_attempt_at stays the exact SAME instant as the rest of
+    this transaction's own timestamp columns, never a few microseconds
+    later."""
+
+    canonical_now = format_utc_timestamp(parse_task_timestamp(now, "now"))
+    conn.execute(
+        "INSERT INTO task_lifecycle_outbox ("
+        "event_id, task_id, transition_id, channel, event_kind, payload_json, "
+        "created_at, attempt_count, next_attempt_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        (
+            generate_task_id(),
+            task_id,
+            transition_id,
+            source,
+            event_kind.value,
+            payload_json,
+            canonical_now,
+            canonical_now,
+        ),
+    )
+
+
+def _select_task_state_for_update(conn: sqlite3.Connection, task_id: str) -> tuple[str, int, str]:
+    """Must be called after BEGIN IMMEDIATE, inside the write-locked
+    transaction that will act on the result. Returns (state, version,
+    source) for an existing task, or raises TaskNotFoundError. Shared by
+    every method (claim_step, propose_confirmation,
+    consume_confirmation_and_claim_step, deny_confirmation,
+    fail_pending_confirmation, fail_running_step) that needs to check the
+    task's CURRENT state before acting on it - never a caller-held,
+    possibly-stale TaskRecord. `source` (Milestone 47 P1) is returned
+    alongside state/version purely so the methods that atomically insert a
+    task_lifecycle_outbox row (propose_confirmation, fail_running_step,
+    _resolve_pending_confirmation) never need a second SELECT for it - the
+    two callers that don't insert an outbox row (claim_step,
+    consume_confirmation_and_claim_step) simply ignore it."""
+
+    row = conn.execute(
+        "SELECT state, version, source FROM tasks WHERE task_id = ?", (task_id,)
+    ).fetchone()
     if row is None:
         raise TaskNotFoundError(task_id)
-    return row[0], row[1]
+    return row[0], row[1], row[2]
 
 
 def _require_task_state(actual_state: str, expected: TaskState) -> None:
@@ -864,7 +969,7 @@ class TaskRepository:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            actual_state, task_version = _select_task_state_for_update(conn, task_id)
+            actual_state, task_version, _source = _select_task_state_for_update(conn, task_id)
             _require_task_state(actual_state, TaskState.RUNNING)
 
             conn.execute(
@@ -976,7 +1081,7 @@ class TaskRepository:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            actual_state, current_version, source = _select_task_state_for_update(conn, task_id)
             _require_task_state(actual_state, TaskState.RUNNING)
 
             step_cursor = conn.execute(
@@ -1028,7 +1133,7 @@ class TaskRepository:
                 )
 
             new_version = current_version + 1
-            conn.execute(
+            transitions_cursor = conn.execute(
                 "INSERT INTO task_transitions ("
                 "task_id, from_state, to_state, timestamp, reason_code, "
                 "safe_summary, task_version"
@@ -1042,6 +1147,15 @@ class TaskRepository:
                     failure_summary,
                     new_version,
                 ),
+            )
+            _insert_outbox_event(
+                conn,
+                now,
+                task_id,
+                source,
+                transitions_cursor.lastrowid,
+                LifecycleEventKind.TASK_FAILED,
+                payload_json=None,
             )
         except sqlite3.OperationalError as exc:
             conn.execute("ROLLBACK")
@@ -1141,7 +1255,7 @@ class TaskRepository:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            actual_state, current_version, source = _select_task_state_for_update(conn, task_id)
             _require_task_state(actual_state, TaskState.RUNNING)
 
             existing_step = conn.execute(
@@ -1188,7 +1302,7 @@ class TaskRepository:
             )
 
             new_version = current_version + 1
-            conn.execute(
+            transitions_cursor = conn.execute(
                 "INSERT INTO task_transitions ("
                 "task_id, from_state, to_state, timestamp, reason_code, "
                 "safe_summary, task_version"
@@ -1202,6 +1316,32 @@ class TaskRepository:
                     safe_summary,
                     new_version,
                 ),
+            )
+
+            # Milestone 47 P1: the ONE event_kind that needs a captured,
+            # immutable payload - action_name/resource_key/confirmation_id
+            # are exactly the fields already validated above and already
+            # written to task_pending_confirmation in this same
+            # transaction; capturing them a second time here, atomically,
+            # is what lets a later confirmation round replace the pending
+            # row without destroying this historical event's own ability
+            # to be rendered correctly (see ConfirmationRequiredPayload's
+            # own docstring).
+            confirmation_payload_json = serialize_confirmation_required_payload(
+                ConfirmationRequiredPayload(
+                    confirmation_id=confirmation_id,
+                    action_name=action_name,
+                    resource_key=resource_key,
+                )
+            )
+            _insert_outbox_event(
+                conn,
+                now,
+                task_id,
+                source,
+                transitions_cursor.lastrowid,
+                LifecycleEventKind.CONFIRMATION_REQUIRED,
+                confirmation_payload_json,
             )
         except sqlite3.OperationalError as exc:
             conn.execute("ROLLBACK")
@@ -1313,7 +1453,7 @@ class TaskRepository:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            actual_state, current_version, _source = _select_task_state_for_update(conn, task_id)
             _require_task_state(actual_state, TaskState.WAITING_FOR_CONFIRMATION)
 
             pending_row = conn.execute(
@@ -1483,7 +1623,7 @@ class TaskRepository:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            actual_state, current_version = _select_task_state_for_update(conn, task_id)
+            actual_state, current_version, source = _select_task_state_for_update(conn, task_id)
             _require_task_state(actual_state, TaskState.WAITING_FOR_CONFIRMATION)
 
             pending_row = conn.execute(
@@ -1522,7 +1662,7 @@ class TaskRepository:
                 )
 
             new_version = current_version + 1
-            conn.execute(
+            transitions_cursor = conn.execute(
                 "INSERT INTO task_transitions ("
                 "task_id, from_state, to_state, timestamp, reason_code, "
                 "safe_summary, task_version"
@@ -1536,6 +1676,15 @@ class TaskRepository:
                     safe_summary,
                     new_version,
                 ),
+            )
+            _insert_outbox_event(
+                conn,
+                now,
+                task_id,
+                source,
+                transitions_cursor.lastrowid,
+                _DELIVERABLE_EVENT_KIND_BY_TARGET_STATE[target_state],
+                payload_json=None,
             )
         except sqlite3.OperationalError as exc:
             conn.execute("ROLLBACK")
@@ -1615,12 +1764,12 @@ class TaskRepository:
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
-                "SELECT state, started_at, version FROM tasks WHERE task_id = ?", (task_id,)
+                "SELECT state, started_at, version, source FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             if row is None:
                 raise TaskNotFoundError(task_id)
 
-            actual_state, started_at, current_version = row
+            actual_state, started_at, current_version, source = row
             if actual_state != expected.value:
                 if actual_state in _TERMINAL_STATE_VALUES:
                     raise TaskAlreadyTerminalError(actual_state)
@@ -1664,13 +1813,32 @@ class TaskRepository:
                 )
 
             new_version = current_version + 1
-            conn.execute(
+            transitions_cursor = conn.execute(
                 "INSERT INTO task_transitions ("
                 "task_id, from_state, to_state, timestamp, reason_code, "
                 "safe_summary, task_version"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (task_id, expected.value, target.value, now, reason_code, safe_summary, new_version),
             )
+
+            # Milestone 47 P1: WAITING_FOR_CONFIRMATION is never a possible
+            # `target` here - _reject_generic_waiting_for_confirmation()
+            # (called by every public caller of this method) already
+            # refuses that edge before this method is ever reached - so
+            # this lookup only ever needs to cover
+            # COMPLETED/FAILED/CANCELLED, exactly what
+            # _DELIVERABLE_EVENT_KIND_BY_TARGET_STATE holds.
+            deliverable_kind = _DELIVERABLE_EVENT_KIND_BY_TARGET_STATE.get(target)
+            if deliverable_kind is not None:
+                _insert_outbox_event(
+                    conn,
+                    now,
+                    task_id,
+                    source,
+                    transitions_cursor.lastrowid,
+                    deliverable_kind,
+                    payload_json=None,
+                )
         except sqlite3.OperationalError as exc:
             conn.execute("ROLLBACK")
             raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
@@ -1681,3 +1849,172 @@ class TaskRepository:
             conn.execute("COMMIT")
 
         return self.get_task(task_id)
+
+    # -- lifecycle outbox (Milestone 47 P1) ---------------------------------
+
+    def get_outbox_event_for_task_version(
+        self, task_id: str, task_version: int
+    ) -> LifecycleOutboxEvent | None:
+        """Exact, unambiguous correlation between a freshly-produced
+        TaskRecord (any caller already has one in hand, immediately after a
+        transition-producing call - e.g. ExecutionAdvanceResult.task) and
+        the ONE outbox event that transition atomically created, if any.
+        `task_version` (a strictly-incrementing, never-reused counter -
+        see TaskRecord.version) maps 1:1 to exactly one task_transitions
+        row for a given task_id, which in turn maps 1:1 (transition_id is
+        UNIQUE) to at most one outbox row - so this is never an "oldest
+        pending" or "most recent" guess even when a task has been through
+        many historical lifecycle events (e.g. several confirmation
+        rounds). Returns None both when the transition that produced this
+        exact task_version was not a deliverable one (e.g. READY ->
+        RUNNING) and when no task_transitions row exists for this
+        (task_id, task_version) pair at all - callers must treat both the
+        same way (nothing to deliver), never raise on either."""
+
+        row = self._conn.execute(
+            "SELECT o.event_id, o.task_id, o.transition_id, o.channel, o.event_kind, "
+            "o.payload_json, o.created_at, o.delivered_at, o.attempt_count, o.next_attempt_at "
+            "FROM task_lifecycle_outbox o "
+            "JOIN task_transitions t ON t.transition_id = o.transition_id "
+            "WHERE o.task_id = ? AND t.task_version = ?",
+            (task_id, task_version),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_outbox_event(row)
+
+    def list_due_lifecycle_outbox_events(
+        self, channel: str, limit: int = DEFAULT_LIST_LIMIT
+    ) -> list[LifecycleOutboxEvent]:
+        """Bounded, indexed lookup of undelivered outbox events for exactly
+        one channel, whose next_attempt_at has already arrived - never a
+        cross-channel scan (see LifecycleOutboxEvent's own docstring on why
+        a delivery/recovery loop must filter on channel). Ordered by
+        (next_attempt_at, event_id) - the same stable keyset ordering
+        task_lifecycle_outbox_pending_idx is built for (see db.py's own
+        comment): a permanently-failing event's OWN next_attempt_at moves
+        into the future on every failed attempt (see
+        TaskRepository.mark_lifecycle_event_delivery_failed()), which is
+        what keeps it from ever permanently blocking a newer, still-due
+        event at the front of this ordering. `now` is computed internally,
+        matching every other method in this class that never accepts a
+        caller-supplied clock value.
+
+        LEXICAL-EQUALS-CHRONOLOGICAL INVARIANT (Milestone 47 P1
+        adversarial-review correction, load-bearing - do not weaken
+        without re-reading this comment): the `next_attempt_at <= ?`
+        comparison below is a PLAIN SQLite TEXT/BINARY comparison, not a
+        real datetime comparison - this is what keeps the query cheap and
+        indexed (task_lifecycle_outbox_pending_idx is a plain btree index
+        over this same column, ASC). This is provably safe ONLY because
+        EVERY next_attempt_at (and created_at) value this table ever
+        stores is written via kernel.employee_tasks.types.
+        format_utc_timestamp() - a fixed-width, always-six-fractional-
+        digit, UTC-normalized ISO-8601 string (see
+        _insert_outbox_event()/mark_lifecycle_event_delivery_failed()) -
+        never datetime.isoformat()'s own default, variable-width output
+        (which omits the fractional-seconds suffix entirely when it is
+        exactly zero - see parse_task_timestamp()'s own docstring for why
+        that specific variation is unsafe to compare lexically in
+        general). `now` here is computed through the SAME canonical
+        function, so the comparison is always apples-to-apples."""
+
+        channel = _validate_bounded_text(channel, "channel", 1, MAX_SOURCE_CHARS)
+        limit = _validate_limit(limit)
+        now = format_utc_timestamp(datetime.now(timezone.utc))
+        rows = self._conn.execute(
+            f"SELECT {_OUTBOX_SELECT_COLUMNS} FROM task_lifecycle_outbox "
+            "WHERE channel = ? AND delivered_at IS NULL AND next_attempt_at <= ? "
+            "ORDER BY next_attempt_at, event_id LIMIT ?",
+            (channel, now, limit),
+        ).fetchall()
+        return [_row_to_outbox_event(row) for row in rows]
+
+    def mark_lifecycle_event_delivered(self, event_id: str) -> bool:
+        """Conditional, idempotent: sets delivered_at only if it is
+        currently NULL. Returns True if this call actually marked it (the
+        normal case), False if it was already delivered by an earlier
+        call - never raises for the already-delivered case, since that is
+        not an error, only a race this method's own conditional UPDATE
+        already resolves safely (see this module's own module docstring on
+        why every state-changing method here uses this shape)."""
+
+        event_id = _validate_bounded_text(event_id, "event_id", 1, MAX_CONFIRMATION_ID_CHARS)
+        conn = self._conn
+        now = _now()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "UPDATE task_lifecycle_outbox SET delivered_at = ? "
+                "WHERE event_id = ? AND delivered_at IS NULL",
+                (now, event_id),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+        return cursor.rowcount > 0
+
+    def mark_lifecycle_event_delivery_failed(
+        self, event_id: str, attempt_count: int, next_attempt_at: datetime
+    ) -> None:
+        """Persist retry metadata for a failed delivery attempt - never
+        marks delivered_at, never stores the raw provider error/exception
+        text (the caller passes only the new, already-computed
+        attempt_count/next_attempt_at - see
+        kernel.employee_tasks.compute_outbox_retry_delay_seconds() - never
+        this method's job to compute the backoff itself, matching this
+        module's own "policy stays with the caller" doctrine for
+        failure_code/failure_summary elsewhere in this class). Conditional
+        on delivered_at IS NULL, exactly like
+        mark_lifecycle_event_delivered() - a race against a delivery that
+        already succeeded must never resurrect a genuinely-delivered event
+        back into the pending set.
+
+        Milestone 47 P1 adversarial-review correction: `next_attempt_at`
+        is now a real, timezone-aware datetime - never caller-supplied raw
+        text. This method is the SOLE authority for how it gets
+        serialized (kernel.employee_tasks.types.format_utc_timestamp() -
+        always UTC, always fixed-width microsecond precision), which is
+        what makes list_due_lifecycle_outbox_events()'s own plain lexical
+        comparison provably correct (see that method's own docstring).
+        `next_attempt_at` must be genuinely UTC (`utcoffset() ==
+        timedelta()`) - a non-UTC offset is REJECTED outright here
+        (TaskInputTooLargeError), never silently converted: the only
+        production caller (interfaces/whatsapp/task_control.py) always
+        constructs `datetime.now(timezone.utc)`, so there is no legitimate
+        reason for a non-UTC value to ever reach this method, and failing
+        closed on anything unexpected matches this class's own doctrine
+        throughout."""
+
+        event_id = _validate_bounded_text(event_id, "event_id", 1, MAX_CONFIRMATION_ID_CHARS)
+        if not isinstance(attempt_count, int) or isinstance(attempt_count, bool) or attempt_count < 0:
+            raise TaskInputTooLargeError("attempt_count must be a non-negative integer")
+        if (
+            not isinstance(next_attempt_at, datetime)
+            or next_attempt_at.tzinfo is None
+            or next_attempt_at.utcoffset() != timedelta()
+        ):
+            raise TaskInputTooLargeError("next_attempt_at must be a UTC (offset +00:00) datetime")
+        next_attempt_at_text = format_utc_timestamp(next_attempt_at)
+
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE task_lifecycle_outbox SET attempt_count = ?, next_attempt_at = ? "
+                "WHERE event_id = ? AND delivered_at IS NULL",
+                (attempt_count, next_attempt_at_text, event_id),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")

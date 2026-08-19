@@ -18,6 +18,7 @@ call, proven the same way P2A's own confirmation-gate tests already do.
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
@@ -54,6 +55,7 @@ from interfaces.whatsapp.task_control import (
     TaskFixedReply,
     TaskRequestText,
     _GENERIC_INVALID_CONFIRMATION_TEXT,
+    _MALFORMED_OUTBOX_PAYLOAD_TEXT,
     accept_task_message,
     classify_confirmation_text,
     classify_task_text,
@@ -61,6 +63,7 @@ from interfaces.whatsapp.task_control import (
     dispatch_confirmation_work,
     dispatch_task_work,
     needs_dispatch,
+    run_outbound_lifecycle_recovery_checkpoint,
     select_terminal_result_text,
 )
 
@@ -872,16 +875,20 @@ def test_sensitive_task_duplicate_dispatch_does_not_resend_or_execute(repo):
 
 
 def test_missing_pending_confirmation_fails_safe_without_fabrication(repo, monkeypatch):
-    """Defensive path: CONFIRMATION_REQUIRED structurally implies a pending
-    row exists, but this is never assumed - if get_pending_confirmation()
-    somehow returns None, no token is fabricated, nothing executes, and a
-    bounded generic message is sent instead."""
+    """Defensive path (Milestone 47 P1): a deliverable
+    ExecutionAdvanceStatus structurally implies TaskRepository already
+    atomically created the matching task_lifecycle_outbox row, but this is
+    never assumed - if get_outbox_event_for_task_version() somehow returns
+    None, no token/text is fabricated, nothing executes, and a bounded
+    generic message is sent instead."""
 
     task = _ready_task(repo, [_action_step(1, "open_application", "notepad")])
     client = RecordingClient()
     loader = lambda: _tools_config(approved_applications={"notepad": object()})
 
-    monkeypatch.setattr(TaskRepository, "get_pending_confirmation", lambda self, task_id: None)
+    monkeypatch.setattr(
+        TaskRepository, "get_outbox_event_for_task_version", lambda self, task_id, task_version: None
+    )
 
     _dispatch(repo, task.task_id, catalog=(), planner_provider=_FakeModelProvider([]),
               tools_config_loader=loader, client=client)
@@ -1284,14 +1291,19 @@ def test_task_cancelled_uses_fixed_text_never_model_synthesized(repo):
     # TASK_CANCELLED is not reachable through dispatch_task_work() in P2A
     # (only deny_task_confirmation(), Milestone 46 P2B, ever produces it) -
     # this proves the delivery wrapper itself is correct and ready for P2B
-    # to reuse, using a directly-constructed ExecutionAdvanceResult.
+    # to reuse. Milestone 47 P1: delivery is durable-outbox-backed end to
+    # end, so this must be a REAL cancellation - mark_cancelled()
+    # atomically creates the corresponding task_lifecycle_outbox row in
+    # the same transaction - rather than a hand-constructed
+    # ExecutionAdvanceResult with no matching durable event.
     from kernel.task_execution import ExecutionAdvanceResult, ExecutionAdvanceStatus
 
     import interfaces.whatsapp.task_control as task_control_module
 
     task = repo.create_task("request", "whatsapp")
+    cancelled_task = repo.mark_cancelled(task.task_id, TaskState.CREATED)
     client = RecordingClient()
-    result = ExecutionAdvanceResult(task, ExecutionAdvanceStatus.TASK_CANCELLED)
+    result = ExecutionAdvanceResult(cancelled_task, ExecutionAdvanceStatus.TASK_CANCELLED)
 
     task_control_module._deliver_execution_result(result, repo, client, _AUTHORIZED_SENDER)
 
@@ -2026,3 +2038,147 @@ def test_send_failure_after_reject_does_not_roll_back_or_replay(repo):
         task_control_module.SafeTaskExecutor = real_executor
     assert recording_client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
     assert executor_calls.calls == []
+
+
+# --- Milestone 47 P1: run_outbound_lifecycle_recovery_checkpoint() ---------
+
+
+def test_recovery_checkpoint_noop_when_nothing_due(repo):
+    client = RecordingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+    assert client.sent == []
+
+
+def test_recovery_checkpoint_delivers_at_most_one_due_event_per_call(repo):
+    task_a = repo.create_task("request a", "whatsapp")
+    task_b = repo.create_task("request b", "whatsapp")
+    repo.mark_cancelled(task_a.task_id, TaskState.CREATED)
+    repo.mark_cancelled(task_b.task_id, TaskState.CREATED)
+
+    client = RecordingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    # Exactly one external send this checkpoint, never both at once - see
+    # task_control.run_outbound_lifecycle_recovery_checkpoint()'s own
+    # docstring for why this bound exists.
+    assert len(client.sent) == 1
+    assert client.sent[0] == (_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)
+
+    still_due = repo.list_due_lifecycle_outbox_events("whatsapp")
+    assert len(still_due) == 1  # the other event remains untouched, still pending
+
+    # A second checkpoint call picks up the remaining one.
+    client2 = RecordingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client2, _AUTHORIZED_SENDER)
+    assert len(client2.sent) == 1
+    assert repo.list_due_lifecycle_outbox_events("whatsapp") == []
+
+
+def test_recovery_checkpoint_never_consumes_a_different_channel_event(repo):
+    other_task = repo.create_task("other-channel request", "other_channel")
+    repo.mark_cancelled(other_task.task_id, TaskState.CREATED)
+
+    client = RecordingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    assert client.sent == []
+    # The other channel's event remains completely untouched - never
+    # marked delivered, never attempted.
+    other_event = repo.get_outbox_event_for_task_version(
+        other_task.task_id, repo.get_task(other_task.task_id).version
+    )
+    assert other_event.delivered_at is None
+    assert other_event.attempt_count == 0
+
+
+def test_recovery_checkpoint_send_failure_persists_retry_metadata(repo):
+    task = repo.create_task("request", "whatsapp")
+    repo.mark_cancelled(task.task_id, TaskState.CREATED)
+
+    client = FailingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    event = repo.list_due_lifecycle_outbox_events("whatsapp", limit=100)
+    # A failed attempt does not clear the row from "pending" - but its
+    # next_attempt_at is pushed into the future, so it may or may not still
+    # be "due" depending on the exact backoff; check the underlying row
+    # directly via get_outbox_event_for_task_version() instead.
+    reloaded_task = repo.get_task(task.task_id)
+    outbox_event = repo.get_outbox_event_for_task_version(task.task_id, reloaded_task.version)
+    assert outbox_event.delivered_at is None
+    assert outbox_event.attempt_count == 1
+    assert outbox_event.next_attempt_at > outbox_event.created_at
+
+
+def test_recovery_checkpoint_repeated_failure_never_marks_delivered(repo):
+    task = repo.create_task("request", "whatsapp")
+    repo.mark_cancelled(task.task_id, TaskState.CREATED)
+    event_before = repo.get_outbox_event_for_task_version(task.task_id, repo.get_task(task.task_id).version)
+
+    client = FailingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    # Force it due again immediately (bypassing the real backoff delay,
+    # exactly like the repository-level starvation test does) and fail
+    # again, proving attempt_count accumulates and delivered_at is never
+    # set purely because of repeated attempts.
+    repo.mark_lifecycle_event_delivery_failed(event_before.event_id, 1, datetime.now(timezone.utc))
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    final = repo.get_outbox_event_for_task_version(task.task_id, repo.get_task(task.task_id).version)
+    assert final.delivered_at is None
+    assert final.attempt_count == 2
+
+
+# --- Milestone 47 P1: malformed durable payload never crashes the worker ---
+
+
+def _force_redelivery_with_corrupted_payload(repo, event) -> None:
+    """_waiting_task() already drives a real dispatch_task_work() call
+    internally, which already durably delivers the fresh
+    CONFIRMATION_REQUIRED event via its own internal RecordingClient - so
+    by the time a test gets `event`, it is already marked delivered. This
+    resets it back to "due now" (delivered_at cleared, next_attempt_at
+    moved to the past) AND corrupts its payload in the same step - never
+    reachable through any supported write API, exactly like a manually
+    altered/corrupted database row."""
+
+    repo._conn.execute(
+        "UPDATE task_lifecycle_outbox SET payload_json = ?, delivered_at = NULL, "
+        "next_attempt_at = '2020-01-01T00:00:00+00:00' WHERE event_id = ?",
+        ("not valid json{{{", event.event_id),
+    )
+
+
+def test_malformed_confirmation_payload_uses_fallback_never_crashes(repo):
+    """Structurally unreachable through this module's own write path, but
+    proven safe anyway (Milestone 47 design requirement): a durably
+    corrupted confirmation_required payload must never crash the worker,
+    never leak raw JSON/SQL detail, and must still respect the normal
+    delivered/retry recording discipline."""
+
+    task, pending = _waiting_task(repo, action_name="open_application", resource_key="notepad")
+    event = repo.get_outbox_event_for_task_version(task.task_id, task.version)
+    assert event is not None
+    _force_redelivery_with_corrupted_payload(repo, event)
+
+    client = RecordingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    assert client.sent == [(_AUTHORIZED_SENDER, _MALFORMED_OUTBOX_PAYLOAD_TEXT)]
+    reloaded = repo.get_outbox_event_for_task_version(task.task_id, task.version)
+    assert reloaded.delivered_at is not None  # fallback send succeeded -> marked delivered
+
+
+def test_malformed_confirmation_payload_fallback_send_failure_persists_retry(repo):
+    task, pending = _waiting_task(repo, action_name="open_application", resource_key="notepad")
+    event = repo.get_outbox_event_for_task_version(task.task_id, task.version)
+    _force_redelivery_with_corrupted_payload(repo, event)
+
+    client = FailingClient()
+    run_outbound_lifecycle_recovery_checkpoint(repo, client, _AUTHORIZED_SENDER)
+
+    reloaded = repo.get_outbox_event_for_task_version(task.task_id, task.version)
+    assert reloaded.delivered_at is None  # never marked delivered on a failed fallback send
+    assert reloaded.attempt_count == 1
+    assert reloaded.attempt_count == 1

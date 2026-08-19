@@ -117,6 +117,60 @@ _TASK_PENDING_CONFIRMATION_TABLE_SQL = """
     )
     """
 
+# Schema version 5 (Milestone 47 P1): the closed set of durable
+# lifecycle-outbox event kinds - mirrors
+# kernel/employee_tasks/types.py:LifecycleEventKind exactly. No other
+# event_kind string is ever accepted at the schema level, matching
+# _STEP_STATUS_LIST_SQL's own "close the set in SQL too, not just in the
+# enum" discipline above.
+_LIFECYCLE_EVENT_KIND_LIST_SQL = (
+    "'confirmation_required', 'task_completed', 'task_failed', 'task_cancelled'"
+)
+
+# Schema version 5 (Milestone 47 P1): the durable, at-least-once
+# lifecycle-notification outbox - see
+# kernel/employee_tasks/types.py:LifecycleOutboxEvent's own docstring for
+# the full field-by-field rationale, and repository.py's own module
+# docstring for the atomicity invariant every writer of this table must
+# uphold (one row, created in the SAME transaction as the
+# task_transitions row it corresponds to - never a second, later
+# transaction). transition_id is UNIQUE: a given task_transitions row can
+# never have more than one corresponding outbox event, structurally, not
+# merely by convention. Defined once and reused by BOTH _SCHEMA_STATEMENTS
+# and _MIGRATION_4_TO_5_STATEMENTS, matching every earlier new-table
+# migration's own "one definition, never two independently-maintained
+# copies" discipline (see _TASK_STEP_PROGRESS_TABLE_SQL/
+# _TASK_PENDING_CONFIRMATION_TABLE_SQL above).
+_TASK_LIFECYCLE_OUTBOX_TABLE_SQL = f"""
+    CREATE TABLE IF NOT EXISTS task_lifecycle_outbox (
+        event_id        TEXT PRIMARY KEY,
+        task_id         TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+        transition_id   INTEGER NOT NULL UNIQUE
+                            REFERENCES task_transitions(transition_id) ON DELETE CASCADE,
+        channel         TEXT NOT NULL,
+        event_kind      TEXT NOT NULL CHECK (event_kind IN ({_LIFECYCLE_EVENT_KIND_LIST_SQL})),
+        payload_json    TEXT,
+        created_at      TEXT NOT NULL,
+        delivered_at    TEXT,
+        attempt_count   INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_attempt_at TEXT NOT NULL
+    )
+    """
+
+# Schema version 5 (Milestone 47 P1): the due-event lookup index - a
+# partial index (SQLite has supported `WHERE` on `CREATE INDEX` since
+# 3.8.0) covering only undelivered rows, ordered for exactly the query
+# recovery/immediate-delivery retry logic runs
+# (next_attempt_at, event_id ASC - event_id as the stable tiebreaker for
+# equal next_attempt_at values). Already-delivered rows are excluded from
+# this index entirely rather than merely skipped by a WHERE clause at
+# query time, keeping the recovery scan cheap regardless of how large the
+# table eventually grows.
+_TASK_LIFECYCLE_OUTBOX_PENDING_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS task_lifecycle_outbox_pending_idx "
+    "ON task_lifecycle_outbox(next_attempt_at, event_id) WHERE delivered_at IS NULL"
+)
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS schema_meta (
@@ -160,6 +214,8 @@ _SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS transitions_task_idx ON task_transitions(task_id, transition_id)",
     _TASK_STEP_PROGRESS_TABLE_SQL,
     _TASK_PENDING_CONFIRMATION_TABLE_SQL,
+    _TASK_LIFECYCLE_OUTBOX_TABLE_SQL,
+    _TASK_LIFECYCLE_OUTBOX_PENDING_INDEX_SQL,
 )
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -312,6 +368,42 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
         raise TaskStorageUnavailableError("task database is unavailable") from exc
 
 
+# Milestone 47 P1: adds the task_lifecycle_outbox table (and its partial
+# pending-event index) a fresh v5+ database already has via
+# _SCHEMA_STATEMENTS above - same "wholly new table, no ALTER TABLE" shape
+# as _migrate_v2_to_v3/_migrate_v3_to_v4. Deliberately creates the table
+# EMPTY - no historical backfill for any M40-M46 terminal or
+# waiting_for_confirmation transition that already exists in an upgraded
+# database: AI-OS has no durable evidence of whether any of those messages
+# were already delivered, and fabricating outbox rows for them risks
+# resending stale/duplicate WhatsApp notifications for events that may
+# have been sent (or superseded) months ago. Outbox-backed delivery only
+# ever applies to a lifecycle transition created AFTER this migration is
+# active - existing durable task state is otherwise completely untouched
+# by this migration. Reuses _TASK_LIFECYCLE_OUTBOX_TABLE_SQL/
+# _TASK_LIFECYCLE_OUTBOX_PENDING_INDEX_SQL (defined once, above
+# _SCHEMA_STATEMENTS).
+_MIGRATION_4_TO_5_STATEMENTS = (
+    _TASK_LIFECYCLE_OUTBOX_TABLE_SQL,
+    _TASK_LIFECYCLE_OUTBOX_PENDING_INDEX_SQL,
+)
+
+
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _MIGRATION_4_TO_5_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("5",),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        raise TaskStorageUnavailableError("task database is unavailable") from exc
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         row = conn.execute(
@@ -336,6 +428,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if current_version == "3":
             _migrate_v3_to_v4(conn)
             current_version = "4"
+        if current_version == "4":
+            _migrate_v4_to_v5(conn)
+            current_version = "5"
         if current_version == str(SCHEMA_VERSION):
             return  # already current - idempotent no-op
         raise TaskSchemaIncompatibleError("task database schema is incompatible")

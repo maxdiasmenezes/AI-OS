@@ -2667,6 +2667,50 @@ def test_created_task_survives_restart_and_resumes_exactly_once(repo, catalog, d
     assert len(client.sent) == 1
 
 
+def test_created_task_state_survives_a_genuine_connection_close_and_reopen(db_path, catalog, downloads_dir):
+    """Milestone 47 P4 acceptance: every other CREATED/PLANNING/READY/
+    RUNNING recovery test in this module (including the one immediately
+    above, despite its own name) strands a task and recovers it within
+    the SAME connection/process - correct proof of the recovery LOGIC,
+    but not, by itself, proof that the bare stranded task STATE survives
+    an actual process crash and restart. This is the one test in this
+    module that genuinely closes the writer connection (simulating a
+    real crash - no recovery is ever attempted before the close) and
+    opens a brand-new one (simulating the restart) before ever calling
+    run_task_state_recovery_checkpoint() - mirroring
+    test_confirmation_recovery_checkpoint_survives_close_and_reopen()'s
+    own P2 pattern for the P3 case. The fairness/backoff metadata's OWN
+    reopen-durability is already covered separately by
+    test_fairness_regression_survives_restart() - this test is about the
+    underlying stranded state itself, independent of any backoff."""
+
+    conn1 = open_writer_connection(db_path)
+    repo1 = TaskRepository(conn1)
+    task = repo1.create_task("Check the downloads folder.", "whatsapp")
+    conn1.close()  # crash simulation - no recovery ever attempted
+
+    conn2 = open_writer_connection(db_path)
+    repo2 = TaskRepository(conn2)
+    try:
+        assert repo2.get_task(task.task_id).state == TaskState.CREATED
+
+        planner = _FakeModelProvider([_valid_plan_raw(catalog)])
+        client = RecordingClient()
+        loader = lambda: _tools_config(approved_directories={"downloads": str(downloads_dir)})
+
+        run_task_state_recovery_checkpoint(
+            repo2, catalog, planner, ActionRegistry(), loader, _FakeModelProvider([]), client,
+            _AUTHORIZED_SENDER,
+        )
+
+        reloaded = repo2.get_task(task.task_id)
+        assert reloaded.state == TaskState.COMPLETED
+        assert len(planner.calls) == 1
+        assert len(client.sent) == 1
+    finally:
+        conn2.close()
+
+
 # --- B/C/D/E: PLANNING --------------------------------------------------------
 
 

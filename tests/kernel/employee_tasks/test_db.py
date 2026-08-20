@@ -506,8 +506,17 @@ def test_existing_v2_database_migrates_to_current_schema_version(tmp_path):
 
 
 def test_existing_v1_database_reaches_current_schema_via_full_chain(tmp_path):
-    """v1 must reach the current (v4) schema in one open_writer_connection()
-    call, via the full v1 -> v2 -> v3 -> v4 chain - not just v1 -> v2."""
+    """v1 must reach the current schema (SCHEMA_VERSION, dynamically
+    checked below - v7 as of Milestone 47 P3, not hardcoded here so this
+    assertion never goes stale again) in one open_writer_connection()
+    call, via the full historical migration chain - not just v1 -> v2.
+    A narrower, earlier-written companion to the exhaustive
+    test_existing_v1_database_reaches_v7_via_full_chain() below, which
+    additionally asserts every P2/P3-specific column and table this one
+    does not - kept separately rather than merged, since both already
+    pass and neither is redundant ceremony (this one predates P2/P3
+    entirely and null-tests the chain's own older v1->v4 segment
+    independently of anything newer)."""
 
     db_path = tmp_path / "tasks.sqlite3"
     _create_v1_database(db_path)
@@ -1540,6 +1549,80 @@ def test_migration_v6_to_v7_existing_tasks_receive_zero_and_null(tmp_path):
         # No task state changed by the migration itself.
         state_row = conn.execute("SELECT state FROM tasks WHERE task_id = ?", ("task-1",)).fetchone()
         assert state_row == ("running",)
+    finally:
+        conn.close()
+
+
+def test_migration_v6_to_v7_preserves_outbox_and_receipt_data(tmp_path):
+    """Milestone 47 P4 acceptance: extends
+    test_migration_v5_to_v6_preserves_outbox_data's own pattern one hop
+    further - a real P1 outbox row and a real P2 ingress-receipt row,
+    inserted directly against a genuine v6 database, must survive the
+    v6 -> v7 migration completely untouched. v6 -> v7 only ever ALTERs
+    the tasks table itself (see _MIGRATION_6_TO_7_STATEMENTS) and never
+    touches task_lifecycle_outbox/task_confirmation_ingress_receipts at
+    all - this proves that by direct observation, not merely by
+    inference from reading the migration statements alone."""
+
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v6_database(db_path)
+    _insert_v5_task(db_path, "task-1", "TASK-AAAA1111", state="running")
+
+    conn0 = sqlite3.connect(str(db_path))
+    try:
+        conn0.execute("BEGIN IMMEDIATE")
+        conn0.execute(
+            "INSERT INTO task_transitions (task_id, from_state, to_state, timestamp, "
+            "reason_code, safe_summary, task_version) "
+            "VALUES ('task-1', 'running', 'completed', '2026-01-01T00:01:00+00:00', "
+            "'task_completed', NULL, 2)"
+        )
+        transition_id = conn0.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn0.execute(
+            "INSERT INTO task_lifecycle_outbox "
+            "(event_id, task_id, transition_id, channel, event_kind, payload_json, "
+            "created_at, attempt_count, next_attempt_at) "
+            "VALUES ('event-1', 'task-1', ?, 'whatsapp', 'task_completed', NULL, "
+            "'2026-01-01T00:01:00.000000+00:00', 0, '2026-01-01T00:01:00.000000+00:00')",
+            (transition_id,),
+        )
+        conn0.execute(
+            "INSERT INTO task_confirmation_ingress_receipts "
+            "(dedup_key, task_id, confirmation_id, decision, source, accepted_at) "
+            "VALUES ('dedup-1', 'task-1', 'confirmation-1', 'confirm', 'whatsapp', "
+            "'2026-01-01T00:00:30.000000+00:00')"
+        )
+        conn0.execute("COMMIT")
+    finally:
+        conn0.close()
+
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+
+        # Every column of both rows, not a subset - "completely untouched"
+        # (this test's own docstring) means every column, checked.
+        outbox_row = conn.execute(
+            "SELECT event_id, task_id, transition_id, channel, event_kind, payload_json, "
+            "created_at, delivered_at, attempt_count, next_attempt_at "
+            "FROM task_lifecycle_outbox WHERE event_id = ?",
+            ("event-1",),
+        ).fetchone()
+        assert outbox_row == (
+            "event-1", "task-1", transition_id, "whatsapp", "task_completed", None,
+            "2026-01-01T00:01:00.000000+00:00", None, 0, "2026-01-01T00:01:00.000000+00:00",
+        )
+
+        receipt_row = conn.execute(
+            "SELECT dedup_key, task_id, confirmation_id, decision, source, accepted_at "
+            "FROM task_confirmation_ingress_receipts WHERE dedup_key = ?",
+            ("dedup-1",),
+        ).fetchone()
+        assert receipt_row == (
+            "dedup-1", "task-1", "confirmation-1", "confirm", "whatsapp",
+            "2026-01-01T00:00:30.000000+00:00",
+        )
     finally:
         conn.close()
 

@@ -23,7 +23,9 @@ from kernel.employee_tasks.types import (
     MAX_REQUEST_TEXT_CHARS,
     MAX_SAFE_SUMMARY_CHARS,
     MAX_SOURCE_CHARS,
+    ALLOWED_TRANSITIONS,
     TERMINAL_STATES,
+    ConfirmationDecision,
     DuplicateTaskError,
     InvalidTransitionError,
     LifecycleEventKind,
@@ -401,6 +403,7 @@ def test_full_happy_path_lifecycle(repo):
         ("planning", "ready"),
         ("planning", "cancelled"),
         ("planning", "failed"),
+        ("planning", "created"),
         ("ready", "running"),
         ("ready", "cancelled"),
         ("ready", "failed"),
@@ -535,6 +538,271 @@ def test_terminal_state_protected(repo, terminal_state):
 def test_nonexistent_task_rejected(repo):
     with pytest.raises(TaskNotFoundError):
         repo.transition_task("00000000-0000-7000-8000-000000000000", "created", "planning")
+
+
+# --- Milestone 47 P3: ALLOWED_TRANSITIONS invariant + find_one_recoverable_task --
+
+
+def test_allowed_transitions_grants_exactly_one_new_created_target_edge():
+    """Milestone 47 P3 adds exactly one new edge to the closed transition
+    table: planning -> created, for restart reconciliation of a task
+    stranded mid-planning (model-only, no external side effect - see
+    ALLOWED_TRANSITIONS's own comment in kernel/employee_tasks/types.py).
+    No other state may gain an unexpected -> created edge - created
+    remains a source state everywhere else, never again a target."""
+
+    assert TaskState.CREATED in ALLOWED_TRANSITIONS[TaskState.PLANNING]
+    for state, targets in ALLOWED_TRANSITIONS.items():
+        if state is TaskState.PLANNING:
+            continue
+        assert TaskState.CREATED not in targets
+
+
+def test_find_one_recoverable_task_returns_none_when_nothing_recoverable(repo):
+    assert repo.find_one_recoverable_task("whatsapp") is None
+
+
+@pytest.mark.parametrize("state", ["created", "planning", "ready", "running"])
+def test_find_one_recoverable_task_finds_each_recoverable_state(repo, state):
+    record = repo.create_task("request", "whatsapp")
+    _drive_to_state(repo, record.task_id, state)
+    assert repo.find_one_recoverable_task("whatsapp") == record.task_id
+
+
+def test_find_one_recoverable_task_excludes_waiting_for_confirmation_decision_null(repo):
+    record = repo.create_task("request", "whatsapp")
+    _drive_to_state(repo, record.task_id, "waiting_for_confirmation")
+    assert repo.find_one_recoverable_task("whatsapp") is None
+
+
+def test_find_one_recoverable_task_excludes_waiting_for_confirmation_decision_non_null(repo):
+    """Milestone 47 P2's own find_recoverable_confirmation_decision() is
+    the sole owner of a durably-decided pending confirmation - P3's
+    lookup must never also select the owning task, which would let both
+    recovery mechanisms race the same task."""
+
+    record = repo.create_task("request", "whatsapp")
+    _drive_to_state(repo, record.task_id, "waiting_for_confirmation")
+    pending = repo.get_pending_confirmation(record.task_id)
+    repo.record_confirmation_decision(
+        pending.confirmation_id,
+        ConfirmationDecision.CONFIRM,
+        required_source="whatsapp",
+        provider_dedup_key="p3-coexistence-dedup-1",
+    )
+    assert repo.find_one_recoverable_task("whatsapp") is None
+
+
+@pytest.mark.parametrize("terminal_state", ["completed", "failed", "cancelled"])
+def test_find_one_recoverable_task_excludes_terminal_states(repo, terminal_state):
+    record = repo.create_task("request", "whatsapp")
+    tid = record.task_id
+    if terminal_state == "completed":
+        _drive_to_state(repo, tid, "running")
+        repo.transition_task(tid, "running", "completed")
+    elif terminal_state == "failed":
+        repo.mark_failed(tid, "created", "tool_error", "something failed")
+    else:
+        repo.mark_cancelled(tid, "created")
+
+    assert repo.find_one_recoverable_task("whatsapp") is None
+
+
+def test_find_one_recoverable_task_source_isolation(repo):
+    whatsapp_record = repo.create_task("request", "whatsapp")
+    other_record = repo.create_task("request", "other-source")
+
+    assert repo.find_one_recoverable_task("whatsapp") == whatsapp_record.task_id
+    assert repo.find_one_recoverable_task("other-source") == other_record.task_id
+
+
+def test_find_one_recoverable_task_orders_oldest_first(repo):
+    first = repo.create_task("first", "whatsapp")
+    repo.create_task("second", "whatsapp")
+
+    assert repo.find_one_recoverable_task("whatsapp") == first.task_id
+
+
+def test_find_one_recoverable_task_orders_correctly_even_when_created_at_omits_fractional_seconds(repo):
+    """Milestone 47 P3 adversarial-review correction: find_one_recoverable_task()'s
+    ORDER BY COALESCEs a never-deferred task's own created_at (set by
+    create_task()'s plain _now()/isoformat(), which OMITS the fractional-
+    seconds component when microsecond == 0 - a real, if rare, 1-in-1e6
+    occurrence) against recovery_next_attempt_at (always fixed-width, via
+    format_utc_timestamp()). Never reachable through create_task() itself
+    within a single fast test run (datetime.now() essentially never lands
+    on exactly microsecond 0), so the exact edge case is forced directly:
+    two tasks in the SAME integer second, one with its created_at row
+    hand-edited to the omitted-fraction shape, the other left with a
+    real fixed-width value later in that same second. See
+    find_one_recoverable_task()'s own docstring for the full proof this
+    empirically confirms: omission only ever means microsecond == 0 (the
+    earliest possible sub-second instant), and '+' (the offset sign) is
+    always ASCII-less-than '.' (the fraction separator), so the
+    omitted-fraction row always - provably, not coincidentally - sorts
+    first, exactly matching chronological order."""
+
+    earlier = repo.create_task("earlier, omitted fraction", "whatsapp")
+    later = repo.create_task("later, real fraction", "whatsapp")
+
+    repo._conn.execute(
+        "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+        ("2026-08-20T08:00:00+00:00", earlier.task_id),
+    )
+    repo._conn.execute(
+        "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+        ("2026-08-20T08:00:00.500000+00:00", later.task_id),
+    )
+
+    assert repo.find_one_recoverable_task("whatsapp") == earlier.task_id
+
+
+def test_find_one_recoverable_task_rejects_oversized_source(repo):
+    with pytest.raises(TaskInputTooLargeError):
+        repo.find_one_recoverable_task("x" * (MAX_SOURCE_CHARS + 1))
+
+
+# --- Milestone 47 P3 adversarial-review correction: due-based fairness -------
+
+
+def test_find_one_recoverable_task_skips_a_deferred_task_not_yet_due(repo):
+    older = repo.create_task("older", "whatsapp")
+    newer = repo.create_task("newer", "whatsapp")
+
+    future = datetime.now(timezone.utc) + timedelta(seconds=3600)
+    repo.defer_task_recovery_retry(older.task_id, "whatsapp", 1, future)
+
+    assert repo.find_one_recoverable_task("whatsapp") == newer.task_id
+
+
+def test_find_one_recoverable_task_returns_a_deferred_task_once_due(repo):
+    task = repo.create_task("task", "whatsapp")
+
+    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    repo.defer_task_recovery_retry(task.task_id, "whatsapp", 1, past)
+
+    assert repo.find_one_recoverable_task("whatsapp") == task.task_id
+
+
+def test_find_one_recoverable_task_never_starves_a_never_deferred_task_behind_a_deferred_one(repo):
+    """The exact confirmed-MEDIUM regression: a task deferred into the
+    future must never keep a DIFFERENT, never-deferred, newer task from
+    being selected."""
+
+    older = repo.create_task("older", "whatsapp")
+    newer = repo.create_task("newer", "whatsapp")
+
+    future = datetime.now(timezone.utc) + timedelta(seconds=3600)
+    repo.defer_task_recovery_retry(older.task_id, "whatsapp", 1, future)
+
+    # Repeated calls (simulating repeated checkpoints) never re-select
+    # the deferred older task while it remains not-yet-due.
+    for _ in range(3):
+        assert repo.find_one_recoverable_task("whatsapp") == newer.task_id
+
+
+def test_defer_task_recovery_retry_sets_attempt_count_and_next_attempt_at(repo):
+    task = repo.create_task("task", "whatsapp")
+    future = datetime.now(timezone.utc) + timedelta(seconds=120)
+
+    repo.defer_task_recovery_retry(task.task_id, "whatsapp", 3, future)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.recovery_attempt_count == 3
+    assert reloaded.recovery_next_attempt_at == format_utc_timestamp(future)
+
+
+@pytest.mark.parametrize("state", ["created", "planning", "ready", "running"])
+def test_defer_task_recovery_retry_applies_while_still_recoverable(repo, state):
+    record = repo.create_task("request", "whatsapp")
+    _drive_to_state(repo, record.task_id, state)
+    before = repo.get_task(record.task_id)
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    repo.defer_task_recovery_retry(record.task_id, "whatsapp", 1, future)
+
+    reloaded = repo.get_task(record.task_id)
+    assert reloaded.recovery_attempt_count == 1
+    assert reloaded.recovery_next_attempt_at == format_utc_timestamp(future)
+    assert reloaded.state == TaskState(state)  # never changes task state
+    assert reloaded.version == before.version  # never changes task version
+
+
+def test_defer_task_recovery_retry_is_a_noop_when_waiting_for_confirmation(repo):
+    record = repo.create_task("request", "whatsapp")
+    _drive_to_state(repo, record.task_id, "waiting_for_confirmation")
+    before = repo.get_task(record.task_id)
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    repo.defer_task_recovery_retry(record.task_id, "whatsapp", 1, future)
+
+    after = repo.get_task(record.task_id)
+    assert after.recovery_attempt_count == 0
+    assert after.recovery_next_attempt_at is None
+    assert after.state == TaskState.WAITING_FOR_CONFIRMATION
+    assert after.version == before.version
+    # Never selectable regardless - P3's own lookup already excludes this
+    # state - but the no-op deferral confirms it never re-arms anything.
+    assert repo.find_one_recoverable_task("whatsapp") is None
+
+
+@pytest.mark.parametrize("terminal_state", ["completed", "failed", "cancelled"])
+def test_defer_task_recovery_retry_is_a_noop_for_terminal_tasks(repo, terminal_state):
+    record = repo.create_task("request", "whatsapp")
+    tid = record.task_id
+    if terminal_state == "completed":
+        _drive_to_state(repo, tid, "running")
+        repo.transition_task(tid, "running", "completed")
+    elif terminal_state == "failed":
+        repo.mark_failed(tid, "created", "tool_error", "something failed")
+    else:
+        repo.mark_cancelled(tid, "created")
+    before = repo.get_task(tid)
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    repo.defer_task_recovery_retry(tid, "whatsapp", 1, future)
+
+    after = repo.get_task(tid)
+    assert after.recovery_attempt_count == 0
+    assert after.recovery_next_attempt_at is None
+    assert after.state == TaskState(terminal_state)
+    assert after.version == before.version
+    assert repo.find_one_recoverable_task("whatsapp") is None
+
+
+def test_defer_task_recovery_retry_is_a_noop_for_wrong_source(repo):
+    task = repo.create_task("task", "whatsapp")
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    repo.defer_task_recovery_retry(task.task_id, "a-different-source", 1, future)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.recovery_attempt_count == 0
+    assert reloaded.recovery_next_attempt_at is None
+
+
+def test_defer_task_recovery_retry_never_creates_an_outbox_event(repo):
+    task = repo.create_task("task", "whatsapp")
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+    repo.defer_task_recovery_retry(task.task_id, "whatsapp", 1, future)
+
+    reloaded = repo.get_task(task.task_id)
+    assert repo.get_outbox_event_for_task_version(task.task_id, reloaded.version) is None
+
+
+def test_defer_task_recovery_retry_rejects_negative_attempt_count(repo):
+    task = repo.create_task("task", "whatsapp")
+    with pytest.raises(TaskInputTooLargeError):
+        repo.defer_task_recovery_retry(
+            task.task_id, "whatsapp", -1, datetime.now(timezone.utc) + timedelta(seconds=60)
+        )
+
+
+def test_defer_task_recovery_retry_rejects_naive_datetime(repo):
+    task = repo.create_task("task", "whatsapp")
+    with pytest.raises(TaskInputTooLargeError):
+        repo.defer_task_recovery_retry(task.task_id, "whatsapp", 1, datetime.now())
 
 
 def test_version_increments_on_every_transition(repo):

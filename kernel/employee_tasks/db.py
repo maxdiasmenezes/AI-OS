@@ -272,7 +272,9 @@ _SCHEMA_STATEMENTS = (
         metadata_json    TEXT NOT NULL DEFAULT '{{}}',
         protocol_version INTEGER NOT NULL,
         version          INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
-        plan_json        TEXT
+        plan_json        TEXT,
+        recovery_attempt_count  INTEGER NOT NULL DEFAULT 0 CHECK (recovery_attempt_count >= 0),
+        recovery_next_attempt_at TEXT
     )
     """,
     f"""
@@ -534,6 +536,44 @@ def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
         raise TaskStorageUnavailableError("task database is unavailable") from exc
 
 
+# Milestone 47 P3 adversarial-review correction: unlike the P2 columns that
+# were folded directly into v6 (v6 had never shipped yet when that
+# correction landed - see _MIGRATION_5_TO_6_STATEMENTS' own comment), v6
+# IS already shipped/committed (Milestone 47 P2's own commit) by the time
+# this finding was found - so this lands in a genuinely new v7, never a
+# retrofit of v6. Adds recovery_attempt_count/recovery_next_attempt_at to
+# a fresh v6 database's EXISTING tasks table - both are genuinely new
+# ALTER TABLE ADD COLUMN statements (tasks already exists on any v1+
+# database), same "CHECK constraint on the new column alone, no table
+# rebuild needed" shape _MIGRATION_5_TO_6_STATEMENTS' own four ALTER
+# TABLEs already established. recovery_attempt_count gets DEFAULT 0 and
+# recovery_next_attempt_at gets no DEFAULT (implicit NULL) for every
+# existing row - "never deferred, immediately eligible if otherwise
+# recoverable," never a fabricated retry history for a task that existed
+# before this milestone. Runs inside the same transaction as the
+# schema_meta version bump, same as every other migration here.
+_MIGRATION_6_TO_7_STATEMENTS = (
+    "ALTER TABLE tasks ADD COLUMN recovery_attempt_count INTEGER NOT NULL DEFAULT 0 "
+    "CHECK (recovery_attempt_count >= 0)",
+    "ALTER TABLE tasks ADD COLUMN recovery_next_attempt_at TEXT",
+)
+
+
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _MIGRATION_6_TO_7_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("7",),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        raise TaskStorageUnavailableError("task database is unavailable") from exc
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         row = conn.execute(
@@ -564,6 +604,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if current_version == "5":
             _migrate_v5_to_v6(conn)
             current_version = "6"
+        if current_version == "6":
+            _migrate_v6_to_v7(conn)
+            current_version = "7"
         if current_version == str(SCHEMA_VERSION):
             return  # already current - idempotent no-op
         raise TaskSchemaIncompatibleError("task database schema is incompatible")

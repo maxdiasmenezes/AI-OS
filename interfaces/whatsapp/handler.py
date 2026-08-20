@@ -74,6 +74,7 @@ from interfaces.whatsapp.task_control import (
     dispatch_task_work,
     run_confirmation_decision_recovery_checkpoint,
     run_outbound_lifecycle_recovery_checkpoint,
+    run_task_state_recovery_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -281,9 +282,9 @@ class MessageHandler:
         interfaces/whatsapp/server.py:WhatsAppServer._run_worker()'s own
         docstring for the monotonic-deadline scheduling that calls this at
         most once per checkpoint, interleaved with normal queue
-        consumption. Performs TWO independently-bounded pickups, each at
+        consumption. Performs THREE independently-bounded pickups, each at
         most one per call, matching this milestone's own "never an
-        unbounded page" discipline for either:
+        unbounded page" discipline for all three:
 
           - Milestone 47 P1: task_control.run_outbound_lifecycle_recovery_checkpoint()
             - at most one due, undelivered WhatsApp lifecycle-outbox
@@ -292,19 +293,44 @@ class MessageHandler:
             - at most one durable confirmation decision that was recorded
             but never reached the worker (e.g. queue-full at recording
             time, or a crash before consumption).
+          - Milestone 47 P3: task_control.run_task_state_recovery_checkpoint()
+            - at most one durable task stranded in created/planning/ready/
+            running with no volatile work item behind it (e.g. the
+            process died before the worker ever dequeued its
+            TaskExecutionWork, or died mid-execution).
 
-        Never task-state recovery (still out of scope - see this
-        milestone's own scope boundary). Reuses the exact same long-lived
-        TaskRepository/ActionRegistry/ToolsConfig loader/general
+        Sequential, not concurrent: these three calls run one after
+        another on this same worker thread, exactly like normal queue
+        consumption does, so an earlier category's own network/model
+        latency (a WhatsApp send, a durable write, a planning call) can
+        delay a later category reaching its own turn within this one
+        checkpoint - never unboundedly, since each of the three is itself
+        capped at one pickup, but truthfully worth stating rather than
+        implying all three are free or parallel. No new worker thread and
+        no startup sweep are introduced by any of the three.
+
+        Reuses the exact same long-lived TaskRepository/TaskCatalog/
+        PlannerProvider/ActionRegistry/ToolsConfig loader/general
         conversational ModelProvider/client/authorized_sender already
         wired for TaskExecutionWork/TaskConfirmationWork above - no
-        separate recovery-specific dependency exists for either pickup."""
+        separate recovery-specific dependency exists for any of the
+        three."""
 
         run_outbound_lifecycle_recovery_checkpoint(
             self._task_repository, self._client, self._authorized_sender
         )
         run_confirmation_decision_recovery_checkpoint(
             self._task_repository,
+            self._action_registry,
+            self._tools_config_loader,
+            self._respond_provider,
+            self._client,
+            self._authorized_sender,
+        )
+        run_task_state_recovery_checkpoint(
+            self._task_repository,
+            self._task_catalog,
+            self._planner_provider,
             self._action_registry,
             self._tools_config_loader,
             self._respond_provider,

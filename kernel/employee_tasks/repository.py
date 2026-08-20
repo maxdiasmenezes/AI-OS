@@ -134,7 +134,8 @@ _TERMINAL_STATE_VALUES = frozenset(state.value for state in TERMINAL_STATES)
 _SELECT_COLUMNS = (
     "task_id, display_id, state, request_text, source, dedup_key, "
     "created_at, updated_at, started_at, completed_at, failure_code, "
-    "failure_summary, metadata_json, protocol_version, version, plan_json"
+    "failure_summary, metadata_json, protocol_version, version, plan_json, "
+    "recovery_attempt_count, recovery_next_attempt_at"
 )
 
 _STEP_PROGRESS_SELECT_COLUMNS = (
@@ -331,6 +332,8 @@ def _row_to_record(row) -> TaskRecord:
         protocol_version=row[13],
         version=row[14],
         plan_json=row[15],
+        recovery_attempt_count=row[16],
+        recovery_next_attempt_at=row[17],
     )
 
 
@@ -1667,6 +1670,190 @@ class TaskRepository:
                 "UPDATE task_pending_confirmation SET decision_attempt_count = ?, "
                 "decision_next_attempt_at = ? WHERE confirmation_id = ? AND decision IS NOT NULL",
                 (attempt_count, next_attempt_at_text, confirmation_id),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+    def find_one_recoverable_task(self, source: str) -> str | None:
+        """Milestone 47 P3: bounded, source-filtered, DUE lookup for the
+        task-state recovery checkpoint's own pickup - at most one durable
+        task, for the given source only, currently in a non-terminal
+        state that is NOT waiting_for_confirmation: created, planning,
+        ready, or running. Mirrors find_recoverable_confirmation_decision()'s
+        own shape and doctrine exactly - a plain read, no transaction
+        needed, LIMIT 1, no OFFSET, never an unbounded scan.
+
+        waiting_for_confirmation is deliberately excluded from the state
+        list below, not merely left unhandled by a caller: a plain
+        (decision NULL) pending confirmation is correctly, durably
+        blocked awaiting user authority and needs no P3 action at all,
+        and a decided (decision non-NULL) one is find_recoverable_confirmation_decision()'s
+        own, sole responsibility (Milestone 47 P2) - P3 must never
+        duplicate that pickup or race it for the same task. Terminal
+        states (completed/failed/cancelled) are excluded the same way -
+        never reopened, never re-selected.
+
+        Milestone 47 P3 adversarial-review correction: filtered on
+        `recovery_next_attempt_at IS NULL OR recovery_next_attempt_at <= ?`
+        (NULL means never deferred - immediately eligible) and ordered by
+        `COALESCE(recovery_next_attempt_at, created_at), created_at,
+        task_id` - NOT plain (created_at, task_id) over every eligible row
+        regardless of retry state. The earlier design (unconditional
+        oldest-first) let one recoverable task whose recovery dispatch
+        kept raising - without ever transitioning it out of its
+        recoverable state - remain "the oldest" forever, permanently
+        starving every task created after it (task_lifecycle_outbox's own
+        attempt_count/next_attempt_at, and task_pending_confirmation's own
+        decision_attempt_count/decision_next_attempt_at, already solved
+        the identical problem for P1/P2 - see
+        defer_task_recovery_retry()'s own docstring for the P3 analogue).
+        COALESCE'ing a never-deferred row's own created_at into the sort
+        key (rather than treating NULL as "always first" or "always
+        last") gives it a directly comparable due-instant: due exactly
+        when it was created, exactly like every row already worked before
+        this correction. The `<= ?` comparison is a PLAIN SQLite TEXT
+        comparison, exactly like list_due_lifecycle_outbox_events()'s own
+        and find_recoverable_confirmation_decision()'s own - provably
+        equivalent to chronological ordering because recovery_next_attempt_at
+        (set by defer_task_recovery_retry()) and `now` here are both
+        ALWAYS produced by the SAME canonical, fixed-width UTC
+        format_utc_timestamp() this whole package relies on for exactly
+        this property.
+
+        The COALESCE's fallback arm, `created_at`, is NOT produced by
+        format_utc_timestamp() - it is set by create_task()'s own `_now()`
+        (plain datetime.isoformat()), which - unlike format_utc_timestamp() -
+        OMITS the fractional-seconds component entirely on the rare
+        (1-in-1e6) occasion a timestamp's microsecond happens to be
+        exactly 0. This is still safe to compare lexically against a
+        fixed-width recovery_next_attempt_at value, but NOT merely
+        "because both are canonical" (they are not the same
+        representation) - it is safe for a narrower, still-provable
+        reason: every UTC-aware value this package ever produces renders
+        its offset as literally "+00:00" (never "Z", never any other
+        offset - datetime.isoformat() on a timezone.utc-aware datetime is
+        deterministic here), and omission ONLY ever happens for
+        microsecond == 0, the definitionally EARLIEST possible sub-second
+        instant. So immediately after any shared "...:SS" prefix, the
+        omitted-fraction string's next character is always '+' (0x2B,
+        the offset sign) while any fixed-width value sharing that same
+        second is always '.' (0x2E, the fraction separator) - and
+        '+' < '.' in ASCII means the omitted-fraction (microsecond == 0)
+        value always sorts first, which is always chronologically
+        correct, never merely coincidentally so (verified empirically,
+        not just asserted - see
+        tests/kernel/employee_tasks/test_repository.py's own
+        test_find_one_recoverable_task_orders_correctly_even_when_created_at_omits_fractional_seconds).
+        A wider fix (making create_task() itself always use
+        format_utc_timestamp() for created_at) was deliberately NOT made
+        here: `_now()` is shared by every write path in this file
+        (task_transitions.timestamp, task_step_progress timestamps,
+        task_pending_confirmation timestamps, and more), so changing its
+        format would be a package-wide change wildly out of proportion to
+        this one due-query's own needs - never justified by an ordering
+        property that is already provably correct as constructed.
+
+        Returns a bare task_id (never a TaskRecord snapshot), since the
+        caller always re-reads the task fresh via get_task() before
+        acting on it anyway - exactly like P1's outbox pickup and P2's
+        confirmation-decision pickup both already do (queue/pickup
+        identity is never authority; only a fresh re-read is)."""
+
+        source = _validate_bounded_text(source, "source", MIN_SOURCE_CHARS, MAX_SOURCE_CHARS)
+        now = format_utc_timestamp(datetime.now(timezone.utc))
+        row = self._conn.execute(
+            "SELECT task_id FROM tasks WHERE source = ? AND state IN (?, ?, ?, ?) "
+            "AND (recovery_next_attempt_at IS NULL OR recovery_next_attempt_at <= ?) "
+            "ORDER BY COALESCE(recovery_next_attempt_at, created_at), created_at, task_id "
+            "LIMIT 1",
+            (
+                source,
+                TaskState.CREATED.value,
+                TaskState.PLANNING.value,
+                TaskState.READY.value,
+                TaskState.RUNNING.value,
+                now,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0]
+
+    def defer_task_recovery_retry(
+        self, task_id: str, source: str, attempt_count: int, next_attempt_at: datetime
+    ) -> None:
+        """Milestone 47 P3 adversarial-review correction: persist a
+        bounded retry deferral for a durable, recoverable task whose
+        recovery dispatch attempt raised BEFORE it could leave its
+        recoverable state (created/planning/ready/running) - the P3
+        analogue of mark_lifecycle_event_delivery_failed()/
+        defer_confirmation_decision_retry(). Callers own the backoff
+        policy (e.g. kernel.employee_tasks.compute_outbox_retry_delay_seconds(),
+        reused as-is - the identical bounded, capped-exponential policy
+        P1's outbox and P2's confirmation-decision retry both already use,
+        with no task-recovery-specific semantics of its own to justify a
+        separate copy); this method never computes it itself, matching
+        both of those methods' own "policy stays with the caller"
+        doctrine.
+
+        CONDITIONAL, at the SQL level, on the SAME task (matched on
+        task_id AND source) STILL being in one of created/planning/ready/
+        running - if dispatch_task_work() (or the planning -> created
+        reconciliation before it) actually moved the task out of that set
+        before raising (WAITING_FOR_CONFIRMATION or a terminal state),
+        there is nothing left to defer, and this call is a silent, safe
+        no-op: never re-arms a task that has already moved on, never
+        changes task state, never changes task version, never creates a
+        lifecycle-outbox event, never stores raw exception/error text -
+        only the two backoff columns are ever touched, and only while the
+        WHERE clause's own state list still matches. A wrong `source`
+        (structurally unreachable given run_task_state_recovery_checkpoint()
+        always defers with the SAME TASK_SOURCE it discovered the task
+        with, but never assumed away) is refused the identical way.
+
+        `attempt_count` must already be the caller's own freshly-computed
+        new count (mirroring defer_confirmation_decision_retry()'s own
+        "caller reads the old value, computes old + 1, passes the new
+        value" convention - never computed at the SQL level here) -
+        monotonic only because the caller always derives it from a fresh
+        read, never a stale one. `next_attempt_at` must be a real,
+        timezone-aware UTC datetime - never caller-supplied raw text -
+        serialized here via the same canonical format_utc_timestamp()
+        every other timestamp column in this package uses."""
+
+        source = _validate_bounded_text(source, "source", MIN_SOURCE_CHARS, MAX_SOURCE_CHARS)
+        if not isinstance(attempt_count, int) or isinstance(attempt_count, bool) or attempt_count < 0:
+            raise TaskInputTooLargeError("attempt_count must be a non-negative integer")
+        if (
+            not isinstance(next_attempt_at, datetime)
+            or next_attempt_at.tzinfo is None
+            or next_attempt_at.utcoffset() != timedelta()
+        ):
+            raise TaskInputTooLargeError("next_attempt_at must be a UTC (offset +00:00) datetime")
+        next_attempt_at_text = format_utc_timestamp(next_attempt_at)
+
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE tasks SET recovery_attempt_count = ?, recovery_next_attempt_at = ? "
+                "WHERE task_id = ? AND source = ? AND state IN (?, ?, ?, ?)",
+                (
+                    attempt_count,
+                    next_attempt_at_text,
+                    task_id,
+                    source,
+                    TaskState.CREATED.value,
+                    TaskState.PLANNING.value,
+                    TaskState.READY.value,
+                    TaskState.RUNNING.value,
+                ),
             )
         except sqlite3.OperationalError as exc:
             conn.execute("ROLLBACK")

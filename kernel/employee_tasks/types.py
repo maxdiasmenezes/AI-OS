@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 PROTOCOL_VERSION = 1
 
 # Fixed, code-level bounds on every externally supplied text field. Not
@@ -141,9 +141,20 @@ TERMINAL_STATES = frozenset({TaskState.COMPLETED, TaskState.FAILED, TaskState.CA
 # The exact, closed transition table. Cancellation is allowed from every
 # non-terminal state - nothing in the current roadmap needs an
 # uncancellable working state. No other states or edges exist.
+#
+# PLANNING -> CREATED (Milestone 47 P3) is the one exception to "forward
+# progress only": restart/crash reconciliation for a task stranded
+# PLANNING - planning is model-only (no external side effect), so
+# abandoning an interrupted model call and re-entering CREATED for a
+# fresh planning attempt is safe. Never used outside restart
+# reconciliation (see TaskRepository.transition_task()'s own
+# RESTART_PLANNING_INTERRUPTED_REASON_CODE, the sole caller-supplied
+# reason this edge is ever taken with).
 ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.CREATED: frozenset({TaskState.PLANNING, TaskState.CANCELLED, TaskState.FAILED}),
-    TaskState.PLANNING: frozenset({TaskState.READY, TaskState.CANCELLED, TaskState.FAILED}),
+    TaskState.PLANNING: frozenset(
+        {TaskState.READY, TaskState.CANCELLED, TaskState.FAILED, TaskState.CREATED}
+    ),
     TaskState.READY: frozenset({TaskState.RUNNING, TaskState.CANCELLED, TaskState.FAILED}),
     TaskState.RUNNING: frozenset(
         {
@@ -348,6 +359,20 @@ class TaskRecord:
     protocol_version: int
     version: int
     plan_json: str | None = None
+    # Milestone 47 P3 (adversarial-review correction): durable backoff
+    # state for find_one_recoverable_task()'s own due-ordered pickup -
+    # mirrors task_pending_confirmation's decision_attempt_count/
+    # decision_next_attempt_at (Milestone 47 P2) exactly, for the
+    # identical reason: without it, one recoverable task whose recovery
+    # dispatch keeps raising (without ever transitioning the task out of
+    # its recoverable state) permanently starves every task created after
+    # it, since a plain oldest-first scan always re-selects the same row.
+    # recovery_attempt_count starts at 0 and recovery_next_attempt_at
+    # starts at NULL (== "never deferred, immediately eligible") for
+    # every task - see TaskRepository.defer_task_recovery_retry() for how
+    # they change after a failed recovery dispatch.
+    recovery_attempt_count: int = 0
+    recovery_next_attempt_at: str | None = None
 
 
 @dataclass(frozen=True)

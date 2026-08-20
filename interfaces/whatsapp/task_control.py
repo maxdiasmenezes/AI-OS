@@ -148,6 +148,7 @@ from kernel.employee_tasks import (
     NoPendingConfirmationError,
     StepAlreadyClaimedError,
     StepStatus,
+    TaskAlreadyTerminalError,
     TaskInputTooLargeError,
     TaskNotFoundError,
     TaskRecord,
@@ -1233,6 +1234,180 @@ def dispatch_task_work(
     executor = SafeTaskExecutor(tools_config, registry)
     result = run_task_until_blocked(task, repository, registry, tools_config, executor, respond_provider)
     _deliver_execution_result(result, repository, client, authorized_sender)
+
+
+# Milestone 47 P3: the sole, fixed, code-owned reason this specific edge is
+# ever taken with - never used for any other transition, and never
+# caller-supplied free text (see ALLOWED_TRANSITIONS's own comment in
+# kernel/employee_tasks/types.py for why this edge exists at all).
+_RESTART_PLANNING_INTERRUPTED_REASON_CODE = "restart_planning_interrupted"
+_RESTART_PLANNING_INTERRUPTED_SAFE_SUMMARY = (
+    "Planning was interrupted by a restart; a fresh planning attempt will run next."
+)
+
+# Milestone 47 P3 adversarial-review correction: the exact same state set
+# TaskRepository.find_one_recoverable_task() itself selects from - used
+# here only to decide whether a failed dispatch attempt left the task
+# somewhere defer_task_recovery_retry() would still apply to (its own SQL
+# WHERE clause is the true, authoritative check; this is the cheap
+# Python-side pre-check that avoids an unnecessary transaction/call when
+# the task has already moved to waiting_for_confirmation or terminal).
+_RECOVERABLE_TASK_STATES = (
+    TaskState.CREATED,
+    TaskState.PLANNING,
+    TaskState.READY,
+    TaskState.RUNNING,
+)
+
+
+def run_task_state_recovery_checkpoint(
+    repository: TaskRepository,
+    catalog,
+    planner_provider,
+    registry,
+    tools_config_loader,
+    respond_provider,
+    client,
+    authorized_sender: str,
+) -> None:
+    """Milestone 47 P3: attempt AT MOST ONE durable task-state recovery
+    pickup per call - the recovery-checkpoint counterpart of
+    run_outbound_lifecycle_recovery_checkpoint()/
+    run_confirmation_decision_recovery_checkpoint() above, closing the
+    crash gap for a task stranded in created/planning/ready/running with
+    no volatile work item behind it (e.g. the process died before the
+    worker ever dequeued its TaskExecutionWork, or died mid-execution).
+    Deliberately bounded to exactly one pickup per checkpoint, for the
+    same reason both of the above are: a burst of stranded tasks (or one
+    that keeps failing) must never block the worker's own normal queue
+    responsiveness for longer than one dispatch_task_work() call (see
+    interfaces/whatsapp/server.py's own monotonic-deadline
+    recovery-checkpoint scheduling, which calls this function at most once
+    per checkpoint, interleaved with the other two above - see
+    MessageHandler.run_recovery_checkpoint()'s own docstring for the exact
+    ordering and the truthful sequential-latency note that implies).
+
+    Filters strictly on source=TASK_SOURCE ("whatsapp") via
+    TaskRepository.find_one_recoverable_task() - this is what makes it
+    structurally impossible for this function to ever act on a different
+    source's task. That same lookup already excludes
+    waiting_for_confirmation (own separately by P2's own recovery
+    pickup - see find_one_recoverable_task()'s own docstring for why P3
+    must never duplicate or race that pickup) and every terminal state
+    (never reopened, never re-executed). Dispatches DIRECTLY through the
+    existing dispatch_task_work() - never a new or recovery-specific
+    execution path, and never re-queued back onto the worker's own queue,
+    since this call already runs on the single worker thread that already
+    owns all serialization. A complete no-op, cheaply, if nothing is
+    currently stranded.
+
+    RUNNING WITH AN IN_PROGRESS STEP: deliberately NOT special-cased here.
+    dispatch_task_work() re-derives the next eligible step fresh via the
+    existing run_task_until_blocked() -> evaluate_next_step() chain, which
+    already treats an in_progress step as an UNCERTAIN execution state -
+    never retried, never skipped, never inferred success or failure from -
+    and already fails the task closed (mark_failed(...,
+    "step_execution_uncertain", ...), Milestone 42 P1) rather than ever
+    calling SafeTaskExecutor.execute() again. This function's only job for
+    that case is to make sure the stranded task is REACHED at all after a
+    restart; the already-built, already-tested M42 safety path does the
+    rest. The in_progress task_step_progress row itself is never touched
+    here or by that path - it remains the durable, honest record that the
+    external outcome is unknown.
+
+    PLANNING RECONCILIATION: a task found in planning is durably
+    transitioned to created first (TaskRepository.transition_task(),
+    the one new ALLOWED_TRANSITIONS edge this milestone adds - see that
+    table's own comment for why this edge is safe: planning has no
+    external side effect), using the fixed
+    _RESTART_PLANNING_INTERRUPTED_REASON_CODE/_SAFE_SUMMARY above - never
+    caller-supplied text, and never a claim that the interrupted model
+    call succeeded or failed, since neither is known. This produces no
+    lifecycle-outbox event (created is not in
+    _DELIVERABLE_EVENT_KIND_BY_TARGET_STATE - nothing user-visible has
+    happened yet) - only the subsequent dispatch_task_work() call, driving
+    a genuinely fresh planning attempt, can ever produce one. A race that
+    has already moved the task out of planning by the time this call
+    reaches transition_task() (structurally near-unreachable given the
+    worker's own single-threaded serialization, but never assumed away)
+    raises InvalidTransitionError or TaskAlreadyTerminalError, both caught
+    here as an already-handled no-op - exactly like dispatch_task_work()
+    itself already catches TaskNotInCreatedStateError for the identical
+    reason. Never reversed: a failed dispatch AFTER this reconciliation
+    already succeeded defers the resulting CREATED task (see FAILURE
+    HANDLING below) rather than ever attempting to un-reconcile it back to
+    planning - created -> planning -> created merely as backoff machinery
+    would be a second, redundant transition for no durable benefit.
+
+    FAILURE HANDLING (Milestone 47 P3 adversarial-review correction): if
+    dispatch_task_work() raises BEFORE it could move the task out of its
+    recoverable state (created/planning/ready/running) - a genuine
+    execution-engine/config/storage defect, never an ordinary outcome -
+    this durably DEFERS the SAME task
+    (TaskRepository.defer_task_recovery_retry(), a small, capped-
+    exponential backoff reusing compute_outbox_retry_delay_seconds() - the
+    identical bounded policy P1's lifecycle-outbox and P2's confirmation-
+    decision retry both already use, with no task-recovery-specific
+    semantics of its own to justify a separate copy) so this one failing
+    task can never permanently starve every later durable recoverable task
+    behind it in the due-ordered queue above. The deferral is itself
+    conditional on the task still being in a recoverable state (see
+    defer_task_recovery_retry()'s own docstring for why a dispatch failure
+    AFTER the task left that set - waiting_for_confirmation or a terminal
+    state - must never fabricate a retry for state that is already gone,
+    and must never re-arm/reopen it). The original exception is always
+    re-raised afterward - this function never silently reports success for
+    a genuine defect; the worker's own existing generic recovery-error
+    boundary (WhatsAppServer._run_worker()'s
+    `except Exception: logger.warning("worker_recovery_error")`) still
+    catches it and keeps the worker alive, exactly as it already does for
+    every other recovery-checkpoint failure mode. This is TASK recovery
+    retry metadata only - it never touches task_step_progress, and the
+    RUNNING+in_progress fail-closed path above still returns normally
+    (mark_failed() is not an exception), so it is never itself subject to
+    this deferral."""
+
+    task_id = repository.find_one_recoverable_task(TASK_SOURCE)
+    if task_id is None:
+        return
+
+    try:
+        task = repository.get_task(task_id)
+        if task.state is TaskState.PLANNING:
+            try:
+                repository.transition_task(
+                    task_id,
+                    TaskState.PLANNING,
+                    TaskState.CREATED,
+                    reason_code=_RESTART_PLANNING_INTERRUPTED_REASON_CODE,
+                    safe_summary=_RESTART_PLANNING_INTERRUPTED_SAFE_SUMMARY,
+                )
+            except (InvalidTransitionError, TaskAlreadyTerminalError):
+                return
+
+        dispatch_task_work(
+            repository,
+            task_id,
+            catalog,
+            planner_provider,
+            registry,
+            tools_config_loader,
+            respond_provider,
+            client,
+            authorized_sender,
+        )
+    except Exception:
+        # Re-resolve fresh, by task_id alone - never trust anything
+        # already in hand from before the failed dispatch attempt.
+        still_recoverable_task = repository.get_task(task_id)
+        if still_recoverable_task.state in _RECOVERABLE_TASK_STATES:
+            new_attempt_count = still_recoverable_task.recovery_attempt_count + 1
+            delay_seconds = compute_outbox_retry_delay_seconds(new_attempt_count)
+            next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+            repository.defer_task_recovery_retry(
+                task_id, TASK_SOURCE, new_attempt_count, next_attempt_at
+            )
+        raise
 
 
 # Milestone 46 adversarial review, "narrow expected-exception handling":

@@ -506,6 +506,101 @@ def test_task_confirmation_work_message_handler_adds_no_side_effects_of_its_own(
     assert orchestrator.received_prompts == []
 
 
+# --- run_recovery_checkpoint(): Milestone 47 P1/P2/P3 bounded pickups ------
+
+
+def test_run_recovery_checkpoint_invokes_all_three_bounded_pickups_with_wired_dependencies(monkeypatch):
+    """MessageHandler.run_recovery_checkpoint() performs THREE
+    independently-bounded pickups per call (P1 lifecycle-outbox, P2
+    confirmation-decision, P3 task-state) - this proves the third one
+    (Milestone 47 P3) is actually wired with the SAME long-lived
+    dependencies the other two, and TaskExecutionWork/TaskConfirmationWork
+    above, already use - no separate recovery-specific dependency set."""
+
+    import interfaces.whatsapp.handler as handler_module
+
+    calls = []
+
+    def fake_run_task_state_recovery_checkpoint(
+        repository, catalog, planner_provider, registry, tools_config_loader,
+        respond_provider, client, authorized_sender,
+    ):
+        calls.append((
+            repository, catalog, planner_provider, registry, tools_config_loader,
+            respond_provider, client, authorized_sender,
+        ))
+
+    monkeypatch.setattr(handler_module, "run_outbound_lifecycle_recovery_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(handler_module, "run_confirmation_decision_recovery_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(
+        handler_module, "run_task_state_recovery_checkpoint", fake_run_task_state_recovery_checkpoint
+    )
+
+    (
+        sentinel_repo, sentinel_catalog, sentinel_provider, sentinel_registry,
+        sentinel_loader, sentinel_respond_provider, sentinel_sender,
+    ) = (object(), object(), object(), object(), object(), object(), object())
+    sentinel_client = RecordingClient()
+    handler = MessageHandler(
+        FakeOrchestrator("should not be reached"),
+        sentinel_client,
+        task_repository=sentinel_repo,
+        task_catalog=sentinel_catalog,
+        planner_provider=sentinel_provider,
+        action_registry=sentinel_registry,
+        tools_config_loader=sentinel_loader,
+        respond_provider=sentinel_respond_provider,
+        authorized_sender=sentinel_sender,
+    )
+
+    handler.run_recovery_checkpoint()
+
+    assert calls == [(
+        sentinel_repo, sentinel_catalog, sentinel_provider, sentinel_registry,
+        sentinel_loader, sentinel_respond_provider, sentinel_client, sentinel_sender,
+    )]
+
+
+def test_run_recovery_checkpoint_exception_from_task_state_pickup_propagates(monkeypatch):
+    """MessageHandler itself adds no exception handling of its own around
+    any of the three pickups - the worker's own existing generic
+    recovery-error boundary (WhatsAppServer._run_worker()'s
+    `except Exception: logger.warning("worker_recovery_error")`, exercised
+    directly in tests/interfaces/whatsapp/test_server.py) is what keeps
+    the worker alive; this only proves MessageHandler does not itself
+    swallow a P3 failure into a false "success"."""
+
+    import interfaces.whatsapp.handler as handler_module
+
+    monkeypatch.setattr(handler_module, "run_outbound_lifecycle_recovery_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(handler_module, "run_confirmation_decision_recovery_checkpoint", lambda *a, **k: None)
+
+    def raising_run_task_state_recovery_checkpoint(*a, **k):
+        raise RuntimeError("simulated P3 recovery defect")
+
+    monkeypatch.setattr(
+        handler_module, "run_task_state_recovery_checkpoint", raising_run_task_state_recovery_checkpoint
+    )
+
+    handler = MessageHandler(
+        FakeOrchestrator("should not be reached"),
+        RecordingClient(),
+        task_repository=object(),
+        task_catalog=object(),
+        planner_provider=object(),
+        action_registry=object(),
+        tools_config_loader=object(),
+        respond_provider=object(),
+        authorized_sender=object(),
+    )
+
+    try:
+        handler.run_recovery_checkpoint()
+        assert False, "expected RuntimeError to propagate"
+    except RuntimeError:
+        pass
+
+
 # --- Orchestrator result contract: plain str vs ModelResponse ----------
 
 

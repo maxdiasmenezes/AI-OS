@@ -1164,6 +1164,140 @@ def _insert_v5_pending_confirmation(db_path, task_id, confirmation_id):
         conn.close()
 
 
+def _create_v6_database(db_path):
+    """Build a real, historical schema-version-6 database by hand - the
+    exact schema this package shipped with through Milestone 47 P2 (a
+    task_pending_confirmation table WITH decision/decided_at/
+    decision_attempt_count/decision_next_attempt_at, and the
+    task_confirmation_ingress_receipts table, but tasks itself still
+    WITHOUT recovery_attempt_count/recovery_next_attempt_at) - so the
+    v6 -> v7 migration can be tested against a genuine pre-migration
+    file, not a description of one. The `tasks`/task_transitions/
+    task_step_progress/task_lifecycle_outbox shapes are byte-identical to
+    _create_v5_database()'s own - Milestone 47 P2 never touched them."""
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            f"""
+            CREATE TABLE tasks (
+                task_id          TEXT PRIMARY KEY,
+                display_id       TEXT NOT NULL UNIQUE,
+                state            TEXT NOT NULL CHECK (state IN ({_V1_STATE_LIST_SQL})),
+                request_text     TEXT NOT NULL,
+                source            TEXT NOT NULL,
+                dedup_key        TEXT UNIQUE,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                started_at       TEXT,
+                completed_at     TEXT,
+                failure_code     TEXT,
+                failure_summary  TEXT,
+                metadata_json    TEXT NOT NULL DEFAULT '{{}}',
+                protocol_version INTEGER NOT NULL,
+                version          INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+                plan_json        TEXT
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE task_transitions (
+                transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id       TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                from_state    TEXT CHECK (from_state IS NULL OR from_state IN ({_V1_STATE_LIST_SQL})),
+                to_state      TEXT NOT NULL CHECK (to_state IN ({_V1_STATE_LIST_SQL})),
+                timestamp     TEXT NOT NULL,
+                reason_code   TEXT,
+                safe_summary  TEXT,
+                task_version  INTEGER NOT NULL CHECK (task_version >= 1)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX tasks_created_idx ON tasks(created_at, task_id)")
+        conn.execute(
+            "CREATE INDEX transitions_task_idx ON task_transitions(task_id, transition_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_step_progress (
+                task_id         TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                step_position   INTEGER NOT NULL CHECK (step_position >= 1),
+                status          TEXT NOT NULL CHECK (status IN ('in_progress', 'succeeded', 'failed')),
+                started_at      TEXT NOT NULL,
+                completed_at    TEXT,
+                result_json     TEXT,
+                failure_code    TEXT,
+                failure_summary TEXT,
+                task_version    INTEGER NOT NULL CHECK (task_version >= 1),
+                PRIMARY KEY (task_id, step_position)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_pending_confirmation (
+                task_id                   TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+                confirmation_id           TEXT NOT NULL UNIQUE,
+                step_position             INTEGER NOT NULL CHECK (step_position >= 1),
+                action_name               TEXT NOT NULL,
+                resource_key              TEXT,
+                created_at                TEXT NOT NULL,
+                expires_at                TEXT NOT NULL,
+                decision                  TEXT CHECK (decision IS NULL OR decision IN ('confirm', 'reject')),
+                decided_at                TEXT,
+                decision_attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK (decision_attempt_count >= 0),
+                decision_next_attempt_at  TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_lifecycle_outbox (
+                event_id        TEXT PRIMARY KEY,
+                task_id         TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                transition_id   INTEGER NOT NULL UNIQUE
+                                    REFERENCES task_transitions(transition_id) ON DELETE CASCADE,
+                channel         TEXT NOT NULL,
+                event_kind      TEXT NOT NULL CHECK (event_kind IN (
+                                    'confirmation_required', 'task_completed', 'task_failed', 'task_cancelled'
+                                 )),
+                payload_json    TEXT,
+                created_at      TEXT NOT NULL,
+                delivered_at    TEXT,
+                attempt_count   INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                next_attempt_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX task_lifecycle_outbox_pending_idx "
+            "ON task_lifecycle_outbox(next_attempt_at, event_id) WHERE delivered_at IS NULL"
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_confirmation_ingress_receipts (
+                dedup_key       TEXT PRIMARY KEY,
+                task_id         TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                confirmation_id TEXT NOT NULL,
+                decision        TEXT NOT NULL CHECK (decision IN ('confirm', 'reject')),
+                source          TEXT NOT NULL,
+                accepted_at     TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '6')")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def test_existing_v5_database_migrates_to_current_schema_version(tmp_path):
     db_path = tmp_path / "tasks.sqlite3"
     _create_v5_database(db_path)
@@ -1337,12 +1471,13 @@ def test_v5_to_v6_migration_failure_leaves_a_valid_resumable_v5_database(tmp_pat
         conn2.close()
 
 
-def test_existing_v1_database_reaches_v6_via_full_chain(tmp_path):
-    """The full v1 -> v2 -> v3 -> v4 -> v5 -> v6 chain in one
+def test_existing_v1_database_reaches_v7_via_full_chain(tmp_path):
+    """The full v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 chain in one
     open_writer_connection() call - the exhaustive proof no earlier
-    migration step in the chain re-adds decision/decided_at (or any other
-    column) a later step also adds, and that every older schema still
-    reaches the CURRENT version deterministically, not merely v5."""
+    migration step in the chain re-adds decision/decided_at (or
+    recovery_attempt_count/recovery_next_attempt_at, or any other column)
+    a later step also adds, and that every older schema still reaches the
+    CURRENT version deterministically, not merely v6."""
 
     db_path = tmp_path / "tasks.sqlite3"
     _create_v1_database(db_path)
@@ -1359,6 +1494,138 @@ def test_existing_v1_database_reaches_v6_via_full_chain(tmp_path):
         assert "task_confirmation_ingress_receipts" in _table_names(conn)
         outbox_tables = _table_names(conn)
         assert "task_lifecycle_outbox" in outbox_tables
+        task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert {"recovery_attempt_count", "recovery_next_attempt_at"} <= task_columns
+    finally:
+        conn.close()
+
+
+# --- Milestone 47 P3 adversarial-review correction: v6 -> v7 -----------------
+
+
+def test_existing_v6_database_migrates_to_current_schema_version(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v6_database(db_path)
+
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert {"recovery_attempt_count", "recovery_next_attempt_at"} <= columns
+        # Milestone 47 P2's own structures are untouched by this migration.
+        pending_columns = {row[1] for row in conn.execute("PRAGMA table_info(task_pending_confirmation)")}
+        assert {"decision", "decided_at", "decision_attempt_count", "decision_next_attempt_at"} <= pending_columns
+        assert "task_confirmation_ingress_receipts" in _table_names(conn)
+    finally:
+        conn.close()
+
+
+def test_migration_v6_to_v7_existing_tasks_receive_zero_and_null(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v6_database(db_path)
+    _insert_v5_task(db_path, "task-1", "TASK-AAAA1111", state="running")
+
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT recovery_attempt_count, recovery_next_attempt_at FROM tasks WHERE task_id = ?",
+            ("task-1",),
+        ).fetchone()
+        # 0/NULL - "never deferred, immediately eligible if otherwise
+        # recoverable," never a fabricated retry history for a task that
+        # existed before this milestone.
+        assert row == (0, None)
+
+        # No task state changed by the migration itself.
+        state_row = conn.execute("SELECT state FROM tasks WHERE task_id = ?", ("task-1",)).fetchone()
+        assert state_row == ("running",)
+    finally:
+        conn.close()
+
+
+def test_migration_v6_to_v7_is_idempotent_on_repeated_initialization(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v6_database(db_path)
+    _insert_v5_task(db_path, "task-1", "TASK-AAAA1111", state="running")
+
+    open_writer_connection(db_path).close()
+    conn = open_writer_connection(db_path)
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+        task_row = conn.execute(
+            "SELECT recovery_attempt_count, recovery_next_attempt_at FROM tasks WHERE task_id = ?",
+            ("task-1",),
+        ).fetchone()
+        assert task_row == (0, None)
+    finally:
+        conn.close()
+
+
+def test_v6_to_v7_migration_failure_leaves_a_valid_resumable_v6_database(tmp_path, monkeypatch):
+    """Same proof as test_v5_to_v6_migration_failure_leaves_a_valid_resumable_v5_database,
+    one migration step later: _migrate_v6_to_v7() is its own independently-
+    committed transaction, so a forced failure there leaves the database
+    validly and correctly labelled at v6 - not falsely claiming v7, not
+    missing/partially-added recovery_attempt_count/recovery_next_attempt_at,
+    not structurally corrupt - resumable on a later writer open."""
+
+    import kernel.employee_tasks.db as db_module
+
+    db_path = tmp_path / "tasks.sqlite3"
+    _create_v6_database(db_path)
+    _insert_v5_task(db_path, "task-1", "TASK-AAAA1111", state="running")
+
+    broken_statements = db_module._MIGRATION_6_TO_7_STATEMENTS + ("THIS IS NOT VALID SQL",)
+    monkeypatch.setattr(db_module, "_MIGRATION_6_TO_7_STATEMENTS", broken_statements)
+
+    with pytest.raises(TaskStorageUnavailableError):
+        open_writer_connection(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == ("6",)
+
+        # BOTH statements (the two new ALTERs) are inside the SAME
+        # transaction as the forced-broken final statement - SQLite's own
+        # transactional DDL rolls them back together, proving "one
+        # migration transaction, no partial v7 claim" holds.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert "recovery_attempt_count" not in columns
+        assert "recovery_next_attempt_at" not in columns
+
+        task_row = conn.execute(
+            "SELECT task_id, state FROM tasks WHERE task_id = ?", ("task-1",)
+        ).fetchone()
+        assert task_row == ("task-1", "running")
+    finally:
+        conn.close()
+
+    monkeypatch.undo()
+
+    # Resumable: a later writer open (real code path, not the broken
+    # monkeypatched statements) completes the migration correctly.
+    conn2 = open_writer_connection(db_path)
+    try:
+        row = conn2.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        assert row == (str(SCHEMA_VERSION),)
+        task_row = conn2.execute(
+            "SELECT recovery_attempt_count, recovery_next_attempt_at FROM tasks WHERE task_id = ?",
+            ("task-1",),
+        ).fetchone()
+        assert task_row == (0, None)
+    finally:
+        conn2.close()
+
+
+def test_fresh_database_has_recovery_columns(tmp_path):
+    db_path = tmp_path / "tasks.sqlite3"
+    conn = open_writer_connection(db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert {"recovery_attempt_count", "recovery_next_attempt_at"} <= columns
     finally:
         conn.close()
 

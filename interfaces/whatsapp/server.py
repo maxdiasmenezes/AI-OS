@@ -77,22 +77,69 @@ task_control.py:dispatch_task_work()'s own docstring for the exact
 transition-triggered delivery rule and the full execution/delivery
 boundary.
 
-Milestone 46 P2B: a "CONFIRM <id>"/"REJECT <id>" message needs NO new
-handling in do_POST at all - interfaces.whatsapp.handler.classify_message()
-now recognizes it and returns either a FixedReplyTask (a malformed command
-shape) or a task_control.TaskConfirmationWork, and both fall through this
-function's EXISTING generic-message branch below (SeenMessageCache
-dedup, then work_queue.put_nowait()) exactly like ordinary chat always
-has - TaskConfirmationWork is opaque to do_POST, which only ever
-special-cases TaskRequestText above. Resolving, authorizing, approving,
-denying, and delivering a confirmation decision all happen exclusively on
-the worker thread, via task_control.py:dispatch_confirmation_work()'s own
-docstring, for the same reason execution does: approve_task_confirmation()
-may run a sensitive action synchronously and must never be reachable from
-this request thread. HTTP 200 for a CONFIRM/REJECT message means the
-command was accepted onto the in-memory worker queue - not a durable-
-decision acknowledgement; see task_control.py's own module docstring for
-why this is a deliberately accepted, documented boundary.
+Milestone 46 P2B recognized "CONFIRM <id>"/"REJECT <id>" via
+interfaces.whatsapp.handler.classify_message(), which returns either a
+FixedReplyTask (a malformed command shape) or a confirmation classification
+that fell through do_POST's generic-message branch (SeenMessageCache
+dedup, then work_queue.put_nowait()) with no special handling here at all.
+
+Milestone 47 P2 changes this: classify_message() now returns a
+task_control.ConfirmationCommandText for a syntactically well-formed
+command, and do_POST DOES special-case it, exactly like it already
+special-cases TaskRequestText above - see task_control.py's own module
+docstring for the full crash-window rationale. Synchronously, before this
+request may ever respond:
+
+  1. task_control.compute_confirmation_ingress_dedup_key(message.message_id)
+     derives a bounded, hashed dedup key (a distinct namespace from
+     tasks.dedup_key's own /task-ingress one - never the raw provider
+     message ID itself), then
+     task_control.record_confirmation_decision_durably() atomically
+     records the decision (or discovers it already was, or discovers this
+     EXACT provider message already won once before, or discovers this
+     confirmation_id/source/state is not eligible at all) via
+     TaskRepository.record_confirmation_decision().
+  2. RECORDED: TaskConfirmationWork(confirmation_id) (confirmation_id
+     ONLY - see that dataclass's own docstring on why decision is never
+     carried in the queue item) is offered to the bounded worker queue on
+     a best-effort basis. HTTP 200 either way - a full queue here does
+     NOT roll back the durable decision or respond 503; the durable write
+     is now the acceptance boundary, and the worker's own recovery
+     checkpoint guarantees eventual pickup (see
+     task_control.run_confirmation_decision_recovery_checkpoint()).
+  3. ALREADY_DECIDED: HTTP 200, no new work queued, no reply generated -
+     a decision (possibly from a DIFFERENT provider message) already
+     exists for this confirmation_id.
+  4. DUPLICATE_INGRESS (Milestone 47 P2 adversarial-review correction):
+     HTTP 200, no new work queued, no reply generated - THIS EXACT
+     provider message already won a decision at some point in the past,
+     detected via task_confirmation_ingress_receipts, which (unlike
+     SeenMessageCache) survives both task_pending_confirmation's own row
+     being consumed/deleted AND a process restart. This is what makes an
+     exact Meta redelivery of an already-fully-processed CONFIRM/REJECT
+     message crash-safe and restart-surviving, never producing a
+     spurious "no longer valid" reply merely because the pending row is
+     already gone.
+  5. NOT_ELIGIBLE: no durable decision exists, so this falls through to
+     the EXISTING generic FixedReplyTask/SeenMessageCache/queue-full-
+     ->503 path below - the normal, still-fully-applicable safety net for
+     "nothing durable was accepted, so a full queue must produce 503, not
+     a silently dropped reply." This remains the ONLY path that can ever
+     produce a user-facing "no longer valid" reply for a CONFIRM/REJECT
+     command - a genuinely NEW user message with an unknown/wrong-source/
+     wrong-state/already-consumed token, never a transport redelivery of
+     one that already succeeded, and never stale internal worker-queue
+     work (see task_control.dispatch_confirmation_work()'s own docstring
+     for that second, distinct silent-no-op case).
+
+Resolving, authorizing, approving, denying, and delivering a confirmation
+decision (as opposed to durably RECORDING one) still all happen
+exclusively on the worker thread, via
+task_control.py:dispatch_confirmation_work() - for the same reason
+execution does: approve_task_confirmation() may run a sensitive action
+synchronously and must never be reachable from this request thread. This
+request thread performs durable ingress only, exactly like
+accept_task_message() already does for a brand-new "/task" request.
 """
 
 import hashlib
@@ -109,6 +156,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from capabilities.loader import CapabilityLoader
 from kernel.config.config import Config, load_config
 from kernel.employee_tasks import (
+    ConfirmationDecisionOutcome,
     TaskRepository,
     acquire_runtime_ownership,
     open_writer_connection,
@@ -123,16 +171,23 @@ from kernel.tools import ActionRegistry, load_tools_config
 from interfaces.whatsapp.client import WhatsAppClient
 from interfaces.whatsapp.config import WhatsAppConfig, load_whatsapp_config
 from interfaces.whatsapp.dedup import SeenMessageCache
-from interfaces.whatsapp.handler import MessageHandler, classify_message
+from interfaces.whatsapp.handler import FixedReplyTask, MessageHandler, classify_message
 from interfaces.whatsapp.memory import FixedNamespaceMemory
 from interfaces.whatsapp.payload import parse_webhook_payload
 from interfaces.whatsapp.signature import verify_signature
 from interfaces.whatsapp.task_control import (
+    GENERIC_INVALID_CONFIRMATION_TEXT,
+    TASK_SOURCE,
+    ConfirmationCommandText,
+    ConfirmationDecisionRecordingFailed,
     DurableAcceptanceFailed,
+    TaskConfirmationWork,
     TaskExecutionWork,
     TaskRequestText,
     accept_task_message,
+    compute_confirmation_ingress_dedup_key,
     needs_dispatch,
+    record_confirmation_decision_durably,
 )
 
 logger = logging.getLogger(__name__)
@@ -316,6 +371,123 @@ def _make_handler_class(
                             )
                             queue_overflowed = True
                     continue
+
+                if isinstance(classification, ConfirmationCommandText):
+                    # Milestone 47 P2: a syntactically well-formed CONFIRM/
+                    # REJECT command's decision is durably recorded HERE,
+                    # synchronously, BEFORE this request may ever return
+                    # HTTP 200 - see this module's own module docstring and
+                    # task_control.py's own module docstring for why this
+                    # closes the Milestone 46 crash window. SeenMessageCache
+                    # is never consulted for the RECORDED/ALREADY_DECIDED/
+                    # DUPLICATE_INGRESS outcomes below - the durable write's
+                    # own first-decision-wins semantics, and (Milestone 47
+                    # P2 adversarial-review correction) the durable
+                    # task_confirmation_ingress_receipts row an exact
+                    # WINNING provider message leaves behind, are the real
+                    # idempotency boundary here - exactly like
+                    # tasks.dedup_key already is for a /task message, and
+                    # unlike SeenMessageCache, both survive a process
+                    # restart. task_db_path is None only if this server was
+                    # built without durable-ingress wiring - never silently
+                    # accepted as success in that case either.
+                    if task_db_path is None:
+                        logger.warning("rejecting request: confirmation ingress unavailable")
+                        queue_overflowed = True
+                        continue
+
+                    try:
+                        provider_dedup_key = compute_confirmation_ingress_dedup_key(
+                            message.message_id
+                        )
+                        outcome = record_confirmation_decision_durably(
+                            open_writer_connection,
+                            task_db_path,
+                            classification.confirmation_id,
+                            classification.decision,
+                            required_source=TASK_SOURCE,
+                            provider_dedup_key=provider_dedup_key,
+                        )
+                    except ConfirmationDecisionRecordingFailed:
+                        logger.warning(
+                            "rejecting request: confirmation decision storage failure (ref=%s)",
+                            _message_reference(message.message_id),
+                        )
+                        queue_overflowed = True
+                        continue
+
+                    if outcome is ConfirmationDecisionOutcome.DUPLICATE_INGRESS:
+                        # Milestone 47 P2 adversarial-review correction:
+                        # this EXACT provider message already durably won a
+                        # decision at some point in the past - detected via
+                        # task_confirmation_ingress_receipts, which
+                        # survives even after task_pending_confirmation's
+                        # own row (and SeenMessageCache, which was never
+                        # populated for this message in the first place)
+                        # is long gone. HTTP 200, no enqueue, no reply, no
+                        # further durable mutation - exact provider
+                        # redelivery of an already-accepted command must
+                        # never re-authorize or re-execute anything, and
+                        # must never produce a spurious "no longer valid"
+                        # reply either.
+                        continue
+
+                    if outcome is ConfirmationDecisionOutcome.RECORDED:
+                        try:
+                            work_queue.put_nowait(
+                                TaskConfirmationWork(classification.confirmation_id)
+                            )
+                        except queue.Full:
+                            # The durable decision already stands - never
+                            # rolled back merely because the in-memory
+                            # queue happens to be full right now. The
+                            # worker's own recovery checkpoint (P1's
+                            # lifecycle-outbox pickup, extended in P2 with
+                            # task_control.run_confirmation_decision_recovery_checkpoint())
+                            # guarantees this decision is eventually
+                            # processed even if this request never queues
+                            # it directly. Still HTTP 200: the durable
+                            # write, not the in-memory queue, is now the
+                            # acceptance boundary for a CONFIRM/REJECT
+                            # command (Milestone 47 P2) - never 503 merely
+                            # because the queue happened to be full after
+                            # a successful durable write.
+                            logger.warning(
+                                "confirmation decision recorded but queue full (ref=%s)",
+                                _message_reference(message.message_id),
+                            )
+                        continue
+
+                    if outcome is ConfirmationDecisionOutcome.ALREADY_DECIDED:
+                        # A durable decision already exists for this
+                        # confirmation_id - most likely Meta redelivering
+                        # the same CONFIRM/REJECT message. Never a
+                        # duplicate enqueue, never a spurious invalid-
+                        # confirmation reply: the existing decision remains
+                        # fully authoritative, and the worker (directly, or
+                        # eventually via the recovery checkpoint) processes
+                        # it exactly once regardless of how many times this
+                        # branch is reached for the same confirmation_id.
+                        continue
+
+                    # ConfirmationDecisionOutcome.NOT_ELIGIBLE: no durable
+                    # decision was written (wrong source, wrong state,
+                    # unknown/consumed token, or otherwise no longer
+                    # eligible - deliberately indistinguishable, exactly
+                    # like dispatch_confirmation_work()'s own generic
+                    # reply). Falls through to the EXISTING generic dedup+
+                    # enqueue path below as a fixed FixedReplyTask -
+                    # reusing SeenMessageCache so a Meta redelivery of the
+                    # same invalid message never produces a duplicate
+                    # invalid reply, and reusing the SAME queue-full ->
+                    # HTTP 503 semantics every other fixed-reply
+                    # classification already has (no durable decision
+                    # exists to protect here, so an overflowed queue must
+                    # not silently drop this work the way RECORDED's own
+                    # queue-full branch above safely can).
+                    classification = FixedReplyTask(
+                        message.sender, GENERIC_INVALID_CONFIRMATION_TEXT
+                    )
 
                 if not dedup.add_if_new(message.message_id):
                     logger.info(

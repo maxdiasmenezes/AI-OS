@@ -31,11 +31,13 @@ transition-triggered delivery rule that prevents a duplicate dispatch from
 resending one.
 
 Milestone 46 P2B adds a THIRD, likewise unrelated kind of queued work:
-task_control.py's TaskConfirmationWork(confirmation_id, decision) - the
-durable approve/deny handoff for a "CONFIRM <id>"/"REJECT <id>" message.
-Handling one is entirely delegated to
-task_control.dispatch_confirmation_work(), reusing the exact same
-long-lived TaskRepository/ActionRegistry/ToolsConfig loader/general
+task_control.py's TaskConfirmationWork(confirmation_id) - the approve/deny
+handoff for a "CONFIRM <id>"/"REJECT <id>" message whose decision has
+already been durably recorded (Milestone 47 P2 - see task_control.py's own
+module docstring: this queue item carries confirmation_id ONLY, never a
+decision - QUEUE ITEM IS NOT AUTHORITY). Handling one is entirely
+delegated to task_control.dispatch_confirmation_work(), reusing the exact
+same long-lived TaskRepository/ActionRegistry/ToolsConfig loader/general
 conversational ModelProvider already wired for TaskExecutionWork above -
 no separate confirmation-specific dependency exists. This module still
 performs no reverse lookup, authorization, approval, denial, or execution
@@ -43,6 +45,14 @@ logic itself, only wiring - see dispatch_confirmation_work()'s own
 docstring for why approve_task_confirmation() (which may execute a
 sensitive action synchronously) must never be reachable except from here,
 on the worker, never the webhook HTTP thread.
+
+Milestone 47 P2 also extends run_recovery_checkpoint() (already
+periodically invoked by interfaces/whatsapp/server.py's worker loop for
+P1's lifecycle-outbox redelivery) with a second, independently-bounded
+pickup: a durable confirmation decision that was recorded but never
+reached the worker (e.g. queue-full at recording time, or a crash before
+consumption) - see task_control.run_confirmation_decision_recovery_checkpoint()
+for the exact bound and dispatch mechanism.
 """
 
 import logging
@@ -52,6 +62,7 @@ from kernel.orchestrator.context import RequestContext
 
 from interfaces.whatsapp.client import WhatsAppClientError
 from interfaces.whatsapp.task_control import (
+    ConfirmationCommandText,
     ConfirmationFixedReply,
     TaskConfirmationWork,
     TaskExecutionWork,
@@ -61,6 +72,7 @@ from interfaces.whatsapp.task_control import (
     classify_task_text,
     dispatch_confirmation_work,
     dispatch_task_work,
+    run_confirmation_decision_recovery_checkpoint,
     run_outbound_lifecycle_recovery_checkpoint,
 )
 
@@ -130,15 +142,17 @@ def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_
     handling to durably accept - this function itself performs no I/O and
     creates no TaskRecord.
 
-    Milestone 46 P2B: a "CONFIRM <id>"/"REJECT <id>" message (checked only
+    Milestone 46/47: a "CONFIRM <id>"/"REJECT <id>" message (checked only
     after the "/task" check above has already ruled it out - the two
     grammars are mutually exclusive by construction) is likewise
     recognized here via task_control.classify_confirmation_text() and
     returned as either a ConfirmationFixedReply-wrapping FixedReplyTask
     (a malformed command shape - never reaches TaskRepository) or a
-    TaskConfirmationWork, unchanged, for the worker to resolve/authorize/
-    act on - this function still performs no I/O, no reverse lookup, and
-    no authorization decision of any kind.
+    ConfirmationCommandText, unchanged, for server.py's POST handling to
+    durably record (Milestone 47 P2 - see task_control.py's own module
+    docstring) before ever queueing anything for the worker - this
+    function still performs no I/O, no reverse lookup, no durable write,
+    and no authorization decision of any kind.
 
     Every other message (including ordinary text that doesn't match
     either grammar) is classified exactly as before Milestone 46."""
@@ -162,7 +176,7 @@ def classify_message(message, max_incoming_text_length: int = MAX_INCOMING_TEXT_
     confirmation_classification = classify_confirmation_text(text)
     if isinstance(confirmation_classification, ConfirmationFixedReply):
         return FixedReplyTask(message.sender, confirmation_classification.reply_text)
-    if isinstance(confirmation_classification, TaskConfirmationWork):
+    if isinstance(confirmation_classification, ConfirmationCommandText):
         return confirmation_classification
 
     return TextTask(message.sender, text)
@@ -263,23 +277,39 @@ class MessageHandler:
             raise TypeError(f"unsupported task type: {type(task).__name__}")
 
     def run_recovery_checkpoint(self) -> None:
-        """Milestone 47 P1: the worker's own bounded, periodic lifecycle-
-        outbox recovery opportunity - see
+        """The worker's own bounded, periodic recovery opportunity - see
         interfaces/whatsapp/server.py:WhatsAppServer._run_worker()'s own
         docstring for the monotonic-deadline scheduling that calls this at
         most once per checkpoint, interleaved with normal queue
-        consumption. Delegates entirely to
-        task_control.run_outbound_lifecycle_recovery_checkpoint(), which
-        attempts at most one due, undelivered WhatsApp lifecycle-outbox
-        redelivery - never task-state recovery, never durable
-        confirmation-decision pickup (neither exists yet - see this
-        milestone's own P1 scope boundary). Reuses the exact same
-        long-lived TaskRepository/client/authorized_sender already wired
-        for TaskExecutionWork/TaskConfirmationWork above - no separate
-        recovery-specific dependency exists."""
+        consumption. Performs TWO independently-bounded pickups, each at
+        most one per call, matching this milestone's own "never an
+        unbounded page" discipline for either:
+
+          - Milestone 47 P1: task_control.run_outbound_lifecycle_recovery_checkpoint()
+            - at most one due, undelivered WhatsApp lifecycle-outbox
+            redelivery.
+          - Milestone 47 P2: task_control.run_confirmation_decision_recovery_checkpoint()
+            - at most one durable confirmation decision that was recorded
+            but never reached the worker (e.g. queue-full at recording
+            time, or a crash before consumption).
+
+        Never task-state recovery (still out of scope - see this
+        milestone's own scope boundary). Reuses the exact same long-lived
+        TaskRepository/ActionRegistry/ToolsConfig loader/general
+        conversational ModelProvider/client/authorized_sender already
+        wired for TaskExecutionWork/TaskConfirmationWork above - no
+        separate recovery-specific dependency exists for either pickup."""
 
         run_outbound_lifecycle_recovery_checkpoint(
             self._task_repository, self._client, self._authorized_sender
+        )
+        run_confirmation_decision_recovery_checkpoint(
+            self._task_repository,
+            self._action_registry,
+            self._tools_config_loader,
+            self._respond_provider,
+            self._client,
+            self._authorized_sender,
         )
 
     def _handle_task_execution_work(self, task: TaskExecutionWork) -> None:

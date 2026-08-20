@@ -99,6 +99,8 @@ from kernel.employee_tasks.types import (
     MIN_REQUEST_TEXT_CHARS,
     MIN_SOURCE_CHARS,
     TERMINAL_STATES,
+    ConfirmationDecision,
+    ConfirmationDecisionOutcome,
     ConfirmationExpiredError,
     ConfirmationMismatchError,
     ConfirmationRequiredPayload,
@@ -117,6 +119,7 @@ from kernel.employee_tasks.types import (
     TaskRecord,
     TaskState,
     TaskStepProgress,
+    TaskStorageCorruptError,
     TaskStorageUnavailableError,
     TaskTransition,
     format_utc_timestamp,
@@ -141,7 +144,8 @@ _STEP_PROGRESS_SELECT_COLUMNS = (
 
 _PENDING_CONFIRMATION_SELECT_COLUMNS = (
     "task_id, confirmation_id, step_position, action_name, resource_key, "
-    "created_at, expires_at"
+    "created_at, expires_at, decision, decided_at, decision_attempt_count, "
+    "decision_next_attempt_at"
 )
 
 _OUTBOX_SELECT_COLUMNS = (
@@ -344,6 +348,28 @@ def _row_to_step_progress(row) -> TaskStepProgress:
     )
 
 
+def _parse_stored_confirmation_decision(raw) -> ConfirmationDecision | None:
+    """Milestone 47 P2 adversarial-review correction (LOW-1): the SQL CHECK
+    constraint already makes this unreachable through any supported write
+    path (record_confirmation_decision() only ever writes a
+    ConfirmationDecision member's own .value) - but defense in depth,
+    never assumed away, matching parse_task_timestamp()'s own established
+    convention for the sibling expires_at field. A malformed stored value
+    (only reachable via direct, out-of-band database corruption/tampering,
+    never through this module's own write path) fails closed as
+    TaskStorageCorruptError - never a bare ValueError, which would embed
+    the raw corrupted value directly in its own message."""
+
+    if raw is None:
+        return None
+    try:
+        return ConfirmationDecision(raw)
+    except ValueError as exc:
+        raise TaskStorageCorruptError(
+            "task_pending_confirmation.decision is not a valid ConfirmationDecision"
+        ) from exc
+
+
 def _row_to_pending_confirmation(row) -> PendingTaskConfirmation:
     return PendingTaskConfirmation(
         task_id=row[0],
@@ -353,6 +379,10 @@ def _row_to_pending_confirmation(row) -> PendingTaskConfirmation:
         resource_key=row[4],
         created_at=row[5],
         expires_at=row[6],
+        decision=_parse_stored_confirmation_decision(row[7]),
+        decided_at=row[8],
+        decision_attempt_count=row[9],
+        decision_next_attempt_at=row[10],
     )
 
 
@@ -1353,6 +1383,299 @@ class TaskRepository:
             conn.execute("COMMIT")
 
         return self.get_task(task_id)
+
+    def record_confirmation_decision(
+        self,
+        confirmation_id: str,
+        decision: ConfirmationDecision,
+        *,
+        required_source: str,
+        provider_dedup_key: str,
+    ) -> ConfirmationDecisionOutcome:
+        """Durable confirmation-decision ingress (Milestone 47 P2) - the
+        crash-safe boundary a webhook request thread calls BEFORE ever
+        returning HTTP 200 for a CONFIRM/REJECT command, closing the
+        Milestone 46 crash window where a decision existed only in the
+        volatile worker queue between HTTP 200 and worker consumption.
+        This is durable ingress ONLY: it never consumes the pending
+        confirmation, never approves/denies anything, never executes an
+        action, and never modifies task state - see
+        consume_confirmation_and_claim_step()/deny_confirmation()/
+        fail_pending_confirmation() for the still-unchanged consume-once
+        boundary that remains the sole authority for all of that.
+
+        SECURITY-CRITICAL: the entire eligibility check and the durable
+        write happen inside ONE BEGIN IMMEDIATE transaction, so a wrong-
+        source or wrong-state confirmation_id can never receive a durable
+        decision even transiently - never committed-then-rolled-back,
+        never written to the row at all. Atomically verifies, in order:
+        (0) `provider_dedup_key` does not already exist in
+        task_confirmation_ingress_receipts - see DUPLICATE_INGRESS below;
+        (1) confirmation_id resolves to a pending confirmation; (2) the
+        owning task still exists; (3) the owning task's source ==
+        required_source; (4) the owning task's state ==
+        WAITING_FOR_CONFIRMATION; (5) the pending confirmation row still
+        has this exact confirmation_id (re-read inside this same
+        transaction, never trusted from step (1)'s own lookup); (6)
+        decision is currently NULL (first-decision-wins). Only once every
+        one of these holds does this call ever write decision/decided_at/
+        decision_attempt_count/decision_next_attempt_at - and, in the SAME
+        transaction, the task_confirmation_ingress_receipts row that lets
+        a later, exact redelivery of THIS SAME provider message be
+        recognized (DUPLICATE_INGRESS) even after task_pending_confirmation
+        itself is consumed/deleted, or after a process restart. Either
+        both the decision and the receipt commit, or neither does - never
+        a decision without its receipt (see this method's own COMMIT
+        below: one transaction, one outcome).
+
+        Returns ConfirmationDecisionOutcome.RECORDED if this call's
+        decision durably won (decision + receipt both committed),
+        .ALREADY_DECIDED if a decision (this one or the opposite one) was
+        already durably recorded for this confirmation_id - by a
+        DIFFERENT provider message - before this call ever reached the
+        transaction, .DUPLICATE_INGRESS if `provider_dedup_key` itself was
+        already the one that won (this exact provider message was already
+        processed, at any point in the past - see that outcome's own
+        docstring for why this is NOT the same as ALREADY_DECIDED), or
+        .NOT_ELIGIBLE if any other eligibility check above failed -
+        deliberately as unspecific as get_task_by_pending_confirmation_id()'s
+        own None return (see ConfirmationDecisionOutcome's own docstring
+        for why). Never raises for any of these four ordinary outcomes -
+        only a genuine storage failure escapes (TaskStorageUnavailableError,
+        or a raw sqlite3 exception the caller translates the same way -
+        see the deliberate absence of any sqlite3.IntegrityError-specific
+        branch below: DUPLICATE_INGRESS detection belongs solely to the
+        explicit pre-check SELECT above, under this same BEGIN IMMEDIATE
+        transaction's exclusive write lock, so no OTHER writer can ever
+        interleave a colliding provider_dedup_key between that SELECT and
+        this method's own INSERT; an IntegrityError reaching this method
+        by any other path is a genuine, unexpected storage defect and must
+        never be silently relabeled as an ordinary duplicate).
+
+        `decided_at` is always this call's own current instant, code-
+        generated here via the SAME canonical, fixed-width UTC
+        serialization (format_utc_timestamp()) task_lifecycle_outbox's
+        created_at/next_attempt_at columns already use - never
+        caller-supplied text. `decision_next_attempt_at` starts equal to
+        `decided_at` (immediately due for the very first recovery
+        checkpoint that looks) and `decision_attempt_count` starts at 0 -
+        see find_recoverable_confirmation_decision()'s own docstring for
+        how these two are used, and defer_confirmation_decision_retry()
+        for how they change on a failed dispatch attempt.
+
+        `provider_dedup_key` must already be a bounded, code-derived
+        digest (see interfaces/whatsapp/task_control.py's
+        compute_confirmation_ingress_dedup_key()) - never the raw
+        provider message ID itself; this method stores exactly the value
+        it is given, performing no hashing of its own."""
+
+        confirmation_id = _validate_confirmation_id(confirmation_id)
+        if not isinstance(decision, ConfirmationDecision):
+            raise TaskInputTooLargeError("decision must be a ConfirmationDecision")
+        required_source = _validate_bounded_text(
+            required_source, "required_source", MIN_SOURCE_CHARS, MAX_SOURCE_CHARS
+        )
+        provider_dedup_key = _validate_bounded_text(
+            provider_dedup_key, "provider_dedup_key", 1, MAX_DEDUP_KEY_CHARS
+        )
+
+        conn = self._conn
+        decided_at = format_utc_timestamp(datetime.now(timezone.utc))
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing_receipt = conn.execute(
+                "SELECT 1 FROM task_confirmation_ingress_receipts WHERE dedup_key = ?",
+                (provider_dedup_key,),
+            ).fetchone()
+            if existing_receipt is not None:
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.DUPLICATE_INGRESS
+
+            row = conn.execute(
+                "SELECT task_id FROM task_pending_confirmation WHERE confirmation_id = ?",
+                (confirmation_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.NOT_ELIGIBLE
+            task_id = row[0]
+
+            try:
+                actual_state, _current_version, source = _select_task_state_for_update(
+                    conn, task_id
+                )
+            except TaskNotFoundError:
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.NOT_ELIGIBLE
+
+            if (
+                source != required_source
+                or actual_state != TaskState.WAITING_FOR_CONFIRMATION.value
+            ):
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.NOT_ELIGIBLE
+
+            pending_row = conn.execute(
+                "SELECT confirmation_id, decision FROM task_pending_confirmation WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if pending_row is None or pending_row[0] != confirmation_id:
+                # Consumed or replaced by a newer round between the first
+                # lookup above and here - structurally shouldn't happen
+                # within one BEGIN IMMEDIATE transaction (no concurrent
+                # writer can interleave), but never assumed away.
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.NOT_ELIGIBLE
+            if pending_row[1] is not None:
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.ALREADY_DECIDED
+
+            cursor = conn.execute(
+                "UPDATE task_pending_confirmation SET decision = ?, decided_at = ?, "
+                "decision_attempt_count = 0, decision_next_attempt_at = ? "
+                "WHERE task_id = ? AND confirmation_id = ? AND decision IS NULL",
+                (decision.value, decided_at, decided_at, task_id, confirmation_id),
+            )
+            if cursor.rowcount == 0:
+                # Defense in depth only - BEGIN IMMEDIATE's write lock
+                # already makes this unreachable given the checks above;
+                # never assumed to be dead code regardless (matches this
+                # class's own doctrine throughout).
+                conn.execute("ROLLBACK")
+                return ConfirmationDecisionOutcome.ALREADY_DECIDED
+
+            conn.execute(
+                "INSERT INTO task_confirmation_ingress_receipts "
+                "(dedup_key, task_id, confirmation_id, decision, source, accepted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (provider_dedup_key, task_id, confirmation_id, decision.value, source, decided_at),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+        return ConfirmationDecisionOutcome.RECORDED
+
+    def find_recoverable_confirmation_decision(self, source: str) -> str | None:
+        """Bounded, DUE lookup for Milestone 47 P2's recovery-checkpoint
+        pickup: at most one durably-recorded confirmation_id whose
+        decision has not yet been consumed AND whose
+        decision_next_attempt_at has already arrived, for the given
+        source only - never a cross-source scan (mirrors
+        list_due_lifecycle_outbox_events()'s own channel-filtering
+        discipline). Filters defensively on BOTH the owning task's source
+        and its current state (WAITING_FOR_CONFIRMATION) - a decision
+        belonging to a task that has since been consumed, or that belongs
+        to a different source, is never returned here, even as defense in
+        depth alongside dispatch_confirmation_work()'s own independent
+        re-verification of both.
+
+        Milestone 47 P2 adversarial-review correction (MEDIUM-2): ordered
+        by (decision_next_attempt_at, confirmation_id) and filtered on
+        `decision_next_attempt_at <= now` - NOT plain (decided_at,
+        confirmation_id) over every undecided-but-unconsumed row
+        regardless of retry state. The earlier design (oldest decided_at
+        first, unconditionally) let one durable decision that repeatedly
+        fails to be dispatched - before it is ever consumed - remain "the
+        oldest" forever, starving every later durable decision behind it
+        (task_lifecycle_outbox's own attempt_count/next_attempt_at already
+        solved the identical problem for P1 - see
+        defer_confirmation_decision_retry()'s own docstring for the P2
+        analogue). The `next_attempt_at <= ?` comparison below is a PLAIN
+        SQLite TEXT comparison, exactly like
+        list_due_lifecycle_outbox_events()'s own - provably, not merely
+        coincidentally, equivalent to chronological ordering, because
+        decision_next_attempt_at (set by record_confirmation_decision()
+        and defer_confirmation_decision_retry()) and `now` here are both
+        ALWAYS produced by the SAME canonical, fixed-width UTC
+        format_utc_timestamp() this whole package relies on for exactly
+        this property.
+
+        Returns a bare confirmation_id (never a full row/dataclass) since
+        the caller always re-resolves and re-verifies everything fresh
+        from confirmation_id alone anyway, exactly like a normal
+        CONFIRM/REJECT dispatch does. A plain read - no transaction
+        needed."""
+
+        source = _validate_bounded_text(source, "source", MIN_SOURCE_CHARS, MAX_SOURCE_CHARS)
+        now = format_utc_timestamp(datetime.now(timezone.utc))
+        row = self._conn.execute(
+            "SELECT tpc.confirmation_id FROM task_pending_confirmation tpc "
+            "JOIN tasks t ON t.task_id = tpc.task_id "
+            "WHERE tpc.decision IS NOT NULL AND t.source = ? AND t.state = ? "
+            "AND tpc.decision_next_attempt_at <= ? "
+            "ORDER BY tpc.decision_next_attempt_at, tpc.confirmation_id LIMIT 1",
+            (source, TaskState.WAITING_FOR_CONFIRMATION.value, now),
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0]
+
+    def defer_confirmation_decision_retry(
+        self, confirmation_id: str, attempt_count: int, next_attempt_at: datetime
+    ) -> None:
+        """Milestone 47 P2 adversarial-review correction (MEDIUM-2): persist
+        a bounded retry deferral for a durable confirmation decision whose
+        dispatch attempt raised BEFORE it could be consumed - the P2
+        analogue of mark_lifecycle_event_delivery_failed(). Callers own
+        the backoff policy (e.g.
+        kernel.employee_tasks.compute_outbox_retry_delay_seconds(),
+        reused as-is - the identical bounded, capped-exponential policy
+        is exactly what this needs too, with no confirmation-specific
+        semantics of its own to justify a separate copy); this method
+        never computes it itself, matching mark_lifecycle_event_delivery_failed()'s
+        own "policy stays with the caller" doctrine.
+
+        CONDITIONAL on the SAME pending confirmation row (matched on
+        confirmation_id) STILL existing AND still having a non-NULL
+        decision - if dispatch_confirmation_work() actually consumed the
+        row (or someone else's decision replaced this one - structurally
+        impossible today, but never assumed) before raising, there is
+        nothing left to defer, and this call is a silent, safe no-op:
+        never fabricates a retry row for state that no longer exists, and
+        never re-arms a decision the task-execution engine has already
+        moved past (see run_confirmation_decision_recovery_checkpoint()'s
+        own docstring for why this distinction matters - a post-
+        consumption failure is out of THIS layer's scope entirely).
+
+        `next_attempt_at` must be a real, timezone-aware UTC datetime -
+        never caller-supplied raw text - serialized here via the same
+        canonical format_utc_timestamp() every other timestamp column in
+        this package uses."""
+
+        confirmation_id = _validate_confirmation_id(confirmation_id)
+        if not isinstance(attempt_count, int) or isinstance(attempt_count, bool) or attempt_count < 0:
+            raise TaskInputTooLargeError("attempt_count must be a non-negative integer")
+        if (
+            not isinstance(next_attempt_at, datetime)
+            or next_attempt_at.tzinfo is None
+            or next_attempt_at.utcoffset() != timedelta()
+        ):
+            raise TaskInputTooLargeError("next_attempt_at must be a UTC (offset +00:00) datetime")
+        next_attempt_at_text = format_utc_timestamp(next_attempt_at)
+
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE task_pending_confirmation SET decision_attempt_count = ?, "
+                "decision_next_attempt_at = ? WHERE confirmation_id = ? AND decision IS NOT NULL",
+                (attempt_count, next_attempt_at_text, confirmation_id),
+            )
+        except sqlite3.OperationalError as exc:
+            conn.execute("ROLLBACK")
+            raise TaskStorageUnavailableError("task database is locked or unavailable") from exc
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
     def get_pending_confirmation(self, task_id: str) -> PendingTaskConfirmation | None:
         """None means no pending confirmation exists for this task - a

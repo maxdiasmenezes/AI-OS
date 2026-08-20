@@ -102,10 +102,53 @@ _TASK_STEP_PROGRESS_TABLE_SQL = f"""
 # guaranteed by execution being strictly sequential); confirmation_id is
 # separately UNIQUE (a single-use identity token, never reused across two
 # different proposals for the same task, even sequential ones - see that
-# type's own docstring for why task_id alone is not enough). Defined once
-# and reused by BOTH _SCHEMA_STATEMENTS and _MIGRATION_3_TO_4_STATEMENTS,
-# for the same drift-avoidance reason _TASK_STEP_PROGRESS_TABLE_SQL is.
+# type's own docstring for why task_id alone is not enough).
+#
+# Deliberately NOT shared with _MIGRATION_3_TO_4_STATEMENTS below (unlike
+# _TASK_STEP_PROGRESS_TABLE_SQL/_TASK_LIFECYCLE_OUTBOX_TABLE_SQL's own
+# "one definition, reused by both the fresh-schema and migration paths"
+# discipline): this constant represents the table's CURRENT (v6) shape,
+# decision/decided_at/decision_attempt_count/decision_next_attempt_at
+# columns included, for a fresh database only. A database migrating
+# v3 -> v4 must get the table in its ORIGINAL v4 shape (see
+# _TASK_PENDING_CONFIRMATION_TABLE_V4_SQL below) - reusing this current
+# definition there would ALTER TABLE ADD COLUMN the exact same columns a
+# later v5 -> v6 step then tries to add again, which SQLite rejects
+# outright ("duplicate column name").
+#
+# decision_attempt_count/decision_next_attempt_at (Milestone 47 P2
+# adversarial-review correction): the same bounded retry-scheduling shape
+# task_lifecycle_outbox's own attempt_count/next_attempt_at already
+# established - see TaskRepository.find_recoverable_confirmation_decision()'s
+# own docstring for why this is what keeps one repeatedly-failing durable
+# decision from starving every later one. Since v6 has not shipped yet,
+# these are added directly to this schema version rather than a new v7.
 _TASK_PENDING_CONFIRMATION_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS task_pending_confirmation (
+        task_id                  TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+        confirmation_id          TEXT NOT NULL UNIQUE,
+        step_position            INTEGER NOT NULL CHECK (step_position >= 1),
+        action_name              TEXT NOT NULL,
+        resource_key             TEXT,
+        created_at               TEXT NOT NULL,
+        expires_at               TEXT NOT NULL,
+        decision                 TEXT CHECK (decision IS NULL OR decision IN ('confirm', 'reject')),
+        decided_at               TEXT,
+        decision_attempt_count   INTEGER NOT NULL DEFAULT 0 CHECK (decision_attempt_count >= 0),
+        decision_next_attempt_at TEXT
+    )
+    """
+
+# The table's ORIGINAL v4 shape (Milestone 42 P2), frozen exactly as
+# first shipped - used ONLY by _MIGRATION_3_TO_4_STATEMENTS below, so a
+# v3 -> v4 -> v5 -> v6 chain adds decision/decided_at exactly once, via
+# _MIGRATION_5_TO_6_STATEMENTS' own ALTER TABLE, never twice. Never
+# changed again for any future schema version - if task_pending_confirmation
+# ever needs another new column, it goes on
+# _TASK_PENDING_CONFIRMATION_TABLE_SQL (the current shape) and its own
+# ALTER TABLE migration, exactly like decision/decided_at did, and this
+# historical constant stays exactly as it is here, forever.
+_TASK_PENDING_CONFIRMATION_TABLE_V4_SQL = """
     CREATE TABLE IF NOT EXISTS task_pending_confirmation (
         task_id         TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
         confirmation_id TEXT NOT NULL UNIQUE,
@@ -171,6 +214,40 @@ _TASK_LIFECYCLE_OUTBOX_PENDING_INDEX_SQL = (
     "ON task_lifecycle_outbox(next_attempt_at, event_id) WHERE delivered_at IS NULL"
 )
 
+# Schema version 6 (Milestone 47 P2 adversarial-review correction): the
+# minimal durable receipt a WINNING CONFIRM/REJECT provider message leaves
+# behind - see TaskRepository.record_confirmation_decision()'s own
+# docstring for the exact atomicity contract (this row and the decision
+# write commit in the SAME transaction, or neither does). Deliberately
+# NOT a foreign key to task_pending_confirmation, because that row is
+# intentionally deleted the moment the decision is consumed - this
+# receipt's whole purpose is to survive that deletion, so a provider's
+# later, exact redelivery of the SAME winning message can still be
+# recognized (DUPLICATE_INGRESS) even after the pending confirmation row,
+# and even after a process restart, is long gone. `dedup_key` is the
+# PRIMARY KEY - a SHA-256 digest of the provider message ID, never the
+# raw ID itself (mirrors compute_dedup_key()'s own /task-ingress
+# discipline) - so SQLite itself enforces "one winning provider message
+# can create at most one receipt," not merely application-level
+# discipline. This is transport-dedup HISTORY only, never execution
+# authority: current task/pending-confirmation state and current
+# ToolsConfig/ActionRegistry remain the sole authority for whether
+# anything may execute - see dispatch_confirmation_work()'s own docstring.
+# No raw message text, phone number, recipient, or provider secret is
+# ever stored here - only the four already-bounded identifiers already
+# durable elsewhere (task_id, confirmation_id, decision, source) plus one
+# timestamp.
+_TASK_CONFIRMATION_INGRESS_RECEIPTS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS task_confirmation_ingress_receipts (
+        dedup_key       TEXT PRIMARY KEY,
+        task_id         TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+        confirmation_id TEXT NOT NULL,
+        decision        TEXT NOT NULL CHECK (decision IN ('confirm', 'reject')),
+        source          TEXT NOT NULL,
+        accepted_at     TEXT NOT NULL
+    )
+    """
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS schema_meta (
@@ -216,6 +293,7 @@ _SCHEMA_STATEMENTS = (
     _TASK_PENDING_CONFIRMATION_TABLE_SQL,
     _TASK_LIFECYCLE_OUTBOX_TABLE_SQL,
     _TASK_LIFECYCLE_OUTBOX_PENDING_INDEX_SQL,
+    _TASK_CONFIRMATION_INGRESS_RECEIPTS_TABLE_SQL,
 )
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -343,14 +421,17 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         raise TaskStorageUnavailableError("task database is unavailable") from exc
 
 
-# Milestone 42 P2: adds the task_pending_confirmation table a fresh v4+
-# database already has via _SCHEMA_STATEMENTS above - same "wholly new
-# table, no ALTER TABLE" shape as _migrate_v2_to_v3. Bumps to the fixed
-# literal "4" for the same reason the earlier migrations bump to their own
-# fixed literals - see _migrate_v1_to_v2's comment. Reuses
-# _TASK_PENDING_CONFIRMATION_TABLE_SQL (defined once, above
-# _SCHEMA_STATEMENTS).
-_MIGRATION_3_TO_4_STATEMENTS = (_TASK_PENDING_CONFIRMATION_TABLE_SQL,)
+# Milestone 42 P2: adds the task_pending_confirmation table, in its
+# ORIGINAL v4 shape - same "wholly new table, no ALTER TABLE" shape as
+# _migrate_v2_to_v3. Bumps to the fixed literal "4" for the same reason
+# the earlier migrations bump to their own fixed literals - see
+# _migrate_v1_to_v2's comment. Reuses _TASK_PENDING_CONFIRMATION_TABLE_V4_SQL
+# (defined once, above _SCHEMA_STATEMENTS) - deliberately NOT the current
+# _TASK_PENDING_CONFIRMATION_TABLE_SQL, which already includes the v6
+# decision/decided_at columns _MIGRATION_5_TO_6_STATEMENTS' own ALTER
+# TABLE adds later in the same chain - see that historical constant's own
+# comment for why reusing the current shape here would double-add them.
+_MIGRATION_3_TO_4_STATEMENTS = (_TASK_PENDING_CONFIRMATION_TABLE_V4_SQL,)
 
 
 def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -404,6 +485,55 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
         raise TaskStorageUnavailableError("task database is unavailable") from exc
 
 
+# Milestone 47 P2 (finalized during adversarial-review correction, before
+# ever shipping - so these land directly in v6 rather than a new v7): adds
+# decision/decided_at/decision_attempt_count/decision_next_attempt_at to a
+# fresh v5 database's EXISTING task_pending_confirmation table, and the
+# wholly new task_confirmation_ingress_receipts table - unlike most earlier
+# migrations in this module (which add a wholly new table with no ALTER
+# TABLE needed), the first four statements here are genuinely
+# ALTER TABLE ADD COLUMN, since task_pending_confirmation itself already
+# exists on any v4+ database. SQLite permits a CHECK constraint (and a
+# constant DEFAULT) on an ADD COLUMN as long as it references only the new
+# column itself (never another column) - true for all four columns below,
+# so none needs a table rebuild. decision/decided_at/decision_next_attempt_at
+# are nullable with no DEFAULT, so every existing row (whatever its current
+# state) implicitly gets NULL for all three - exactly "no decision has ever
+# been recorded for this historical row," never a fabricated one.
+# decision_attempt_count gets DEFAULT 0, matching every existing row having
+# made zero attempts (consistent with it never having a decision to retry
+# in the first place). task_confirmation_ingress_receipts is created EMPTY,
+# for the same reason task_lifecycle_outbox was in the v4 -> v5 migration:
+# no durable evidence exists for whether any historical CONFIRM/REJECT
+# provider message ever "won," so nothing is fabricated. Runs inside the
+# same transaction as the schema_meta version bump, same as every other
+# migration here.
+_MIGRATION_5_TO_6_STATEMENTS = (
+    "ALTER TABLE task_pending_confirmation ADD COLUMN decision TEXT "
+    "CHECK (decision IS NULL OR decision IN ('confirm', 'reject'))",
+    "ALTER TABLE task_pending_confirmation ADD COLUMN decided_at TEXT",
+    "ALTER TABLE task_pending_confirmation ADD COLUMN decision_attempt_count "
+    "INTEGER NOT NULL DEFAULT 0 CHECK (decision_attempt_count >= 0)",
+    "ALTER TABLE task_pending_confirmation ADD COLUMN decision_next_attempt_at TEXT",
+    _TASK_CONFIRMATION_INGRESS_RECEIPTS_TABLE_SQL,
+)
+
+
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _MIGRATION_5_TO_6_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("6",),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.execute("ROLLBACK")
+        raise TaskStorageUnavailableError("task database is unavailable") from exc
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     try:
         row = conn.execute(
@@ -431,6 +561,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if current_version == "4":
             _migrate_v4_to_v5(conn)
             current_version = "5"
+        if current_version == "5":
+            _migrate_v5_to_v6(conn)
+            current_version = "6"
         if current_version == str(SCHEMA_VERSION):
             return  # already current - idempotent no-op
         raise TaskSchemaIncompatibleError("task database schema is incompatible")

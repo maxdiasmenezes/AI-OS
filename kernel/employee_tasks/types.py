@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 PROTOCOL_VERSION = 1
 
 # Fixed, code-level bounds on every externally supplied text field. Not
@@ -397,6 +397,65 @@ class TaskStepProgress:
     task_version: int
 
 
+class ConfirmationDecision(str, Enum):
+    """The closed set of durable decisions a CONFIRM/REJECT command may
+    record against a pending confirmation (Milestone 47 P2) - mirrors
+    TaskState/StepStatus/LifecycleEventKind's own "inherits str" convention
+    so a member compares equal to, and can be stored/read as, its plain
+    string value. Exactly the two values
+    task_pending_confirmation.decision's own schema-level CHECK constraint
+    accepts (kernel/employee_tasks/db.py) - no other decision string is
+    ever valid, matching this module's own "close the set in SQL too, not
+    just in the enum" discipline (see _STEP_STATUS_LIST_SQL's own comment
+    in db.py). This is the single, kernel-owned representation - never
+    duplicated by interfaces/whatsapp/task_control.py, which imports this
+    exact enum rather than defining its own equivalent."""
+
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+class ConfirmationDecisionOutcome(str, Enum):
+    """The closed set of outcomes TaskRepository.record_confirmation_decision()
+    (Milestone 47 P2) may return - never a free-form string, never an
+    exception for any of these three ordinary, expected results (an
+    exception remains reserved for a genuine storage failure, matching
+    every other repository method's own convention).
+
+    RECORDED: this call's decision durably won - it, and only it, is now
+    task_pending_confirmation.decision for this confirmation_id, AND a
+    matching task_confirmation_ingress_receipts row now durably remembers
+    this exact provider message as the one that won (see
+    TaskRepository.record_confirmation_decision()'s own docstring for the
+    atomicity of that pairing).
+    ALREADY_DECIDED: a decision (whether this same one or the opposite one)
+    was already durably recorded before this call ever reached the
+    transaction - first-decision-wins, and this call never overwrote it.
+    DUPLICATE_INGRESS (Milestone 47 P2 adversarial-review correction): this
+    EXACT provider message was already the one that durably won a decision
+    - detected via task_confirmation_ingress_receipts, which survives even
+    after task_pending_confirmation's own row is later consumed/deleted.
+    Distinct from ALREADY_DECIDED: ALREADY_DECIDED means "some decision for
+    this confirmation_id already exists, but not necessarily from this
+    exact provider message"; DUPLICATE_INGRESS means "this exact provider
+    message itself already won, at any point in the past, even long after
+    the pending row is gone" - the crash-safe, restart-surviving transport-
+    redelivery answer NOT_ELIGIBLE could never give.
+    NOT_ELIGIBLE: no durable decision was written, for any reason -
+    confirmation_id does not resolve, the owning task's source does not
+    match, the owning task is no longer WAITING_FOR_CONFIRMATION, or the
+    pending row is otherwise gone. Deliberately as unspecific as
+    get_task_by_pending_confirmation_id()'s own None return: which of
+    these actually happened is never distinguishable from the outcome
+    alone, so a wrong-source or expired-token attempt discloses nothing
+    about which case occurred."""
+
+    RECORDED = "recorded"
+    ALREADY_DECIDED = "already_decided"
+    DUPLICATE_INGRESS = "duplicate_ingress"
+    NOT_ELIGIBLE = "not_eligible"
+
+
 @dataclass(frozen=True)
 class PendingTaskConfirmation:
     """One durable task_pending_confirmation row (Milestone 42 P2) - a
@@ -442,7 +501,35 @@ class PendingTaskConfirmation:
     specific threat would require an independent trust boundary (e.g. an
     authenticated/signed proposal record, or storage this process does not
     itself have unrestricted write access to) that no part of this
-    codebase's existing threat model calls for today."""
+    codebase's existing threat model calls for today.
+
+    `decision`/`decided_at` (Milestone 47 P2): durable confirmation-decision
+    authority - see TaskRepository.record_confirmation_decision()'s own
+    docstring for the exact atomic eligibility/first-decision-wins
+    contract. Both are None until a decision has been durably recorded;
+    `decision` is never any value other than a ConfirmationDecision member
+    once non-None, matching the schema's own CHECK constraint. This row
+    (and its decision, if any) is deleted, atomically, by whichever of
+    consume_confirmation_and_claim_step()/deny_confirmation()/
+    fail_pending_confirmation() actually consumes it - there is no separate
+    durable "decision history" once that happens; the task_transitions
+    journal remains the sole durable task-state history (a SEPARATE,
+    independent durable record - task_confirmation_ingress_receipts -
+    remembers only which provider message won, specifically so it can
+    outlive this row's own deletion; see that table's own rationale on
+    TaskRepository.record_confirmation_decision()).
+
+    `decision_attempt_count`/`decision_next_attempt_at` (Milestone 47 P2
+    adversarial-review correction): the SAME small, bounded, capped-
+    exponential retry-scheduling shape task_lifecycle_outbox's own
+    attempt_count/next_attempt_at already established for P1, applied here
+    so one durable decision that repeatedly fails to be dispatched (before
+    it is ever consumed) can never permanently starve every later durable
+    decision behind it in find_recoverable_confirmation_decision()'s own
+    due-ordered queue. Both are meaningless (0 / None) until a decision
+    exists; once RECORDED, decision_next_attempt_at starts equal to
+    decided_at (immediately due) and only ever moves forward, exactly like
+    the outbox's own next_attempt_at never moves backward."""
 
     task_id: str
     confirmation_id: str
@@ -451,6 +538,10 @@ class PendingTaskConfirmation:
     resource_key: str | None
     created_at: str
     expires_at: str
+    decision: ConfirmationDecision | None = None
+    decided_at: str | None = None
+    decision_attempt_count: int = 0
+    decision_next_attempt_at: str | None = None
 
 
 class LifecycleEventKind(str, Enum):

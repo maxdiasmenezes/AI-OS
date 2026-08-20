@@ -110,6 +110,8 @@ from kernel.employee_tasks.types import (
     OUTBOX_MAX_DELAY_SECONDS,
     SCHEMA_VERSION,
     TERMINAL_STATES,
+    ConfirmationDecision,
+    ConfirmationDecisionOutcome,
     ConfirmationExpiredError,
     ConfirmationMismatchError,
     ConfirmationRequiredPayload,
@@ -210,4 +212,6 @@ __all__ = [
     "deserialize_confirmation_required_payload",
     "compute_outbox_retry_delay_seconds",
     "format_utc_timestamp",
+    "ConfirmationDecision",
+    "ConfirmationDecisionOutcome",
 ]

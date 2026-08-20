@@ -1,5 +1,5 @@
 """
-Milestone 46 - WhatsApp Task Control glue.
+Milestone 46/47 - WhatsApp Task Control glue.
 
 Thin glue between the WhatsApp transport (interfaces/whatsapp/server.py,
 handler.py) and the existing, durable task engine (kernel/employee_tasks/,
@@ -27,27 +27,48 @@ sensitive step blocks.
 P2B scope: deterministic "CONFIRM <id>"/"REJECT <id>" command recognition
 (classify_confirmation_text()), resolving a confirmation_id back to its
 durably-waiting task (TaskRepository.get_task_by_pending_confirmation_id()),
-WhatsApp-source/current-state authorization, and durable approval/denial
-through the SAME existing approve_task_confirmation()/
-deny_task_confirmation() functions this module previously only referenced
-in comments - see dispatch_confirmation_work()'s own docstring for the
-full authority order, the post-approval continuation (still exclusively
-through run_task_until_blocked(), never a duplicated execution loop), and
-why every kind of invalid/stale/wrong-source confirmation attempt produces
-the identical generic reply. Like dispatch_task_work(), this is reachable
-only from the worker thread - never the webhook HTTP thread - because
-approve_task_confirmation() may execute a sensitive action synchronously.
-No new durable state, no schema change: get_task_by_pending_confirmation_id()
-is a plain read against confirmation_id's existing UNIQUE constraint.
-HTTP 200 for a CONFIRM/REJECT message means the command was accepted onto
-the in-memory worker queue for processing - it is not a durable-decision
-acknowledgement, and does not by itself guarantee the decision survives a
-process crash before the worker consumes it (see
-dispatch_confirmation_work()'s own docstring and docs/architecture.md for
-why this is a deliberately accepted boundary, not an oversight: the
-pending confirmation itself remains fully durable and safely re-sendable
-either way, unlike a brand-new "/task" request P1 durably accepts before
-ever returning success).
+WhatsApp-source/current-state authorization, and approval/denial through
+the SAME existing approve_task_confirmation()/deny_task_confirmation()
+functions this module previously only referenced in comments - see
+dispatch_confirmation_work()'s own docstring for the full authority order,
+the post-approval continuation (still exclusively through
+run_task_until_blocked(), never a duplicated execution loop), and why
+every kind of invalid/stale/wrong-source confirmation attempt produces the
+identical generic reply. Like dispatch_task_work(), approve/deny execution
+is reachable only from the worker thread - never the webhook HTTP thread -
+because approve_task_confirmation() may execute a sensitive action
+synchronously.
+
+P2 scope (Milestone 47, schema version 6) closes the P2B crash window:
+CONFIRM/REJECT reaching the webhook, HTTP 200 returning, and the process
+crashing before the worker ever consumed the decision could lose it. Now,
+record_confirmation_decision_durably() durably records the decision -
+atomically, inside TaskRepository.record_confirmation_decision()'s own
+BEGIN IMMEDIATE transaction, gated on the exact same source/state
+eligibility dispatch_confirmation_work() itself re-verifies - synchronously
+on the webhook HTTP request thread, BEFORE that request may ever return
+HTTP 200 (see interfaces/whatsapp/server.py's own do_POST and module
+docstring for the exact RECORDED/ALREADY_DECIDED/NOT_ELIGIBLE HTTP
+contract). This durable write still never approves, denies, executes, or
+touches task state - only the durable task_pending_confirmation.decision/
+decided_at columns; approve_task_confirmation()/deny_task_confirmation()
+remain reachable only from the worker thread, exactly as P2B established.
+QUEUE ITEM IS NOT AUTHORITY: the worker queue's TaskConfirmationWork now
+carries confirmation_id only (never decision - see that dataclass's own
+docstring) - dispatch_confirmation_work() always reloads the durable
+decision fresh from TaskRepository, whether reached via the normal queue
+or via run_confirmation_decision_recovery_checkpoint() (the periodic
+worker recovery-checkpoint pickup for a decision that was durably
+recorded but never reached the worker before a crash - the P2 analogue of
+run_outbound_lifecycle_recovery_checkpoint() above it in this file).
+Schema version 6 adds exactly two nullable columns
+(task_pending_confirmation.decision/decided_at, closed to
+kernel.employee_tasks.ConfirmationDecision's two values) - no new table,
+no second "decision history": the existing task_pending_confirmation row
+remains the sole durable record of an in-flight decision, consumed
+(deleted) atomically by whichever of consume_confirmation_and_claim_step()/
+deny_confirmation()/fail_pending_confirmation() actually resolves it,
+exactly as before.
 
 TRANSITION-TRIGGERED DELIVERY (load-bearing - see dispatch_task_work()'s and
 _deliver_execution_result()'s own docstrings for the exact mechanics): a
@@ -74,12 +95,13 @@ simultaneously - "sqlite3 does not serialize concurrent calls on the same
 connection object for you." Two different calling contexts need two
 different connection lifecycles:
 
-  - accept_task_message() is called from a ThreadingHTTPServer request
-    thread - a fresh thread per inbound HTTP request, never reused. It
-    opens its own connection, does its bounded work, and closes it before
-    returning - there is no reuse benefit to holding it open longer, and
-    doing so would risk exactly the sharing hazard above if two concurrent
-    requests ever touched the same instance.
+  - accept_task_message() and (Milestone 47 P2) record_confirmation_decision_durably()
+    are both called from a ThreadingHTTPServer request thread - a fresh
+    thread per inbound HTTP request, never reused. Each opens its own
+    connection, does its bounded work, and closes it before returning -
+    there is no reuse benefit to holding it open longer, and doing so
+    would risk exactly the sharing hazard above if two concurrent requests
+    ever touched the same instance.
   - dispatch_task_work() is called from the single, long-lived WhatsApp
     worker thread (interfaces/whatsapp/handler.py). It takes an
     already-open, caller-owned TaskRepository - the worker constructs one
@@ -112,11 +134,12 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass
-from enum import Enum
 
 from datetime import datetime, timedelta, timezone
 
 from kernel.employee_tasks import (
+    ConfirmationDecision,
+    ConfirmationDecisionOutcome,
     ConfirmationMismatchError,
     DuplicateTaskError,
     InvalidTransitionError,
@@ -231,8 +254,13 @@ _CONFIRMATION_PREFIX_PATTERN = re.compile(r"^(CONFIRM|REJECT)(?=\s|$)", re.IGNOR
 # consumed/rejected token, a wrong-source token, or a wrong-state token.
 # Deliberately identical text for every one of these - see
 # dispatch_confirmation_work()'s own docstring for why disclosing which
-# case actually happened would be an oracle leak.
-_GENERIC_INVALID_CONFIRMATION_TEXT = "That confirmation is no longer valid."
+# case actually happened would be an oracle leak. Public (Milestone 47
+# P2, not merely module-private) since server.py's do_POST now also uses
+# it directly for the NOT_ELIGIBLE durable-decision outcome - the exact
+# same fixed text, whether the failure is detected on the webhook HTTP
+# thread (before a decision could even be durably recorded) or later, on
+# the worker (a race-lost or otherwise-invalid confirmation_id).
+GENERIC_INVALID_CONFIRMATION_TEXT = "That confirmation is no longer valid."
 
 TASK_SOURCE = "whatsapp"
 
@@ -317,31 +345,49 @@ def classify_task_text(text: str) -> TaskFixedReply | TaskRequestText | None:
     return TaskRequestText(remainder)
 
 
-class ConfirmationDecision(Enum):
-    """What a well-formed CONFIRM/REJECT command asked for - never
-    anything else; there is no third decision, and no interactive
-    clarification of an ambiguous one (see classify_confirmation_text()'s
-    own docstring for the exact grammar that produces this)."""
+@dataclass(frozen=True)
+class ConfirmationCommandText:
+    """Milestone 47 P2: the pure parse result of a well-formed "CONFIRM
+    <id>"/"REJECT <id>" command - confirmation_id and the requested
+    ConfirmationDecision only, produced by classify_confirmation_text()
+    with no I/O, no repository access, and no eligibility check of any
+    kind (exactly like TaskRequestText is the pure parse result of a
+    well-formed "/task ..." message - see that dataclass's own
+    docstring). NOT a worker queue item: server.py's do_POST special-cases
+    this type exactly like it special-cases TaskRequestText, calling
+    TaskRepository.record_confirmation_decision() durably BEFORE this
+    request can ever return HTTP 200 - see this module's own module
+    docstring for why. Once that durable write succeeds, do_POST hands
+    the worker only a decision-free TaskConfirmationWork(confirmation_id)
+    - `decision` here is transient parse output, consumed exactly once by
+    the durable-recording call, never itself treated as execution
+    authority and never itself queued."""
 
-    CONFIRM = "confirm"
-    REJECT = "reject"
+    confirmation_id: str
+    decision: ConfirmationDecision
 
 
 @dataclass(frozen=True)
 class TaskConfirmationWork:
     """Minimal, trusted correlation handed to the WhatsApp worker queue for
-    a CONFIRM/REJECT command - confirmation_id and decision only, exactly
-    like TaskExecutionWork carries only a bare task_id (see that
-    dataclass's own docstring for why). Deliberately carries no task_id,
-    sender, provider message ID, raw message text, action_name,
-    resource_key, or anything else: the worker derives every authorization
-    decision from durable state, reached by resolving confirmation_id
-    itself via TaskRepository.get_task_by_pending_confirmation_id() (see
-    dispatch_confirmation_work()) - never by trusting anything this queue
-    item happens to carry."""
+    a CONFIRM/REJECT command - confirmation_id ONLY (Milestone 47 P2;
+    previously also carried `decision` - see this module's own module
+    docstring for why that was removed), exactly like TaskExecutionWork
+    carries only a bare task_id (see that dataclass's own docstring).
+    Deliberately carries no task_id, sender, provider message ID, raw
+    message text, action_name, resource_key, or decision: QUEUE ITEM IS
+    NOT AUTHORITY. The worker (dispatch_confirmation_work()) always
+    reloads BOTH the owning task AND the durably-recorded decision fresh
+    from TaskRepository by confirmation_id alone - never by trusting
+    anything this queue item happens to carry, and never by trusting a
+    decision value that arrived with this item at construction time,
+    since by the time the worker actually processes it, a durable
+    decision is the only value that could possibly still be correct (the
+    queue item may have been sitting unprocessed for an arbitrary amount
+    of time, or reconstructed fresh by a recovery checkpoint after a
+    crash - see run_confirmation_decision_recovery_checkpoint())."""
 
     confirmation_id: str
-    decision: ConfirmationDecision
 
 
 @dataclass(frozen=True)
@@ -349,7 +395,7 @@ class ConfirmationFixedReply:
     """A pre-decided fixed reply for a recognized-but-malformed CONFIRM/
     REJECT command that never touches TaskRepository - the command-shape
     equivalent of TaskFixedReply for bare/malformed "/task ...". Always
-    carries _GENERIC_INVALID_CONFIRMATION_TEXT today; a distinct dataclass
+    carries GENERIC_INVALID_CONFIRMATION_TEXT today; a distinct dataclass
     from TaskFixedReply purely so a caller can route it through the exact
     same authorized-sender-derived FixedReplyTask delivery path without
     conflating the two command families' own docstrings."""
@@ -357,7 +403,7 @@ class ConfirmationFixedReply:
     reply_text: str
 
 
-def classify_confirmation_text(text: str) -> ConfirmationFixedReply | TaskConfirmationWork | None:
+def classify_confirmation_text(text: str) -> ConfirmationFixedReply | ConfirmationCommandText | None:
     """Pure - no I/O, no database access, no repository-bound validation
     of confirmation_id itself (that remains
     TaskRepository.get_task_by_pending_confirmation_id()'s job - see this
@@ -417,9 +463,9 @@ def classify_confirmation_text(text: str) -> ConfirmationFixedReply | TaskConfir
     remainder = text[match.end():].strip()
     parts = remainder.split()
     if len(parts) != 1:
-        return ConfirmationFixedReply(_GENERIC_INVALID_CONFIRMATION_TEXT)
+        return ConfirmationFixedReply(GENERIC_INVALID_CONFIRMATION_TEXT)
 
-    return TaskConfirmationWork(confirmation_id=parts[0], decision=decision)
+    return ConfirmationCommandText(confirmation_id=parts[0], decision=decision)
 
 
 class DurableAcceptanceFailed(Exception):
@@ -478,6 +524,44 @@ def compute_dedup_key(provider_message_id: str) -> str:
 
     digest = hashlib.sha256(provider_message_id.encode("utf-8")).hexdigest()
     return f"{_DEDUP_NAMESPACE}{digest}"
+
+
+# Milestone 47 P2 adversarial-review correction: a distinct namespace from
+# _DEDUP_NAMESPACE above - this key identifies a WINNING CONFIRM/REJECT
+# provider message in task_confirmation_ingress_receipts, a completely
+# separate durable concept from tasks.dedup_key's own /task-ingress
+# idempotency boundary. Never reused across the two tables/purposes, even
+# though both are SHA-256 digests of a provider message ID, so the two
+# spaces can never collide or be confused for one another.
+_CONFIRMATION_INGRESS_DEDUP_NAMESPACE = "whatsapp-confirmation:"
+
+
+def compute_confirmation_ingress_dedup_key(provider_message_id: str) -> str:
+    """Deterministic, namespaced SHA-256 digest of the provider message ID
+    for a CONFIRM/REJECT command - never the raw ID itself, exactly like
+    compute_dedup_key() above, but under a distinct namespace
+    (_CONFIRMATION_INGRESS_DEDUP_NAMESPACE) so the two never collide.
+    Fixed-length output regardless of input length, comfortably within
+    kernel.employee_tasks.MAX_DEDUP_KEY_CHARS (128) - see
+    compute_dedup_key()'s own docstring for why no separate provider-
+    specific length bound is needed beyond the existing upstream webhook-
+    body size limit.
+
+    This is the value TaskRepository.record_confirmation_decision()'s own
+    `provider_dedup_key` parameter expects - see that method's own
+    docstring for the durable receipt this key identifies, and why it
+    survives task_pending_confirmation's own row being consumed/deleted.
+
+    Only a structural precondition remains: the ID must actually exist -
+    unreachable in production today (interfaces/whatsapp/payload.py
+    already filters out any message missing an "id" field before it ever
+    reaches this module), kept as a defense-in-depth guard only."""
+
+    if not isinstance(provider_message_id, str) or not provider_message_id:
+        raise ConfirmationDecisionRecordingFailed("missing provider message id")
+
+    digest = hashlib.sha256(provider_message_id.encode("utf-8")).hexdigest()
+    return f"{_CONFIRMATION_INGRESS_DEDUP_NAMESPACE}{digest}"
 
 
 def accept_task_message(
@@ -540,6 +624,107 @@ def accept_task_message(
         # safety net, never relied on as the primary mitigation.
         logger.warning("task_ingress_storage_error")
         raise DurableAcceptanceFailed("task storage unavailable") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+class ConfirmationDecisionRecordingFailed(Exception):
+    """Milestone 47 P2: raised when a CONFIRM/REJECT command's decision
+    could not be durably recorded at all - a genuine TaskStorageError or a
+    raw sqlite3.Error escaping connection open/use (the same defense-in-
+    depth concurrent-first-open caveat accept_task_message() already
+    guards against - see this module's own module docstring). Never
+    carries the underlying exception's own message or any SQL/database/
+    path detail - callers must treat this as a fixed, generic signal only
+    (log a bounded category), never surface str(exc) anywhere. The caller
+    must treat this as "no durable decision exists" and respond with a
+    retryable webhook status (503), exactly like DurableAcceptanceFailed -
+    never HTTP success, and never a fallback to queueing the command
+    without a durable decision (that would silently resurrect the exact
+    M46 crash window this milestone closes)."""
+
+
+def record_confirmation_decision_durably(
+    open_writer_connection,
+    db_path,
+    confirmation_id: str,
+    decision: ConfirmationDecision,
+    *,
+    required_source: str,
+    provider_dedup_key: str,
+) -> ConfirmationDecisionOutcome:
+    """Durably record a CONFIRM/REJECT command's decision, from the
+    webhook HTTP request thread, BEFORE this request may ever return
+    HTTP 200 - closing the Milestone 46 crash window where a decision
+    existed only in the volatile worker queue between HTTP 200 and
+    worker consumption (see this module's own module docstring).
+
+    Opens and closes its OWN sqlite3 connection/TaskRepository instance
+    for this one call, exactly like accept_task_message() - see that
+    function's own docstring and this module's own module docstring for
+    why this is the correct connection lifecycle for a ThreadingHTTPServer
+    request-thread caller. `open_writer_connection` is passed in (rather
+    than imported and called directly) for the same test-injection reason
+    accept_task_message() takes it as a parameter.
+
+    `provider_dedup_key` (Milestone 47 P2 adversarial-review correction)
+    must already be compute_confirmation_ingress_dedup_key(message_id)'s
+    own output - never a raw provider message ID. Threaded straight
+    through to TaskRepository.record_confirmation_decision(), which
+    atomically checks it against task_confirmation_ingress_receipts
+    BEFORE any other eligibility check, so an exact redelivery of a
+    provider message that already durably won returns
+    ConfirmationDecisionOutcome.DUPLICATE_INGRESS - crash-safe and
+    restart-surviving, unlike SeenMessageCache, and correct even after
+    task_pending_confirmation's own row has long since been consumed.
+
+    Delegates the entire eligibility check and atomic write to
+    TaskRepository.record_confirmation_decision() - this function performs
+    no authorization or eligibility logic of its own, only connection
+    lifecycle and exception translation. Returns the SAME
+    ConfirmationDecisionOutcome that method returns (RECORDED/
+    ALREADY_DECIDED/DUPLICATE_INGRESS/NOT_ELIGIBLE) for these four
+    ordinary outcomes; raises ConfirmationDecisionRecordingFailed - never
+    a raw TaskStorageError or sqlite3.Error - only for a genuine storage
+    failure, mirroring accept_task_message()'s own exception-translation
+    contract exactly.
+
+    A malformed confirmation_id (oversized, wrong type, NUL-containing -
+    TaskInputTooLargeError from record_confirmation_decision()'s own
+    input validation) is deliberately NOT treated as a storage failure:
+    it is a deterministic, never-retryable validation rejection, exactly
+    like dispatch_confirmation_work()'s own reverse lookup already treats
+    an oversized token as an ordinary NOT_ELIGIBLE case (generic-invalid
+    reply, HTTP 200) rather than a worker/storage error - retrying the
+    identical malformed value would never succeed, so this must never
+    surface as ConfirmationDecisionRecordingFailed (which callers treat as
+    retryable, HTTP 503)."""
+
+    conn = None
+    try:
+        conn = open_writer_connection(db_path)
+        repository = TaskRepository(conn)
+        try:
+            return repository.record_confirmation_decision(
+                confirmation_id,
+                decision,
+                required_source=required_source,
+                provider_dedup_key=provider_dedup_key,
+            )
+        except TaskInputTooLargeError:
+            return ConfirmationDecisionOutcome.NOT_ELIGIBLE
+    except TaskStorageError as exc:
+        logger.warning("confirmation_decision_storage_error")
+        raise ConfirmationDecisionRecordingFailed("task storage unavailable") from exc
+    except sqlite3.Error as exc:
+        # Defense in depth against kernel/employee_tasks/db.py's documented
+        # concurrent-first-open race - see accept_task_message()'s own
+        # comment on the identical branch for why this is a safety net,
+        # never the primary mitigation (build_server() pre-initializes the
+        # schema once at startup).
+        logger.warning("confirmation_decision_storage_error")
+        raise ConfirmationDecisionRecordingFailed("task storage unavailable") from exc
     finally:
         if conn is not None:
             conn.close()
@@ -867,6 +1052,108 @@ def run_outbound_lifecycle_recovery_checkpoint(
     _deliver_outbox_event(due_events[0], repository, client, authorized_sender)
 
 
+def run_confirmation_decision_recovery_checkpoint(
+    repository: TaskRepository,
+    registry,
+    tools_config_loader,
+    respond_provider,
+    client,
+    authorized_sender: str,
+) -> None:
+    """Milestone 47 P2: attempt AT MOST ONE durable confirmation-decision
+    pickup per call - the recovery-checkpoint counterpart of
+    run_outbound_lifecycle_recovery_checkpoint() above, closing the same
+    kind of crash gap for a decision that was durably recorded
+    (TaskRepository.record_confirmation_decision() returned RECORDED) but
+    never reached dispatch_confirmation_work() - e.g. the worker queue was
+    full at recording time, or the process crashed between the durable
+    write and worker consumption. Deliberately bounded to exactly one
+    pickup per checkpoint, for the same reason the lifecycle-outbox
+    checkpoint is bounded to one send: a burst of recovered decisions (or
+    one that keeps failing) must never block the worker's own normal
+    queue responsiveness for longer than one confirmation dispatch (see
+    interfaces/whatsapp/server.py's own monotonic-deadline
+    recovery-checkpoint scheduling, which calls this function at most once
+    per checkpoint, interleaved with the lifecycle-outbox checkpoint
+    above - see WhatsAppServer._run_worker()'s own docstring for the exact
+    ordering).
+
+    Filters strictly on source=TASK_SOURCE ("whatsapp") via
+    TaskRepository.find_recoverable_confirmation_decision() - this is what
+    makes it structurally impossible for this function to ever act on a
+    different source's confirmation decision. That same lookup is also
+    now DUE-filtered (Milestone 47 P2 adversarial-review correction,
+    MEDIUM-2 - see find_recoverable_confirmation_decision()'s own
+    docstring): it only ever returns a decision whose
+    decision_next_attempt_at has already arrived, so a decision durably
+    deferred below (see FAILURE HANDLING) cannot be picked again before
+    its own backoff elapses. Dispatches DIRECTLY through the existing
+    dispatch_confirmation_work() - never re-queued back onto the worker's
+    own queue - since this call already runs on the single worker thread,
+    which already owns all serialization; queueing back to itself would
+    add nothing but an unnecessary extra hop. A complete no-op, cheaply,
+    if nothing is currently due.
+
+    FAILURE HANDLING (Milestone 47 P2 adversarial-review correction,
+    MEDIUM-2): if dispatch_confirmation_work() raises BEFORE it could
+    consume the pending confirmation (an execution-engine defect, or any
+    exception outside its own narrow race-lost set - see that function's
+    own EXCEPTION SCOPE docstring), this durably DEFERS the SAME decision
+    (TaskRepository.defer_confirmation_decision_retry(), a small, capped-
+    exponential backoff reusing compute_outbox_retry_delay_seconds() -
+    the identical bounded policy P1's own lifecycle-outbox retry already
+    uses, with no confirmation-specific semantics of its own to justify a
+    separate copy) so this one failing decision can never permanently
+    starve every later durable decision behind it in the due-ordered
+    queue above. The deferral is itself conditional on the pending row
+    (and its decision) still existing - see
+    defer_confirmation_decision_retry()'s own docstring for why a
+    dispatch failure AFTER consumption must never fabricate a retry for
+    state that is already gone. The original exception is always
+    re-raised afterward - this function never silently reports success
+    for a genuine defect; the worker's own existing generic recovery-
+    error boundary (WhatsAppServer._run_worker()'s
+    `except Exception: logger.warning("worker_recovery_error")`) still
+    catches it and keeps the worker alive, exactly as it already does for
+    every other recovery-checkpoint failure mode."""
+
+    confirmation_id = repository.find_recoverable_confirmation_decision(TASK_SOURCE)
+    if confirmation_id is None:
+        return
+    try:
+        dispatch_confirmation_work(
+            repository,
+            TaskConfirmationWork(confirmation_id),
+            registry,
+            tools_config_loader,
+            respond_provider,
+            client,
+            authorized_sender,
+        )
+    except Exception:
+        # Re-resolve fresh, by confirmation_id alone - never trust
+        # anything already in hand from before the failed dispatch
+        # attempt. None here means the pending confirmation (and its
+        # decision) is already gone - see
+        # defer_confirmation_decision_retry()'s own docstring for why
+        # that case is deliberately left alone, never fabricated.
+        still_pending_task = repository.get_task_by_pending_confirmation_id(confirmation_id)
+        if still_pending_task is not None:
+            pending = repository.get_pending_confirmation(still_pending_task.task_id)
+            if (
+                pending is not None
+                and pending.confirmation_id == confirmation_id
+                and pending.decision is not None
+            ):
+                new_attempt_count = pending.decision_attempt_count + 1
+                delay_seconds = compute_outbox_retry_delay_seconds(new_attempt_count)
+                next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+                repository.defer_confirmation_decision_retry(
+                    confirmation_id, new_attempt_count, next_attempt_at
+                )
+        raise
+
+
 def dispatch_task_work(
     repository: TaskRepository,
     task_id: str,
@@ -972,6 +1259,29 @@ _CONFIRMATION_RACE_LOST_EXCEPTIONS = (
 )
 
 
+def _stale_confirmation_work(category: str) -> None:
+    """Milestone 47 P2 adversarial-review correction (MEDIUM-1): the
+    silent, no-op fail-safe path for dispatch_confirmation_work() below -
+    a bounded, code-owned log category ONLY, never a user-facing reply.
+    See that function's own module-level framing for why: a
+    TaskConfirmationWork can only ever legitimately exist because
+    TaskRepository.record_confirmation_decision() already returned
+    RECORDED for it - so if dispatch_confirmation_work() ever reaches here
+    anyway, it is because something else (the worker's own immediate
+    dispatch, or a later recovery-checkpoint pickup) already resolved this
+    exact confirmation_id first. That is internal, redundant work this
+    architecture itself creates by design (an intentionally best-effort
+    queue handoff racing an independent recovery checkpoint) - never a
+    NEW user-entered command, which is handled entirely at HTTP ingress
+    (record_confirmation_decision_durably()'s own NOT_ELIGIBLE outcome,
+    see server.py's own do_POST). Sending
+    "That confirmation is no longer valid." here would be actively
+    misleading whenever the real result was already delivered by whichever
+    dispatch attempt won this race."""
+
+    logger.warning(category)
+
+
 def dispatch_confirmation_work(
     repository: TaskRepository,
     work: TaskConfirmationWork,
@@ -981,14 +1291,40 @@ def dispatch_confirmation_work(
     client,
     authorized_sender: str,
 ) -> None:
-    """Worker-side: the full Milestone 46 P2B reverse-lookup -> source/
-    state authorization -> approve-or-deny -> (for CONFIRM only) post-
-    approval continuation -> delivery flow for one CONFIRM/REJECT command.
-    This is P2B's ONLY confirmation-decision boundary - never called from
-    the webhook HTTP thread (see this module's own module docstring on the
-    connection-lifecycle split, and interfaces/whatsapp/server.py's do_POST,
-    which only ever parses/queues a TaskConfirmationWork, never resolves,
-    authorizes, or executes one).
+    """Worker-side: the full Milestone 47 P2 reverse-lookup -> source/
+    state authorization -> durable-decision reload -> approve-or-deny ->
+    (for CONFIRM only) post-approval continuation -> delivery flow for one
+    CONFIRM/REJECT command. This is the ONLY confirmation-decision
+    execution boundary - never called from the webhook HTTP thread (see
+    this module's own module docstring on the connection-lifecycle split).
+    interfaces/whatsapp/server.py's do_POST durably records the decision
+    itself (TaskRepository.record_confirmation_decision()) BEFORE this
+    function is ever reached - by the time `work` arrives here, it carries
+    only confirmation_id (Milestone 47 P2 - see TaskConfirmationWork's own
+    docstring for why: QUEUE ITEM IS NOT AUTHORITY). This function always
+    reloads the durable decision itself, fresh, from TaskRepository -
+    never from `work`, which no longer even has a decision field to trust.
+
+    QUEUE ITEM IS INTERNAL, NOT A USER COMMAND (Milestone 47 P2
+    adversarial-review correction MEDIUM-1 - load-bearing): a
+    TaskConfirmationWork reaching this function is ALWAYS internal work
+    created only after record_confirmation_decision() already returned
+    RECORDED - never a direct translation of raw, still-unauthorized user
+    input (that boundary is entirely at HTTP ingress - see server.py's own
+    do_POST NOT_ELIGIBLE handling, which is the ONLY place a genuinely new
+    or invalid user command produces GENERIC_INVALID_CONFIRMATION_TEXT).
+    Because this function may be reached TWICE for the exact same durable
+    decision - once via the worker's own best-effort immediate enqueue,
+    once via a LATER recovery-checkpoint pickup, in either order, racing
+    each other by design (see run_confirmation_decision_recovery_checkpoint()'s
+    own docstring) - every fail-safe branch below is now SILENT
+    (_stale_confirmation_work(): a bounded, code-owned log category only,
+    no user reply, no mutation, no execution) rather than a user-facing
+    "no longer valid" reply: by the time a SECOND dispatch attempt for the
+    same confirmation_id reaches any of these checks, the FIRST attempt
+    has almost always already delivered the real result, and repeating
+    that as an alarming "invalid" message would be actively misleading,
+    not merely redundant.
 
     AUTHORITY ORDER (security-critical - every check below MUST precede
     any mutating call): (1) resolve confirmation_id via
@@ -997,19 +1333,35 @@ def dispatch_confirmation_work(
     must be TASK_SOURCE ("whatsapp") - a valid confirmation_id belonging to
     some OTHER source's task must never be actionable from this channel,
     even though today's deployment has exactly one authorized WhatsApp
-    sender; (4) its state must still be WAITING_FOR_CONFIRMATION. Only once
-    all four hold does this function ever call
-    approve_task_confirmation()/deny_task_confirmation() - see
-    _GENERIC_INVALID_CONFIRMATION_TEXT's own docstring for why every
-    failure of any of these four checks, plus a malformed/oversized token
+    sender; (4) its state must still be WAITING_FOR_CONFIRMATION; (5) the
+    pending confirmation row's own confirmation_id must still match
+    `work.confirmation_id` exactly (defense in depth against an
+    exceedingly narrow race: the row was consumed and a brand-new one
+    proposed for the same task between get_task_by_pending_confirmation_id()
+    and this re-read); (6) its durably-recorded `decision` must be non-NULL
+    - see FAIL-SAFE ON MISSING DECISION below for why (6) exists at all.
+    Only once all six hold does this function ever call
+    approve_task_confirmation()/deny_task_confirmation() - every failure of
+    any of these six checks, plus a malformed/oversized token
     (TaskInputTooLargeError from the reverse lookup itself) and the narrow
-    race-lost exception set below, all produce the exact same reply: never
-    disclosing whether a token ever existed, which source it belonged to,
-    or its current/former state.
+    race-lost exception set below, are all now silent stale-internal-work
+    no-ops (see above), never disclosing anything to the user, exactly as
+    a purely-internal correlation failure should.
+
+    FAIL-SAFE ON MISSING DECISION: reaching this function at all (via the
+    queue, or via run_confirmation_decision_recovery_checkpoint()) should
+    only ever happen once record_confirmation_decision() has already
+    returned RECORDED for this exact confirmation_id - so pending.decision
+    should always be non-NULL here. Never assumed: if it is unexpectedly
+    NULL anyway (a defensive-in-depth guard against a future caller of
+    this function that skips the durable-recording step), this function
+    fails safe silently - never guesses a decision, never fabricates one,
+    never falls back to any other authority.
 
     EXCEPTION SCOPE (Milestone 46 adversarial review, H1 correction -
-    load-bearing): _CONFIRMATION_RACE_LOST_EXCEPTIONS is caught ONLY around
-    the approve_task_confirmation()/deny_task_confirmation() call itself -
+    load-bearing, unchanged by the MEDIUM-1 correction above):
+    _CONFIRMATION_RACE_LOST_EXCEPTIONS is caught ONLY around the
+    approve_task_confirmation()/deny_task_confirmation() call itself -
     never around the post-approval run_task_until_blocked() continuation
     below. Once approve_task_confirmation() has returned successfully, the
     confirmation was genuinely valid, has already been durably consumed,
@@ -1021,11 +1373,13 @@ def dispatch_confirmation_work(
     likewise never wrapped in any confirmation-specific exception
     handling. An exception escaping the continuation therefore propagates
     UNCAUGHT to the caller's own generic worker-error boundary, exactly
-    like dispatch_task_work()'s does - it must never be mapped to
-    "That confirmation is no longer valid.", which would both lie to the
-    user (their confirmation WAS valid and DID execute) and silently hide
-    a genuine execution-engine defect from every log/monitor that would
-    otherwise see it as worker_error.
+    like dispatch_task_work()'s does - it must never be silently treated
+    as stale internal work either, which would both lie about the
+    confirmation's own validity (it WAS valid and DID execute) and hide a
+    genuine execution-engine defect from every log/monitor that would
+    otherwise see it as worker_error (or, via
+    run_confirmation_decision_recovery_checkpoint(), a durably-deferred
+    retry).
 
     CONFIRM: reloads ToolsConfig fresh (see this module's own module
     docstring on why - never a snapshot from whenever the confirmation was
@@ -1082,18 +1436,33 @@ def dispatch_confirmation_work(
     try:
         task = repository.get_task_by_pending_confirmation_id(work.confirmation_id)
     except TaskInputTooLargeError:
-        _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+        _stale_confirmation_work("confirmation_work_malformed_token")
         return
 
     if task is None or task.source != TASK_SOURCE or task.state is not TaskState.WAITING_FOR_CONFIRMATION:
-        _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+        _stale_confirmation_work("confirmation_work_stale")
         return
 
-    if work.decision is ConfirmationDecision.REJECT:
+    # Milestone 47 P2: QUEUE ITEM IS NOT AUTHORITY - `work` carries only
+    # confirmation_id; the durable decision is always reloaded fresh here,
+    # never trusted from any value the caller might otherwise have handed
+    # in. get_pending_confirmation() is a plain read, never a mutation.
+    pending = repository.get_pending_confirmation(task.task_id)
+    if pending is None or pending.confirmation_id != work.confirmation_id:
+        _stale_confirmation_work("confirmation_work_stale")
+        return
+    if pending.decision is None:
+        # Structurally shouldn't happen - see this function's own FAIL-SAFE
+        # ON MISSING DECISION docstring section above - but never assumed
+        # away. No durable mutation, no fabricated decision.
+        _stale_confirmation_work("confirmation_decision_missing")
+        return
+
+    if pending.decision is ConfirmationDecision.REJECT:
         try:
             result = deny_task_confirmation(task, repository, work.confirmation_id)
         except _CONFIRMATION_RACE_LOST_EXCEPTIONS:
-            _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+            _stale_confirmation_work("confirmation_work_race_lost")
             return
     else:
         tools_config = tools_config_loader()
@@ -1103,7 +1472,7 @@ def dispatch_confirmation_work(
                 task, repository, registry, tools_config, executor, work.confirmation_id
             )
         except _CONFIRMATION_RACE_LOST_EXCEPTIONS:
-            _send_lifecycle_message(client, authorized_sender, _GENERIC_INVALID_CONFIRMATION_TEXT)
+            _stale_confirmation_work("confirmation_work_race_lost")
             return
 
         # Outside the race-lost try/except, deliberately: the confirmation

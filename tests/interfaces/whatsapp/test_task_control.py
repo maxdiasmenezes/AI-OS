@@ -15,7 +15,9 @@ sensitive action never executes until a genuine approve_task_confirmation()
 call, proven the same way P2A's own confirmation-gate tests already do.
 """
 
+import itertools
 import json
+import logging
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -47,14 +49,18 @@ from interfaces.whatsapp.task_control import (
     TASK_COMPLETED_FALLBACK_TEXT,
     TASK_FAILED_FALLBACK_TEXT,
     TASK_HELP_TEXT,
+    TASK_SOURCE,
+    ConfirmationCommandText,
     ConfirmationDecision,
+    ConfirmationDecisionOutcome,
+    ConfirmationDecisionRecordingFailed,
     ConfirmationFixedReply,
     DurableAcceptanceFailed,
     TaskConfirmationWork,
     TaskExecutionWork,
     TaskFixedReply,
     TaskRequestText,
-    _GENERIC_INVALID_CONFIRMATION_TEXT,
+    GENERIC_INVALID_CONFIRMATION_TEXT,
     _MALFORMED_OUTBOX_PAYLOAD_TEXT,
     accept_task_message,
     classify_confirmation_text,
@@ -63,6 +69,8 @@ from interfaces.whatsapp.task_control import (
     dispatch_confirmation_work,
     dispatch_task_work,
     needs_dispatch,
+    record_confirmation_decision_durably,
+    run_confirmation_decision_recovery_checkpoint,
     run_outbound_lifecycle_recovery_checkpoint,
     select_terminal_result_text,
 )
@@ -1326,11 +1334,21 @@ def test_task_execution_work_carries_only_task_id():
 # =============================================================================
 
 
-def test_task_confirmation_work_carries_only_confirmation_id_and_decision():
-    work = TaskConfirmationWork(confirmation_id="abc-123", decision=ConfirmationDecision.CONFIRM)
+def test_task_confirmation_work_carries_only_confirmation_id():
+    # Milestone 47 P2: QUEUE ITEM IS NOT AUTHORITY - decision was removed
+    # from this dataclass entirely (see its own docstring for why).
+    work = TaskConfirmationWork(confirmation_id="abc-123")
     assert work.confirmation_id == "abc-123"
-    assert work.decision is ConfirmationDecision.CONFIRM
-    assert work.__dataclass_fields__.keys() == {"confirmation_id", "decision"}
+    assert work.__dataclass_fields__.keys() == {"confirmation_id"}
+
+
+def test_confirmation_command_text_carries_confirmation_id_and_decision():
+    # The pure parse-result type (Milestone 47 P2) - distinct from the
+    # queue item above.
+    parsed = ConfirmationCommandText(confirmation_id="abc-123", decision=ConfirmationDecision.CONFIRM)
+    assert parsed.confirmation_id == "abc-123"
+    assert parsed.decision is ConfirmationDecision.CONFIRM
+    assert parsed.__dataclass_fields__.keys() == {"confirmation_id", "decision"}
 
 
 # --- classify_confirmation_text(): pure, no I/O -----------------------------
@@ -1371,7 +1389,7 @@ def test_prose_starting_with_verb_word_never_intercepted(text):
 )
 def test_valid_command_shapes_parse_correctly(text, expected_decision):
     result = classify_confirmation_text(text)
-    assert isinstance(result, TaskConfirmationWork)
+    assert isinstance(result, ConfirmationCommandText)
     assert result.confirmation_id == "abc"
     assert result.decision is expected_decision
 
@@ -1394,7 +1412,7 @@ def test_confirmation_id_token_case_is_preserved_exactly_not_folded():
 def test_malformed_command_shapes_return_fixed_reply(text):
     result = classify_confirmation_text(text)
     assert isinstance(result, ConfirmationFixedReply)
-    assert result.reply_text == _GENERIC_INVALID_CONFIRMATION_TEXT
+    assert result.reply_text == GENERIC_INVALID_CONFIRMATION_TEXT
 
 
 # --- dispatch_confirmation_work(): test helpers -----------------------------
@@ -1427,6 +1445,34 @@ def _waiting_task(
     return reloaded, pending
 
 
+_dedup_key_counter = itertools.count()
+
+
+def _dk() -> str:
+    """A fresh, unique provider_dedup_key for each call - see
+    tests/kernel/employee_tasks/test_pending_confirmation.py's own
+    identical helper for why a fresh key per call is the correct default."""
+
+    return f"test-provider-dedup-{next(_dedup_key_counter)}"
+
+
+def _confirmation_work(repo, confirmation_id, decision, *, required_source=TASK_SOURCE):
+    """Milestone 47 P2 test helper: durably records `decision` for
+    `confirmation_id` exactly like record_confirmation_decision_durably()
+    does on the real webhook HTTP thread, then returns the decision-free
+    TaskConfirmationWork the worker actually receives - mirroring
+    production's own record-then-dispatch split. A no-op, harmlessly
+    returning NOT_ELIGIBLE, if confirmation_id does not currently resolve
+    to an eligible pending confirmation (e.g. the "unknown token" tests
+    below) - dispatch_confirmation_work() itself is still the one that
+    must fail safe for that case, this helper does not special-case it."""
+
+    repo.record_confirmation_decision(
+        confirmation_id, decision, required_source=required_source, provider_dedup_key=_dk()
+    )
+    return TaskConfirmationWork(confirmation_id)
+
+
 def _dispatch_confirmation(
     repo,
     work,
@@ -1451,20 +1497,32 @@ def _dispatch_confirmation(
 # --- dispatch_confirmation_work(): invalid/stale token handling ------------
 
 
-def test_unknown_token_gets_generic_invalid_reply_no_mutation(repo):
+def test_unknown_token_is_silent_stale_internal_work_no_mutation(repo, caplog):
+    # Milestone 47 P2 adversarial-review correction (MEDIUM-1):
+    # dispatch_confirmation_work() only ever receives internal,
+    # already-RECORDED work - an unknown token here is stale internal
+    # work (e.g. a queue item that lost a race to a recovery-checkpoint
+    # pickup, or vice versa), never a genuinely new user command. It must
+    # be a silent no-op, bounded-logged only - never a user-facing reply.
+    # A genuinely new user command with an unknown token is handled
+    # entirely at HTTP ingress (NOT_ELIGIBLE -> generic-invalid reply -
+    # see server.py's own do_POST), never here.
     task, pending = _waiting_task(repo)
     client = RecordingClient()
 
-    _dispatch_confirmation(
-        repo, TaskConfirmationWork("does-not-exist", ConfirmationDecision.CONFIRM), client=client
-    )
+    with caplog.at_level(logging.WARNING):
+        _dispatch_confirmation(
+            repo, _confirmation_work(repo, "does-not-exist", ConfirmationDecision.CONFIRM), client=client
+        )
 
-    assert client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client.sent == []
     assert repo.get_task(task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
     assert repo.get_pending_confirmation(task.task_id) is not None
+    messages = [record.getMessage() for record in caplog.records]
+    assert "confirmation_work_stale" in messages
 
 
-def test_repository_invalid_oversized_token_gets_generic_invalid_reply_not_worker_error(repo):
+def test_repository_invalid_oversized_token_is_silent_not_worker_error(repo, caplog):
     from kernel.employee_tasks import MAX_CONFIRMATION_ID_CHARS
 
     client = RecordingClient()
@@ -1472,12 +1530,24 @@ def test_repository_invalid_oversized_token_gets_generic_invalid_reply_not_worke
 
     # Must not raise - the narrow TaskInputTooLargeError from the reverse
     # lookup's own validation must be caught inside dispatch_confirmation_work(),
-    # never escape to the caller's worker_error boundary.
-    _dispatch_confirmation(
-        repo, TaskConfirmationWork(oversized, ConfirmationDecision.CONFIRM), client=client
-    )
+    # never escape to the caller's worker_error boundary, and (Milestone
+    # 47 P2 adversarial-review correction) never produce a user-facing
+    # reply either - this is stale/malformed internal work, not a new
+    # user command. Deliberately NOT routed through _confirmation_work()'s
+    # own durable-recording step - record_confirmation_decision() would
+    # itself raise TaskInputTooLargeError for this same oversized value
+    # (see the dedicated record_confirmation_decision_durably()
+    # NOT_ELIGIBLE-mapping test for that boundary instead); this test
+    # targets dispatch_confirmation_work()'s own independent reverse-
+    # lookup validation.
+    with caplog.at_level(logging.WARNING):
+        _dispatch_confirmation(
+            repo, TaskConfirmationWork(oversized), client=client
+        )
 
-    assert client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client.sent == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert "confirmation_work_malformed_token" in messages
 
 
 def test_wrong_source_token_never_mutates_remains_pending(repo):
@@ -1511,13 +1581,17 @@ def test_wrong_source_token_never_mutates_remains_pending(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader_must_not_be_called, client=client,
         )
     finally:
         task_control_module.SafeTaskExecutor = real_executor
 
-    assert client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    # Milestone 47 P2 adversarial-review correction (MEDIUM-1): silent
+    # stale-internal-work no-op, never a user-facing reply - see
+    # test_unknown_token_is_silent_stale_internal_work_no_mutation()'s own
+    # comment for why.
+    assert client.sent == []
     assert executor_calls.calls == []
     reloaded = repo.get_task(other.task_id)
     assert reloaded.state == TaskState.WAITING_FOR_CONFIRMATION
@@ -1529,28 +1603,30 @@ def test_wrong_source_token_never_mutates_remains_pending(repo):
     # code path ever changed to load config - it currently never does).
     client2 = RecordingClient()
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT),
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT),
         tools_config_loader=loader_must_not_be_called, client=client2,
     )
-    assert client2.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client2.sent == []
     assert repo.get_task(other.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
     assert repo.get_pending_confirmation(other.task_id) is not None
 
 
-def test_wrong_state_token_gets_generic_invalid(repo):
+def test_wrong_state_token_is_silent_stale_internal_work(repo):
     # A task whose pending confirmation was already consumed (state moved
-    # on) but whose OLD confirmation_id is replayed.
+    # on) but whose OLD confirmation_id is replayed via internal work -
+    # Milestone 47 P2 adversarial-review correction (MEDIUM-1): silent
+    # no-op, never a user-facing reply.
     task, pending = _waiting_task(repo)
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT)
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT)
     )
     assert repo.get_task(task.task_id).state == TaskState.CANCELLED
 
     client = RecordingClient()
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM), client=client
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM), client=client
     )
-    assert client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client.sent == []
 
 
 # --- dispatch_confirmation_work(): valid REJECT -----------------------------
@@ -1569,7 +1645,7 @@ def test_valid_reject_cancels_task_never_touches_executor_or_config(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT),
             tools_config_loader=loader, client=client,
         )
     finally:
@@ -1587,17 +1663,18 @@ def test_replayed_reject_no_second_cancellation_message(repo):
     client = RecordingClient()
 
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT), client=client
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT), client=client
     )
     assert client.sent == [(_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)]
 
+    # A second dispatch attempt for the same (already-consumed)
+    # confirmation_id is stale internal work (Milestone 47 P2
+    # adversarial-review correction, MEDIUM-1) - silent, never a second
+    # message of any kind.
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT), client=client
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT), client=client
     )
-    assert client.sent == [
-        (_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT),
-        (_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT),
-    ]
+    assert client.sent == [(_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)]
     assert repo.get_task(task.task_id).state == TaskState.CANCELLED
 
 
@@ -1616,7 +1693,7 @@ def test_expired_but_still_pending_reject_still_cancels(repo):
 
     client = RecordingClient()
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT), client=client
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT), client=client
     )
     assert repo.get_task(task.task_id).state == TaskState.CANCELLED
     assert client.sent == [(_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)]
@@ -1636,7 +1713,7 @@ def test_valid_confirm_executes_sensitive_action_exactly_once(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
     finally:
@@ -1661,22 +1738,24 @@ def test_replayed_confirm_no_second_execution_no_resend(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
         assert len(client.sent) == 1
         first_state = repo.get_task(task.task_id).state
 
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
     finally:
         task_control_module.SafeTaskExecutor = real_executor
 
+    # Milestone 47 P2 adversarial-review correction (MEDIUM-1): the
+    # second, stale-internal-work dispatch attempt is silent - never a
+    # second message of any kind.
     assert len(executor_calls.calls) == 1  # never a second real invocation
-    assert len(client.sent) == 2
-    assert client.sent[1] == (_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)
+    assert len(client.sent) == 1
     assert repo.get_task(task.task_id).state == first_state  # unchanged, no resend of the terminal result
 
 
@@ -1693,7 +1772,7 @@ def test_config_removed_before_confirm_fails_closed_no_execution(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
     finally:
@@ -1705,14 +1784,16 @@ def test_config_removed_before_confirm_fails_closed_no_execution(repo):
     assert executor_calls.calls == []  # revalidation failed BEFORE any execution
     assert len(client.sent) == 1
     assert client.sent[0][1].startswith("Task failed:")
-    # The (now-deleted) confirmation cannot be replayed into execution later.
+    # The (now-deleted) confirmation cannot be replayed into execution
+    # later - a second dispatch attempt is stale internal work (Milestone
+    # 47 P2 adversarial-review correction, MEDIUM-1), silent.
     assert repo.get_pending_confirmation(task.task_id) is None
     client2 = RecordingClient()
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
         tools_config_loader=loader, client=client2,
     )
-    assert client2.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client2.sent == []
 
 
 def test_expired_confirm_fails_closed_through_existing_engine(repo):
@@ -1735,7 +1816,7 @@ def test_expired_confirm_fails_closed_through_existing_engine(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
     finally:
@@ -1790,7 +1871,7 @@ def test_post_approval_continuation_exception_propagates_not_generic_invalid(rep
 
         with pytest.raises(StepAlreadyClaimedError):
             _dispatch_confirmation(
-                repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+                repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
                 tools_config_loader=loader, client=client,
             )
     finally:
@@ -1814,12 +1895,15 @@ def test_post_approval_continuation_exception_propagates_not_generic_invalid(rep
     # it as, and is not this test's concern to unwind.
 
 
-def test_approve_task_confirmation_exception_itself_still_gets_generic_invalid(repo):
+def test_approve_task_confirmation_exception_itself_is_silent_stale_work(repo):
     # The complementary half of the H1 boundary proof above: the SAME
-    # exception type must still be caught and mapped to the generic
-    # invalid reply when it is approve_task_confirmation() itself that
-    # raises it - never SafeTaskExecutor.execute() reached in this case,
-    # since the exception fires before any claim/execute could occur.
+    # exception type must still be caught when it is
+    # approve_task_confirmation() itself that raises it - never
+    # SafeTaskExecutor.execute() reached in this case, since the
+    # exception fires before any claim/execute could occur. Milestone 47
+    # P2 adversarial-review correction (MEDIUM-1): a race-lost exception
+    # here means something else already resolved this confirmation_id -
+    # stale internal work, silent, never a user-facing reply.
     task, pending = _waiting_task(repo, action_name="open_application", resource_key="notepad")
     client = RecordingClient()
     loader = lambda: _tools_config(approved_applications={"notepad": object()})
@@ -1837,14 +1921,14 @@ def test_approve_task_confirmation_exception_itself_still_gets_generic_invalid(r
         task_control_module.approve_task_confirmation = raising_approve
 
         _dispatch_confirmation(  # must NOT raise
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
     finally:
         task_control_module.SafeTaskExecutor = real_executor
         task_control_module.approve_task_confirmation = real_approve
 
-    assert client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client.sent == []
     assert executor_calls.calls == []
 
 
@@ -1871,7 +1955,7 @@ def test_approved_sensitive_action_that_fails_finalizes_task_failed_normally(rep
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )
     finally:
@@ -1890,13 +1974,15 @@ def test_approved_sensitive_action_that_fails_finalizes_task_failed_normally(rep
     step = repo.get_step_progress(task.task_id, 1)
     assert step.status.value == "failed"
 
-    # Replay after the failure must not resend or re-execute.
+    # Replay after the failure must not resend or re-execute - stale
+    # internal work (Milestone 47 P2 adversarial-review correction,
+    # MEDIUM-1), silent.
     client2 = RecordingClient()
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
         tools_config_loader=loader, client=client2,
     )
-    assert client2.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert client2.sent == []
     assert len(executor_calls.calls) == 1  # still exactly once
 
 
@@ -1952,7 +2038,7 @@ def test_multiple_confirmation_rounds_each_new_id_each_executed_once(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending_a.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending_a.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=counting_confirm_loader, respond_provider=respond_provider, client=client,
         )
         reloaded = repo.get_task(task.task_id)
@@ -1965,7 +2051,7 @@ def test_multiple_confirmation_rounds_each_new_id_each_executed_once(repo):
         assert len(confirm_loader_calls) == 1  # A's confirmation dispatch loaded config exactly once
 
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending_b.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending_b.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=counting_confirm_loader, respond_provider=respond_provider, client=client,
         )
     finally:
@@ -1994,22 +2080,24 @@ def test_send_failure_after_confirm_does_not_roll_back_or_replay(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=client,
         )  # must not raise
 
         assert repo.get_task(task.task_id).state == TaskState.COMPLETED
 
-        # Replay after the send failure - still invalid, no second execution.
+        # Replay after the send failure - stale internal work (Milestone
+        # 47 P2 adversarial-review correction, MEDIUM-1), silent, no
+        # second execution.
         recording_client = RecordingClient()
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             tools_config_loader=loader, client=recording_client,
         )
     finally:
         task_control_module.SafeTaskExecutor = real_executor
 
-    assert recording_client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    assert recording_client.sent == []
     assert len(executor_calls.calls) == 1
 
 
@@ -2018,7 +2106,7 @@ def test_send_failure_after_reject_does_not_roll_back_or_replay(repo):
     client = FailingClient()
 
     _dispatch_confirmation(
-        repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.REJECT), client=client
+        repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.REJECT), client=client
     )  # must not raise
 
     assert repo.get_task(task.task_id).state == TaskState.CANCELLED
@@ -2031,12 +2119,14 @@ def test_send_failure_after_reject_does_not_roll_back_or_replay(repo):
     try:
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         _dispatch_confirmation(
-            repo, TaskConfirmationWork(pending.confirmation_id, ConfirmationDecision.CONFIRM),
+            repo, _confirmation_work(repo, pending.confirmation_id, ConfirmationDecision.CONFIRM),
             client=recording_client,
         )
     finally:
         task_control_module.SafeTaskExecutor = real_executor
-    assert recording_client.sent == [(_AUTHORIZED_SENDER, _GENERIC_INVALID_CONFIRMATION_TEXT)]
+    # Stale internal work (Milestone 47 P2 adversarial-review correction,
+    # MEDIUM-1), silent.
+    assert recording_client.sent == []
     assert executor_calls.calls == []
 
 
@@ -2128,6 +2218,305 @@ def test_recovery_checkpoint_repeated_failure_never_marks_delivered(repo):
     final = repo.get_outbox_event_for_task_version(task.task_id, repo.get_task(task.task_id).version)
     assert final.delivered_at is None
     assert final.attempt_count == 2
+
+
+# --- Milestone 47 P2: run_confirmation_decision_recovery_checkpoint() ------
+
+
+def test_confirmation_recovery_checkpoint_noop_when_nothing_decided(repo):
+    client = RecordingClient()
+    run_confirmation_decision_recovery_checkpoint(
+        repo, ActionRegistry(), _tools_config, _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+    )
+    assert client.sent == []
+
+
+def test_confirmation_recovery_checkpoint_processes_one_recorded_confirm(repo):
+    task, pending = _waiting_task(repo, action_name="open_application", resource_key="notepad")
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+    client = RecordingClient()
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        run_confirmation_decision_recovery_checkpoint(
+            repo, ActionRegistry(),
+            lambda: _tools_config(approved_applications={"notepad": object()}),
+            _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+        )
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+
+    assert len(executor_calls.calls) == 1
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+    assert client.sent == [(_AUTHORIZED_SENDER, "'notepad' launched.")]
+
+
+def test_confirmation_recovery_checkpoint_processes_one_recorded_reject(repo):
+    task, pending = _waiting_task(repo, action_name="open_application", resource_key="notepad")
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+
+    client = RecordingClient()
+    run_confirmation_decision_recovery_checkpoint(
+        repo, ActionRegistry(), _tools_config, _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+    )
+
+    assert repo.get_task(task.task_id).state == TaskState.CANCELLED
+    assert client.sent == [(_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)]
+
+
+def test_confirmation_recovery_checkpoint_never_picks_up_a_different_source(repo):
+    other_task = repo.create_task("other-channel request", "other_channel")
+    repo.transition_task(other_task.task_id, TaskState.CREATED, TaskState.PLANNING)
+    plan = TaskPlan(
+        plan_version=1, task_id=other_task.task_id, objective="x",
+        steps=(PlanStep(step_id="s1", position=1, kind=StepKind.ACTION, action_name="open_application",
+                         resource_key="notepad", catalog_id="a1", description="d", expected_result="e",
+                         depends_on=(), requires_confirmation=False),),
+        created_at="2026-08-08T00:00:00+00:00",
+    )
+    repo.persist_plan_and_ready(other_task.task_id, TaskState.PLANNING, serialize_plan(plan))
+    repo.transition_task(other_task.task_id, TaskState.READY, TaskState.RUNNING)
+    repo.propose_confirmation(other_task.task_id, 1, "open_application", "notepad", ttl_seconds=120)
+    other_pending = repo.get_pending_confirmation(other_task.task_id)
+    repo.record_confirmation_decision(
+        other_pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="other_channel",
+        provider_dedup_key=_dk(),
+    )
+
+    client = RecordingClient()
+    run_confirmation_decision_recovery_checkpoint(
+        repo, ActionRegistry(), _tools_config, _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+    )
+
+    # Never touched - the other source's own durable decision remains
+    # completely unprocessed by this (WhatsApp-only) checkpoint.
+    assert client.sent == []
+    assert repo.get_task(other_task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+    assert repo.get_pending_confirmation(other_task.task_id) is not None
+
+
+def test_confirmation_recovery_checkpoint_defers_failing_decision_and_does_not_starve_next(repo):
+    """Milestone 47 P2 adversarial-review correction (MEDIUM-2) - the full
+    worker-level fairness/starvation regression: decision A (oldest) is
+    forced to fail BEFORE consumption (a real exception escaping
+    approve_task_confirmation() before any claim); decision B (newer)
+    must still be selectable, processed, and never starved behind A."""
+
+    task_a, pending_a = _waiting_task(repo, action_name="open_application", resource_key="notepad",
+                                       request_text="task a")
+    task_b, pending_b = _waiting_task(repo, action_name="open_application", resource_key="notepad",
+                                       request_text="task b")
+
+    repo.record_confirmation_decision(
+        pending_a.confirmation_id, ConfirmationDecision.CONFIRM, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+    repo.record_confirmation_decision(
+        pending_b.confirmation_id, ConfirmationDecision.CONFIRM, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+
+    import interfaces.whatsapp.task_control as task_control_module
+    real_approve = task_control_module.approve_task_confirmation
+
+    def raising_approve(*args, **kwargs):
+        raise RuntimeError("simulated execution-engine defect for confirmation A only")
+
+    client = RecordingClient()
+    loader = lambda: _tools_config(approved_applications={"notepad": object()})
+    try:
+        task_control_module.approve_task_confirmation = raising_approve
+        # Checkpoint 1: A is oldest and due - dispatch raises, A is
+        # durably deferred, the exception propagates (never silently
+        # swallowed as success).
+        with pytest.raises(RuntimeError):
+            run_confirmation_decision_recovery_checkpoint(
+                repo, ActionRegistry(), loader, _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+            )
+    finally:
+        task_control_module.approve_task_confirmation = real_approve
+
+    # A remains durable, unconsumed, never executed - deferred, not lost.
+    reloaded_a = repo.get_pending_confirmation(task_a.task_id)
+    assert reloaded_a is not None
+    assert reloaded_a.decision is ConfirmationDecision.CONFIRM
+    assert reloaded_a.decision_attempt_count == 1
+    assert repo.get_task(task_a.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+    assert client.sent == []  # the failed attempt never produced a user-facing reply
+
+    # Checkpoint 2 (real approve_task_confirmation restored): B is now the
+    # only due decision - A's own deferred backoff has not elapsed yet, so
+    # B is correctly selected and processed, never starved behind A.
+    executor_calls = _FakeSuccessExecutor()
+    real_executor = task_control_module.SafeTaskExecutor
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        run_confirmation_decision_recovery_checkpoint(
+            repo, ActionRegistry(), loader, _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+        )
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+
+    assert len(executor_calls.calls) == 1
+    assert repo.get_task(task_b.task_id).state == TaskState.COMPLETED
+    assert client.sent == [(_AUTHORIZED_SENDER, "'notepad' launched.")]
+    # A is untouched by checkpoint 2 - still deferred, still durable.
+    assert repo.get_task(task_a.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+
+
+def test_confirmation_recovery_checkpoint_survives_close_and_reopen(db_path):
+    # Milestone 47 P2 crash/restart proof: durably record a decision, then
+    # close the connection WITHOUT ever dispatching it (simulating a crash
+    # between HTTP 200 and worker consumption) - open a brand-new
+    # connection/TaskRepository (simulating process restart) and confirm
+    # the recovery checkpoint alone, with no further CONFIRM/REJECT ever
+    # posted again, still finds and correctly processes the decision.
+    conn1 = open_writer_connection(db_path)
+    repo1 = TaskRepository(conn1)
+    task, pending = _waiting_task(repo1, action_name="open_application", resource_key="notepad")
+    outcome = repo1.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+    conn1.close()  # crash simulation - no dispatch ever happened
+
+    conn2 = open_writer_connection(db_path)
+    repo2 = TaskRepository(conn2)
+    try:
+        assert repo2.get_task(task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+
+        executor_calls = _FakeSuccessExecutor()
+        import interfaces.whatsapp.task_control as task_control_module
+        real_executor = task_control_module.SafeTaskExecutor
+        client = RecordingClient()
+        try:
+            task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+            run_confirmation_decision_recovery_checkpoint(
+                repo2, ActionRegistry(),
+                lambda: _tools_config(approved_applications={"notepad": object()}),
+                _FakeModelProvider([]), client, _AUTHORIZED_SENDER,
+            )
+        finally:
+            task_control_module.SafeTaskExecutor = real_executor
+
+        assert len(executor_calls.calls) == 1
+        assert repo2.get_task(task.task_id).state == TaskState.COMPLETED
+        assert client.sent == [(_AUTHORIZED_SENDER, "'notepad' launched.")]
+    finally:
+        conn2.close()
+
+
+# --- Milestone 47 P2 adversarial-review correction (MEDIUM-1): the        --
+# --- RECORDED -> recovery -> stale-queue-item race                        --
+
+
+def test_recovery_consumes_confirm_before_stale_queue_item_no_invalid_reply(repo):
+    """Deterministic reproduction of the exact interleaving the
+    adversarial review found broken:
+
+      1. record_confirmation_decision() commits RECORDED (the HTTP
+         thread's own durable write).
+      2. A recovery checkpoint races ahead of that SAME HTTP thread's own
+         subsequent queue enqueue and fully processes the decision - the
+         real lifecycle result is delivered, the pending row is consumed.
+      3. The HTTP thread's own (now-stale) TaskConfirmationWork is later
+         dispatched anyway.
+
+    Required (this is what the correction fixes): exactly one action
+    execution, exactly one lifecycle result/outbox event, and the stale
+    dispatch in step 3 produces NO reply of any kind - silent, bounded-
+    logged stale internal work, never
+    "That confirmation is no longer valid.\""""
+
+    task, pending = _waiting_task(repo, action_name="open_application", resource_key="notepad")
+
+    # Step 1.
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+    task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+    try:
+        # Step 2: the recovery checkpoint races ahead and fully consumes
+        # the decision, exactly as if it had won the race against the
+        # HTTP thread's own subsequent put_nowait().
+        recovery_client = RecordingClient()
+        run_confirmation_decision_recovery_checkpoint(
+            repo, ActionRegistry(),
+            lambda: _tools_config(approved_applications={"notepad": object()}),
+            _FakeModelProvider([]), recovery_client, _AUTHORIZED_SENDER,
+        )
+        assert repo.get_task(task.task_id).state == TaskState.COMPLETED
+        assert recovery_client.sent == [(_AUTHORIZED_SENDER, "'notepad' launched.")]
+        completed_version = repo.get_task(task.task_id).version
+        outbox_event = repo.get_outbox_event_for_task_version(task.task_id, completed_version)
+        assert outbox_event is not None
+
+        # Step 3: the stale queue item, dispatched anyway.
+        stale_client = RecordingClient()
+        dispatch_confirmation_work(
+            repo, TaskConfirmationWork(pending.confirmation_id), ActionRegistry(),
+            lambda: _tools_config(approved_applications={"notepad": object()}),
+            _FakeModelProvider([]), stale_client, _AUTHORIZED_SENDER,
+        )
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+
+    assert stale_client.sent == []  # no invalid reply, no anything
+    assert len(executor_calls.calls) == 1  # executed exactly once, never twice
+    assert repo.get_task(task.task_id).state == TaskState.COMPLETED  # unchanged by the stale dispatch
+    # No second outbox event for the same (already-delivered) transition.
+    assert repo.get_outbox_event_for_task_version(task.task_id, completed_version).event_id == outbox_event.event_id
+
+
+def test_recovery_consumes_reject_before_stale_queue_item_no_invalid_reply(repo):
+    """The REJECT analogue of the CONFIRM race test above - the same
+    internal-stale-work mechanism applies identically."""
+
+    task, pending = _waiting_task(repo)
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source=TASK_SOURCE,
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+
+    recovery_client = RecordingClient()
+    run_confirmation_decision_recovery_checkpoint(
+        repo, ActionRegistry(), _tools_config, _FakeModelProvider([]), recovery_client, _AUTHORIZED_SENDER,
+    )
+    assert repo.get_task(task.task_id).state == TaskState.CANCELLED
+    assert recovery_client.sent == [(_AUTHORIZED_SENDER, TASK_CANCELLED_TEXT)]
+    cancelled_version = repo.get_task(task.task_id).version
+    outbox_event = repo.get_outbox_event_for_task_version(task.task_id, cancelled_version)
+    assert outbox_event is not None
+
+    stale_client = RecordingClient()
+    dispatch_confirmation_work(
+        repo, TaskConfirmationWork(pending.confirmation_id), ActionRegistry(),
+        _tools_config, _FakeModelProvider([]), stale_client, _AUTHORIZED_SENDER,
+    )
+
+    assert stale_client.sent == []
+    assert repo.get_task(task.task_id).state == TaskState.CANCELLED
+    assert repo.get_outbox_event_for_task_version(task.task_id, cancelled_version).event_id == outbox_event.event_id
 
 
 # --- Milestone 47 P1: malformed durable payload never crashes the worker ---

@@ -3285,20 +3285,170 @@ this flow — a single call to `handle()` is one full request/response cycle.
   assumes away, and, where applicable, they remain Milestone 47's scope
   to close.
 
+- Milestone 47 — Persistence and Recovery: **COMPLETE.** Closes exactly
+  the boundaries Milestone 46 stated explicitly rather than assumed away
+  (see M46's own closure paragraph above) — safe, bounded recovery after
+  a process crash/restart, never a generalized scheduler, never a
+  broader autonomy or launch milestone. `SCHEMA_VERSION` is now 7 (was
+  4 as of M46 — see each phase below for the three intervening bumps).
+
+  P1 (Runtime Ownership and Lifecycle Outbox Foundation) is implemented:
+  an OS-level, database-scoped runtime lock
+  (`kernel/employee_tasks/runtime_lock.py`) is acquired once, in
+  `build_server()`, before any `TaskRepository` is constructed or any
+  worker/recovery activity begins — a second live runtime against the
+  same database fails startup closed, before touching any durable task
+  state, never silently continuing without recovery ownership. The lock
+  path is derived deterministically from the canonicalized database
+  path, so relative/absolute/`..`-segment/symlinked-parent aliases of
+  the same file always resolve to the same lock, while genuinely
+  different database files remain independent. Released only after
+  clean shutdown has fully quiesced both the worker thread and every
+  in-flight HTTP request thread (`WhatsAppServer.stop()`) — never while
+  either could still be touching the database. A new `task_lifecycle_outbox`
+  table (schema version 5) makes every deliverable lifecycle transition
+  (confirmation-required, task-completed, task-failed, task-cancelled)
+  durable in the SAME transaction as the transition itself — "if the
+  transition commits, the obligation to deliver it exists, always, never
+  later, never separately" — with a bounded, capped-exponential retry
+  schedule (`compute_outbox_retry_delay_seconds()`, base 60s / cap
+  3600s) and a periodic, at-most-one-redelivery-per-checkpoint recovery
+  pass interleaved with normal worker queue consumption
+  (`run_outbound_lifecycle_recovery_checkpoint()`).
+
+  P2 (Durable Confirmation Decisions and Recovery) is implemented: a
+  `CONFIRM`/`REJECT` command's decision is now durably recorded
+  (`TaskRepository.record_confirmation_decision()`) inside one
+  `BEGIN IMMEDIATE` transaction, atomically checking source/state/
+  first-decision-wins, *before* the webhook HTTP thread may ever return
+  200 — closing the exact "decision lost between HTTP 200 and worker
+  pickup" window M46 P2B stated as its own scope boundary. A durable,
+  restart-surviving provider-message ingress receipt
+  (`task_confirmation_ingress_receipts`, schema version 6) — keyed on a
+  hashed, never-raw provider message ID — distinguishes an exact
+  redelivery of an already-accepted command (`DUPLICATE_INGRESS`: HTTP
+  200, no enqueue, no reply, no further mutation) from an ordinary
+  already-decided one (`ALREADY_DECIDED`, a different provider message)
+  or a genuinely invalid one (`NOT_ELIGIBLE`), and survives even after
+  the `task_pending_confirmation` row itself has been consumed and
+  deleted. The in-memory work queue item (`TaskConfirmationWork`) carries
+  only a `confirmation_id`, never the decision itself — the worker always
+  reloads the durable decision fresh, so the queue is never authority.
+  Stale internal work (the pending row already gone, wrong state, or
+  already resolved) is handled silently by the worker — a bounded log
+  only, never a user-facing reply; the *only* place a user-facing
+  "confirmation no longer valid" reply can ever originate is the HTTP
+  ingress path's own `NOT_ELIGIBLE` outcome. A due-ordered, capped-backoff
+  recovery checkpoint (`run_confirmation_decision_recovery_checkpoint()`,
+  `decision_attempt_count`/`decision_next_attempt_at`) picks up a
+  decision that was durably recorded but never reached the worker (e.g.
+  queue-full at recording time, or a crash before consumption) — bounded
+  to one pickup per checkpoint, with the same base-60s/cap-3600s policy
+  P1's outbox already established, reused rather than duplicated.
+
+  P3 (Task-State Restart Recovery and Reconciliation) is implemented:
+  a bounded, source-filtered, due-ordered lookup
+  (`TaskRepository.find_one_recoverable_task()`) discovers at most one
+  durable task per checkpoint currently in `created`/`planning`/`ready`/
+  `running` — a state that may have been left behind by a crash before
+  the worker ever dequeued its `TaskExecutionWork`, or mid-execution.
+  This lookup is based entirely on durable database state, never on
+  inspecting the worker's own volatile in-memory queue — it neither
+  proves nor requires that no queued work item for the same task
+  happens to exist; the two can coexist safely (see the accepted LOW
+  finding on this below). `run_task_state_recovery_checkpoint()`
+  redispatches the discovered task through the
+  SAME `dispatch_task_work()` the normal queue path already uses — no
+  separate recovery-specific execution logic, no special recovery
+  executor. A `planning -> created` edge (the one new entry added to the
+  closed `ALLOWED_TRANSITIONS` table) lets a task stranded mid-planning
+  be explicitly re-armed for a genuinely fresh planning attempt — the
+  interrupted model call's outcome is never assumed, since planning has
+  no external side effect to begin with. **The hardest requirement in
+  this phase — that a `running` task with an `in_progress` step must
+  never be automatically retried after a restart, no matter how many
+  times recovery attempts it — turned out to already be built and tested
+  as part of Milestone 42 P1**: `evaluate_next_step()` already treats
+  `in_progress` as a permanently uncertain state (never retried, never
+  skipped, never inferred success or failure from) and already fails the
+  task closed (`mark_failed(..., "step_execution_uncertain", ...)`)
+  before `SafeTaskExecutor.execute()` is ever reached again; P3 only had
+  to reach that already-safe path after a restart, not reinvent it. The
+  `in_progress` `task_step_progress` row itself is never touched by
+  recovery — it remains the durable, honest record that the external
+  outcome is unknown, forever. `waiting_for_confirmation` and every
+  terminal state are structurally excluded from this lookup — never
+  duplicating or racing P2's own recovery, never reopening a finished
+  task. Schema version 7 adds `tasks.recovery_attempt_count`/
+  `recovery_next_attempt_at` (an adversarial-review correction: the
+  original due-ordered lookup was plain oldest-first with no backoff,
+  which let one repeatedly-failing recoverable task permanently starve
+  every task created after it — fixed with the identical due-filtered,
+  capped-backoff shape P1's outbox and P2's confirmation-decision retry
+  already established, reusing the SAME `compute_outbox_retry_delay_seconds()`
+  policy both of those already call, rather than a third, independent
+  copy of it).
+
+  Final invariants holding across the whole P1+P2+P3 surface: exactly
+  one supported runtime owns one task database at a time; `SafeTaskExecutor`
+  remains the sole action-execution boundary — no phase of M47 introduces
+  a second one; the current `ActionRegistry`/`ToolsConfig` (never a
+  persisted plan snapshot) is always re-validated fresh before any
+  recovered step executes; every one of P1/P2/P3's three recovery
+  categories is bounded to at most one pickup per checkpoint, run in that
+  fixed P1 → P2 → P3 order on the single worker thread, never the webhook
+  HTTP thread, never a second worker, never a startup-blocking sweep; a
+  durably-decided confirmation and a stranded task can never be processed
+  by more than one of these mechanisms; and a repeatedly-failing item in
+  either P2's or P3's own recovery queue is durably deferred with capped
+  backoff rather than permanently starving everything behind it.
+
+  Marking this milestone **COMPLETE** does not retract any boundary
+  stated in M46's own closure paragraph or restated here — all of the
+  following remain true, are explicit scope boundaries rather than
+  silently-assumed-away defects, and are not claims M47 makes stronger
+  than the code actually provides: no exactly-once guarantee for an
+  external action's side effects, ever — a crash after a step is claimed
+  but before or during the actual external call remains genuinely
+  uncertain, and is always resolved by failing the task closed, never by
+  inferring success or failure; outbound lifecycle delivery is
+  at-least-once, so a duplicate WhatsApp message around a crash boundary
+  remains possible; P3's recovery backoff governs P3's own discovery
+  ordering only — it is not a global execution lock, and a legitimate,
+  already-queued `TaskExecutionWork` item may still process a
+  P3-deferred task sooner, which is intentional, not a gap; single-worker
+  recovery may be delayed by one long-running task, network call, or
+  model call ahead of it in the same checkpoint; and this remains a
+  personal-scale architecture with no generalized scheduler and no
+  multi-worker recovery. Three further, narrower limitations were
+  identified and accepted (not fixed) during M47 P3's own final
+  adversarial review, all judged bounded and self-healing rather than
+  safety-relevant: a secondary database failure while handling an
+  original recovery exception can mask which exception the worker's log
+  reflects, though the worker itself always survives and logs
+  generically either way; stale P3 backoff metadata from an earlier
+  `running` episode can survive a legitimate
+  `waiting_for_confirmation -> running` round-trip and delay
+  rediscovery of a later, unrelated crash by up to the capped backoff
+  interval (at most one hour); and `planning -> created` is a generic
+  transition-table edge with no mechanism restricting which caller may
+  use it, exactly like every other edge in that same table, though only
+  P3's own recovery checkpoint currently does.
+
 **Planned / not yet implemented:**
 
-- Milestone 47 (persistence recovery/reconciliation, especially an
-  uncertain `in_progress` external action left behind by a process crash,
-  and the confirmation-command-lost-before-worker-pickup boundary
-  Milestone 46 P2B explicitly accepted rather than solved), and Milestone
-  48 (employee acceptance/launch). Neither exists yet; do not treat
-  either name as implemented. Milestone 46 itself is complete — see its
-  own entry above — and does not absorb Milestone 47's scope merely by
-  closing. Neither Milestone 44 nor Milestone 45 absorbs any of this
-  scope either — a future JavaScript-enabled or interactive browser
-  capability, and any future native desktop mutation capability, are each
-  new, separately-designed features, not a hidden part of any of these,
-  and not owned by M46.
+- Milestone 48 (employee acceptance/launch). Does not exist yet; do not
+  treat the name as implemented. Milestones 46 and 47 are both complete —
+  see their own entries above — and neither absorbs Milestone 48's scope
+  merely by closing: broad employee launch acceptance, production
+  deployment procedures, generalized monitoring/alerting, new tools or
+  actions, expanded autonomy, and any real-world launch process are all
+  Milestone 48's concern entirely, not a hidden part of M47's persistence/
+  recovery correctness work. Neither Milestone 44 nor Milestone 45
+  absorbs any of this scope either — a future JavaScript-enabled or
+  interactive browser capability, and any future native desktop mutation
+  capability, are each new, separately-designed features, not a hidden
+  part of any of these, and not owned by M46 or M47.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

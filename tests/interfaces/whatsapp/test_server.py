@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import queue
 import socket
 import threading
 import time
@@ -31,14 +32,18 @@ from interfaces.whatsapp.server import (
     build_orchestrator,
 )
 from interfaces.whatsapp.task_control import (
+    GENERIC_INVALID_CONFIRMATION_TEXT,
+    TASK_SOURCE,
     ConfirmationDecision,
     TaskConfirmationWork,
     TaskExecutionWork,
     compute_dedup_key,
+    record_confirmation_decision_durably,
 )
 from kernel.capabilities.base import Capability
 from kernel.config.config import Config
 from kernel.employee_tasks import (
+    ConfirmationDecisionOutcome,
     TaskRepository,
     TaskState,
     open_writer_connection,
@@ -1037,6 +1042,73 @@ def test_worker_survives_a_task_exception_and_processes_the_next_task(caplog):
         assert "Traceback" not in message
 
 
+class FlakyRecoveryHandler:
+    """Raises on its first run_recovery_checkpoint() call, regardless of
+    cause; succeeds silently on every call after that. handle_task() itself
+    never raises - used to prove a recovery-checkpoint defect (Milestone 47
+    P1 adversarial-review correction LOW-3) does not crash the worker loop
+    or block normal queue processing, matching FlakyMessageHandler's own
+    worker_error proof above for the recovery path instead."""
+
+    def __init__(self):
+        self.handled = []
+        self.recovery_calls = 0
+
+    def handle_task(self, task):
+        self.handled.append(task)
+
+    def run_recovery_checkpoint(self):
+        self.recovery_calls += 1
+        if self.recovery_calls == 1:
+            raise RuntimeError("sender=15551234567 text='should never be logged'")
+
+
+def test_worker_survives_a_recovery_checkpoint_exception_and_processes_the_next_task(caplog):
+    whatsapp_config = _make_whatsapp_config()
+    handler = FlakyRecoveryHandler()
+    server = WhatsAppServer(
+        whatsapp_config, handler, queue_capacity=16, recovery_interval_seconds=0.05
+    )
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        with caplog.at_level(logging.DEBUG):
+            # Let the first recovery checkpoint fire - and raise - entirely
+            # on its own, before any normal item is ever enqueued, so this
+            # proves the worker LOOP itself survives a recovery-checkpoint
+            # exception, not merely that items enqueued beforehand happen
+            # to still get processed afterward.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and handler.recovery_calls < 1:
+                time.sleep(0.01)
+            assert handler.recovery_calls >= 1, "the worker never reached its first recovery checkpoint"
+
+            assert _post(server, _envelope("wamid.recov1", _AUTHORIZED_SENDER, text="hello")) == 200
+
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and (
+                len(handler.handled) < 1 or handler.recovery_calls < 2
+            ):
+                time.sleep(0.02)
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(handler.handled) == 1  # the queued task still ran after the recovery failure
+    assert handler.recovery_calls >= 2  # a later checkpoint still ran normally after the failure
+    assert server._queue.unfinished_tasks == 0  # task_done() accounting is unaffected by the raise
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "worker_recovery_error" in messages
+    for message in messages:
+        assert "15551234567" not in message
+        assert "should never be logged" not in message
+        assert "Traceback" not in message
+
+
 # --- IPv6 loopback ---------------------------------------------------------
 
 
@@ -1278,6 +1350,7 @@ def _make_server_with_tasks(
     respond_provider=None,
     task_catalog=None,
     client=None,
+    recovery_interval_seconds=None,
 ):
     """Builds a real WhatsAppServer with Milestone 46 P1 durable-ingress
     and P2A execution/delivery wiring - a real tmp_path SQLite database
@@ -1309,12 +1382,16 @@ def _make_server_with_tasks(
         respond_provider=respond_provider if respond_provider is not None else _FakeRespondProvider(),
         authorized_sender=_AUTHORIZED_SENDER,
     )
+    server_kwargs = {}
+    if recovery_interval_seconds is not None:
+        server_kwargs["recovery_interval_seconds"] = recovery_interval_seconds
     server = WhatsAppServer(
         whatsapp_config,
         handler,
         queue_capacity=queue_capacity,
         task_db_path=db_path,
         worker_task_connection=worker_connection,
+        **server_kwargs,
     )
     return server, client, db_path
 
@@ -1596,16 +1673,31 @@ def test_worker_survives_a_lifecycle_send_failure_and_processes_the_next_task(tm
             # Task A: its confirmation-request send fails (the client's
             # first call).
             assert _post(server, _envelope("wamid.survivea", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+            # Milestone 47 P1 test-hygiene correction: accept_task_message()
+            # durably creates the task row SYNCHRONOUSLY, before this POST
+            # even returns - so merely polling for the row's existence (the
+            # original condition here) provided no real synchronization at
+            # all with the worker's own ASYNCHRONOUS plan/execute/
+            # propose_confirmation() pipeline, and raced the
+            # WAITING_FOR_CONFIRMATION assertion below (empirically ~18%
+            # failure standalone). Poll for the actual terminal state the
+            # assertion depends on instead.
             deadline = time.monotonic() + 2
-            while time.monotonic() < deadline and not _list_tasks(db_path):
-                time.sleep(0.02)
-
             tasks_after_a = _list_tasks(db_path)
+            while time.monotonic() < deadline and (
+                not tasks_after_a or tasks_after_a[0].state != TaskState.WAITING_FOR_CONFIRMATION
+            ):
+                time.sleep(0.02)
+                tasks_after_a = _list_tasks(db_path)
+
             assert len(tasks_after_a) == 1
             # The durable WAITING_FOR_CONFIRMATION transition already
             # committed before the send was even attempted - a send
             # failure never rolls it back.
-            assert tasks_after_a[0].state == TaskState.WAITING_FOR_CONFIRMATION
+            assert tasks_after_a[0].state == TaskState.WAITING_FOR_CONFIRMATION, (
+                "task never reached WAITING_FOR_CONFIRMATION within the 2s deadline - "
+                f"observed state: {tasks_after_a[0].state}"
+            )
             assert client.sent == []  # the one send attempt so far failed
 
             # Task B: a distinct request, still grounded to "notepad" -
@@ -2604,14 +2696,30 @@ def test_valid_reject_via_real_http_cancels_task(tmp_path):
     assert tasks[0].state == TaskState.CANCELLED
 
 
-def test_confirmation_queue_full_returns_503_confirmation_remains_pending(tmp_path):
+def test_confirmation_recorded_durably_despite_queue_full_and_recovered_later(tmp_path):
+    # Milestone 47 P2: the durable write, not the in-memory queue, is now
+    # the acceptance boundary for a CONFIRM/REJECT command - a full queue
+    # at recording time no longer produces 503 (the pre-P2 behavior this
+    # test used to assert); the decision still durably wins, HTTP 200 is
+    # still returned, and the worker's own recovery checkpoint eventually
+    # picks the decision up once it drains its backlog - see
+    # server.py's own module docstring for the full RECORDED/
+    # ALREADY_DECIDED/NOT_ELIGIBLE contract.
     planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
-    server, client, db_path = _make_server_with_tasks(tmp_path, planner, queue_capacity=1)
+    server, client, db_path = _make_server_with_tasks(
+        tmp_path, planner, queue_capacity=1, recovery_interval_seconds=0.1
+    )
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
     time.sleep(0.05)
 
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    blocking = BlockingOrchestrator()
     try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
         assert _post(server, _envelope("wamid.p2bqueue1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and len(client.sent) < 1:
@@ -2624,7 +2732,6 @@ def test_confirmation_queue_full_returns_503_confirmation_remains_pending(tmp_pa
         # is dequeued and blocks the worker in place; a SECOND ordinary
         # message then genuinely occupies the queue's one free slot,
         # unconsumed, while the worker is busy.
-        blocking = BlockingOrchestrator()
         server._message_handler._orchestrator = blocking
         assert _post(server, _envelope("wamid.p2bblock1", _AUTHORIZED_SENDER, text="hello")) == 200
         assert blocking.started.wait(timeout=2)
@@ -2633,28 +2740,306 @@ def test_confirmation_queue_full_returns_503_confirmation_remains_pending(tmp_pa
         status = _post(
             server, _envelope("wamid.p2bqueuefull", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
         )
-        assert status == 503
+        assert status == 200
 
-        # Confirmation remains fully pending/unconsumed - no durable
-        # mutation happened on the HTTP thread.
-        tasks = _list_tasks(db_path)
-        assert tasks[0].state == TaskState.WAITING_FOR_CONFIRMATION
+        # The decision is durably recorded even though it was never
+        # actually enqueued (the queue was genuinely full) - the task
+        # itself is still WAITING_FOR_CONFIRMATION (the worker hasn't
+        # processed the decision yet), but task_pending_confirmation's own
+        # decision column already reflects it.
+        assert _list_tasks(db_path)[0].state == TaskState.WAITING_FOR_CONFIRMATION
+        conn = open_writer_connection(db_path)
+        try:
+            row = conn.execute(
+                "SELECT decision FROM task_pending_confirmation WHERE confirmation_id = ?",
+                (confirmation_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("confirm",)
+
+        # A second, conflicting decision for the SAME confirmation_id
+        # while it is still unconsumed is ALREADY_DECIDED - still HTTP
+        # 200, and the durably-recorded CONFIRM is never overwritten.
+        status2 = _post(
+            server, _envelope("wamid.p2bqueuefull2", _AUTHORIZED_SENDER, text=f"REJECT {confirmation_id}")
+        )
+        assert status2 == 200
 
         blocking.release()
 
-        # A retry (Meta redelivery of the same message) can now queue
-        # successfully once the worker has drained the backlog.
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and tasks[0].state == TaskState.WAITING_FOR_CONFIRMATION:
-            tasks = _list_tasks(db_path)
+        # No further CONFIRM/REJECT is ever posted again - only the
+        # worker's own periodic recovery checkpoint
+        # (task_control.run_confirmation_decision_recovery_checkpoint())
+        # can pick this up, once it drains the backlog and later reaches
+        # its own recovery deadline.
+        #
+        # Milestone 47 P2 adversarial-review correction (LOW-4): poll for
+        # the recovery checkpoint's own real completion reply, not merely
+        # "state left WAITING_FOR_CONFIRMATION" - the task passes through
+        # an intermediate RUNNING state synchronously, within the same
+        # worker call, on its way to COMPLETED, so a state-only poll can
+        # observe that transient RUNNING value and stop too early (as the
+        # confirmed adversarial-review flake demonstrated). Polling on
+        # client.sent - only ever appended to on an actual delivered
+        # message - is the robust signal here, matching the fix already
+        # applied to the same-provider-message-retry test above.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "'notepad' launched." not in (m[1] for m in client.sent):
             time.sleep(0.02)
-        assert _post(
-            server, _envelope("wamid.p2bqueuefull", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
-        ) == 200
+        tasks = _list_tasks(db_path)
     finally:
+        task_control_module.SafeTaskExecutor = real_executor
         blocking.release()
         server.stop()
         thread.join(timeout=5)
+
+    # Recovered and executed via the durably-won CONFIRM - never REJECT,
+    # which lost the durable race and was never written at all.
+    assert tasks[0].state == TaskState.COMPLETED
+    assert len(executor_calls.calls) == 1
+
+
+def test_same_provider_message_retry_no_duplicate_processing_or_reply(tmp_path):
+    # Milestone 47 P2, section 19-F: a Meta redelivery of the EXACT SAME
+    # CONFIRM/REJECT message (identical provider message_id) must never
+    # produce duplicate durable-decision processing or a spurious
+    # generic-invalid reply for the redelivered duplicate.
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(
+        tmp_path, planner, queue_capacity=1, recovery_interval_seconds=0.1
+    )
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+
+    blocking = BlockingOrchestrator()
+    try:
+        task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+        assert _post(server, _envelope("wamid.p2bretry1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        # Block the worker so the queue genuinely fills - the same
+        # technique the queue-full test above uses - widening the window
+        # between durable recording and worker consumption enough that a
+        # same-message-ID redelivery reliably lands on ALREADY_DECIDED
+        # rather than racing the worker to NOT_ELIGIBLE.
+        server._message_handler._orchestrator = blocking
+        assert _post(server, _envelope("wamid.p2bretryblock1", _AUTHORIZED_SENDER, text="hello")) == 200
+        assert blocking.started.wait(timeout=2)
+        assert _post(server, _envelope("wamid.p2bretryblock2", _AUTHORIZED_SENDER, text="hello again")) == 200
+
+        # Meta redelivers the EXACT SAME provider message (identical
+        # message_id) for the original CONFIRM.
+        envelope = _envelope("wamid.p2bretryconfirm", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        assert _post(server, envelope) == 200
+        assert _post(server, envelope) == 200  # exact redelivery, same message_id
+
+        blocking.release()
+
+        # Wait for the recovery checkpoint's own real completion reply,
+        # not merely "state left WAITING_FOR_CONFIRMATION" - the task
+        # passes through an intermediate RUNNING state synchronously,
+        # within the same worker call, on its way to COMPLETED, so
+        # polling on client.sent (only ever appended to on an actual
+        # delivered message) is the robust signal here.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "'notepad' launched." not in (m[1] for m in client.sent):
+            time.sleep(0.02)
+        tasks = _list_tasks(db_path)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        blocking.release()
+        server.stop()
+        thread.join(timeout=5)
+
+    assert tasks[0].state == TaskState.COMPLETED
+    assert len(executor_calls.calls) == 1  # processed exactly once, never twice
+    # No spurious "no longer valid" reply for the redelivered duplicate,
+    # and only ever one real completion message - "hello"/"hello again"
+    # (the unrelated blocking messages used to fill the queue) also
+    # produce their own ordinary chat replies once unblocked, so this
+    # deliberately does not assert an exact total client.sent count.
+    reply_texts = [text for _, text in client.sent]
+    assert reply_texts.count("'notepad' launched.") == 1
+    assert GENERIC_INVALID_CONFIRMATION_TEXT not in reply_texts
+
+
+def test_same_provider_message_retry_after_consumption_no_duplicate_processing_or_reply(tmp_path):
+    # Milestone 47 P2 adversarial-review correction (MEDIUM-1, section
+    # 8/18/20): the SAME exact provider message redelivered by Meta
+    # AFTER the winning decision has already been fully consumed
+    # (task_pending_confirmation's own row deleted) must still be
+    # recognized via the durable task_confirmation_ingress_receipts row -
+    # DUPLICATE_INGRESS, never NOT_ELIGIBLE, and therefore never a
+    # spurious "no longer valid" reply. This is the exact scenario the
+    # adversarial review found broken before this correction.
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+    task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+
+    try:
+        assert _post(server, _envelope("wamid.p2bpostconsume1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        # No blocking this time - the CONFIRM is fully processed
+        # (recorded, dequeued, executed, task COMPLETED, pending row
+        # deleted) well before the redelivery below.
+        envelope = _envelope("wamid.p2bpostconsumesame", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        assert _post(server, envelope) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and "'notepad' launched." not in (m[1] for m in client.sent):
+            time.sleep(0.02)
+        assert _list_tasks(db_path)[0].state == TaskState.COMPLETED
+        conn = open_writer_connection(db_path)
+        try:
+            pending_row = conn.execute(
+                "SELECT 1 FROM task_pending_confirmation WHERE confirmation_id = ?", (confirmation_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert pending_row is None  # genuinely consumed before the redelivery below
+
+        # Meta redelivers the EXACT SAME provider message, well after
+        # consumption.
+        assert _post(server, envelope) == 200
+        time.sleep(0.2)  # let a (never-expected) spurious reply, if any, arrive
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    assert len(executor_calls.calls) == 1  # never executed twice
+    reply_texts = [text for _, text in client.sent]
+    assert reply_texts.count("'notepad' launched.") == 1
+    assert GENERIC_INVALID_CONFIRMATION_TEXT not in reply_texts
+
+
+def test_same_provider_message_retry_survives_repository_restart(tmp_path):
+    # Milestone 47 P2 adversarial-review correction (section 8-B/18):
+    # the durable receipt must survive not merely task_pending_confirmation's
+    # own row deletion, but a full process/repository restart - proven
+    # here by closing the worker's own connection, stopping the server,
+    # and building an entirely NEW server (fresh worker connection)
+    # against the SAME db_path before redelivering the same message.
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+    task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+
+    envelope = None
+    try:
+        assert _post(server, _envelope("wamid.p2brestart1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        envelope = _envelope("wamid.p2brestartsame", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        assert _post(server, envelope) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and "'notepad' launched." not in (m[1] for m in client.sent):
+            time.sleep(0.02)
+        assert _list_tasks(db_path)[0].state == TaskState.COMPLETED
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+    # "Restart": an entirely new server/worker connection against the
+    # SAME db_path - simulates the process having exited and restarted.
+    server2, client2, db_path2 = _make_server_with_tasks(tmp_path, planner, client=RecordingClient())
+    assert db_path2 == db_path
+    thread2 = threading.Thread(target=server2.start, daemon=True)
+    thread2.start()
+    time.sleep(0.05)
+    try:
+        assert _post(server2, envelope) == 200
+        time.sleep(0.2)  # let a (never-expected) spurious reply, if any, arrive
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server2.stop()
+        thread2.join(timeout=5)
+
+    assert len(executor_calls.calls) == 1  # never executed twice, even across the restart
+    assert client2.sent == []  # no reply of any kind for the post-restart redelivery
+
+
+def test_new_provider_message_manual_replay_after_consumption_gets_generic_invalid(tmp_path):
+    # Milestone 47 P2 adversarial-review correction (section 8-C):
+    # preserves the desired distinction - a genuinely NEW user message
+    # (a fresh provider message_id) containing an already-consumed
+    # confirmation_id must still get the ordinary generic-invalid reply,
+    # never silently accepted or ignored. This is what proves manual
+    # replay and transport redelivery remain distinguishable.
+    planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
+    server, client, db_path = _make_server_with_tasks(tmp_path, planner)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    executor_calls = _FakeSuccessExecutor()
+    import interfaces.whatsapp.task_control as task_control_module
+    real_executor = task_control_module.SafeTaskExecutor
+    task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
+
+    try:
+        assert _post(server, _envelope("wamid.p2bmanual1", _AUTHORIZED_SENDER, text="/task open notepad")) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(client.sent) < 1:
+            time.sleep(0.02)
+        confirmation_id = _confirmation_id_from_message(client.sent[0][1])
+
+        assert _post(
+            server, _envelope("wamid.p2bmanualconfirm", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        ) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and "'notepad' launched." not in (m[1] for m in client.sent):
+            time.sleep(0.02)
+        assert _list_tasks(db_path)[0].state == TaskState.COMPLETED
+
+        # A NEW, distinct provider message (different message_id) - a
+        # genuine manual user replay, never an exact transport
+        # redelivery - containing the SAME, now-consumed confirmation_id.
+        assert _post(
+            server, _envelope("wamid.p2bmanualreplay", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        ) == 200
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and GENERIC_INVALID_CONFIRMATION_TEXT not in (
+            m[1] for m in client.sent
+        ):
+            time.sleep(0.02)
+    finally:
+        task_control_module.SafeTaskExecutor = real_executor
+        server.stop()
+        thread.join(timeout=5)
+
+    assert len(executor_calls.calls) == 1  # never executed twice
+    reply_texts = [text for _, text in client.sent]
+    assert reply_texts.count("'notepad' launched.") == 1
+    assert reply_texts.count(GENERIC_INVALID_CONFIRMATION_TEXT) == 1
 
 
 def test_two_pending_tasks_confirming_one_leaves_the_other_untouched(tmp_path):
@@ -2704,7 +3089,7 @@ def test_two_pending_tasks_confirming_one_leaves_the_other_untouched(tmp_path):
     assert len(executor_calls.calls) == 1
 
 
-def test_duplicate_confirmation_work_items_second_gets_generic_invalid(tmp_path):
+def test_duplicate_confirmation_work_items_second_is_silent_stale_work(tmp_path):
     planner = _FakePlannerProvider([_valid_plan_raw(_task_catalog())])
     server, client, db_path = _make_server_with_tasks(tmp_path, planner)
     thread = threading.Thread(target=server.start, daemon=True)
@@ -2723,26 +3108,40 @@ def test_duplicate_confirmation_work_items_second_gets_generic_invalid(tmp_path)
         confirmation_id = _confirmation_id_from_message(client.sent[0][1])
 
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
-        # Manually enqueue the SAME TaskConfirmationWork twice - proves
-        # durable consume-once semantics independent of transport dedup.
-        work = TaskConfirmationWork(confirmation_id=confirmation_id, decision=ConfirmationDecision.CONFIRM)
+        # Milestone 47 P2: durably record the decision once (exactly like
+        # do_POST's own RECORDED branch would), then manually enqueue the
+        # SAME confirmation_id-only TaskConfirmationWork twice - proves
+        # durable consume-once semantics independent of transport dedup
+        # AND independent of the queue item carrying no decision of its
+        # own (the worker reloads it fresh from the repository each time).
+        # Milestone 47 P2 adversarial-review correction (MEDIUM-1): the
+        # SECOND work item is stale internal work once the first has
+        # consumed the pending confirmation - silent, never a second
+        # "no longer valid" reply.
+        outcome = record_confirmation_decision_durably(
+            open_writer_connection, db_path, confirmation_id, ConfirmationDecision.CONFIRM,
+            required_source=TASK_SOURCE, provider_dedup_key="test-dup-work-items-dedup-key",
+        )
+        assert outcome is ConfirmationDecisionOutcome.RECORDED
+        work = TaskConfirmationWork(confirmation_id=confirmation_id)
         server._queue.put(work)
         server._queue.put(work)
 
-        # Three total messages expected: the original confirmation request,
-        # the first work item's real terminal result, and the second (now
-        # already-consumed) work item's generic invalid reply.
+        # Two total messages expected: the original confirmation request,
+        # and the first work item's real terminal result - the second
+        # (now already-consumed) work item produces nothing.
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(client.sent) < 3:
+        while time.monotonic() < deadline and "'notepad' launched." not in (m[1] for m in client.sent):
             time.sleep(0.02)
+        time.sleep(0.1)  # let a (never-expected) third message, if any, settle before asserting
     finally:
         task_control_module.SafeTaskExecutor = real_executor
         server.stop()
         thread.join(timeout=5)
 
     assert len(executor_calls.calls) == 1
-    assert len(client.sent) == 3
-    assert client.sent[2][1] == "That confirmation is no longer valid."
+    assert len(client.sent) == 2
+    assert client.sent[1][1] == "'notepad' launched."
     assert _list_tasks(db_path)[0].state == TaskState.COMPLETED
 
 
@@ -2765,27 +3164,44 @@ def test_concurrent_confirm_and_reject_worker_serializes_confirm_wins(tmp_path):
         confirmation_id = _confirmation_id_from_message(client.sent[0][1])
 
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
-        # Deterministic ordering: enqueue CONFIRM directly ahead of REJECT
-        # (no wall-clock race) - the single worker thread guarantees
-        # strict FIFO processing, so CONFIRM is guaranteed to be resolved
-        # first.
-        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.CONFIRM))
-        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.REJECT))
+        # Milestone 47 P2: the race is now resolved by DURABLE recording,
+        # not queue order - CONFIRM posted first, over real HTTP, wins the
+        # atomic first-decision-wins write inside
+        # TaskRepository.record_confirmation_decision(). REJECT posted
+        # second for the SAME confirmation_id can never take effect: by
+        # the time its own durable-recording call runs, the row is either
+        # ALREADY_DECIDED (recorded but not yet consumed by the worker -
+        # no reply of its own) or already fully consumed, i.e.
+        # NOT_ELIGIBLE (a generic-invalid reply IS sent) - which of the
+        # two actually happens depends on how far the single worker has
+        # already progressed, a timing detail this test does not control
+        # (see tests/kernel/employee_tasks/test_pending_confirmation.py
+        # for the deterministic, worker-free proof of ALREADY_DECIDED
+        # specifically). What this test DOES assert is deterministic:
+        # CONFIRM is the one and only decision that ever takes effect.
+        assert _post(
+            server, _envelope("wamid.p2brace1a", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        ) == 200
+        assert _post(
+            server, _envelope("wamid.p2brace1b", _AUTHORIZED_SENDER, text=f"REJECT {confirmation_id}")
+        ) == 200
 
-        # Three total messages: confirmation request, CONFIRM's real
-        # result, REJECT's generic invalid reply.
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(client.sent) < 3:
+        while time.monotonic() < deadline and len(client.sent) < 2:
             time.sleep(0.02)
+        time.sleep(0.1)  # let REJECT's own (possibly still in-flight) reply, if any, settle
     finally:
         task_control_module.SafeTaskExecutor = real_executor
         server.stop()
         thread.join(timeout=5)
 
-    assert len(executor_calls.calls) == 1  # CONFIRM executed
+    assert len(executor_calls.calls) == 1  # CONFIRM executed - exactly once
     assert client.sent[1][1] == "'notepad' launched."  # CONFIRM's real result
-    assert client.sent[2][1] == "That confirmation is no longer valid."  # REJECT lost the race
     assert _list_tasks(db_path)[0].state == TaskState.COMPLETED  # never CANCELLED
+    # Any further message can only ever be REJECT's own generic-invalid
+    # reply - never a real cancellation.
+    for _, text in client.sent[2:]:
+        assert text == GENERIC_INVALID_CONFIRMATION_TEXT
 
 
 def test_concurrent_confirm_and_reject_worker_serializes_reject_wins(tmp_path):
@@ -2807,14 +3223,24 @@ def test_concurrent_confirm_and_reject_worker_serializes_reject_wins(tmp_path):
         confirmation_id = _confirmation_id_from_message(client.sent[0][1])
 
         task_control_module.SafeTaskExecutor = lambda *a, **k: executor_calls
-        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.REJECT))
-        server._queue.put(TaskConfirmationWork(confirmation_id, ConfirmationDecision.CONFIRM))
+        # Milestone 47 P2: REJECT posted first, over real HTTP, wins the
+        # durable first-decision-wins write this time. CONFIRM posted
+        # second for the SAME confirmation_id can never take effect -
+        # depending on worker timing it lands on either ALREADY_DECIDED
+        # (no reply) or NOT_ELIGIBLE (a generic-invalid reply) - see the
+        # confirm_wins test above for the full explanation of why this
+        # test does not assert on which of the two occurs.
+        assert _post(
+            server, _envelope("wamid.p2brace2a", _AUTHORIZED_SENDER, text=f"REJECT {confirmation_id}")
+        ) == 200
+        assert _post(
+            server, _envelope("wamid.p2brace2b", _AUTHORIZED_SENDER, text=f"CONFIRM {confirmation_id}")
+        ) == 200
 
-        # Three total messages: confirmation request, REJECT's real
-        # cancellation, CONFIRM's generic invalid reply.
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(client.sent) < 3:
+        while time.monotonic() < deadline and len(client.sent) < 2:
             time.sleep(0.02)
+        time.sleep(0.1)  # let CONFIRM's own (possibly still in-flight) reply, if any, settle
     finally:
         task_control_module.SafeTaskExecutor = real_executor
         server.stop()
@@ -2822,8 +3248,11 @@ def test_concurrent_confirm_and_reject_worker_serializes_reject_wins(tmp_path):
 
     assert len(executor_calls.calls) == 0  # CONFIRM never executed - REJECT already won
     assert client.sent[1][1] == "Task cancelled."  # REJECT's real result
-    assert client.sent[2][1] == "That confirmation is no longer valid."  # CONFIRM lost the race
     assert _list_tasks(db_path)[0].state == TaskState.CANCELLED  # never COMPLETED
+    # Any further message can only ever be CONFIRM's own generic-invalid
+    # reply - never a real execution.
+    for _, text in client.sent[2:]:
+        assert text == GENERIC_INVALID_CONFIRMATION_TEXT
 
 
 def test_http_thread_never_executes_confirm_action(tmp_path):
@@ -2865,3 +3294,300 @@ def test_http_thread_never_executes_confirm_action(tmp_path):
         task_control_module.SafeTaskExecutor = real_executor
         server.stop()
         thread.join(timeout=5)
+
+
+# --- Milestone 47 P1: recovery-checkpoint scheduling fairness --------------
+
+
+class _RecordingRecoveryHandler:
+    """A minimal MessageHandler double: records every dispatched task and
+    every recovery-checkpoint invocation, each with a monotonic timestamp,
+    so a test can assert on interleaving/timing without depending on real
+    task-control/repository plumbing."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.handled: list[float] = []
+        self.recovery_calls: list[float] = []
+
+    def handle_task(self, task) -> None:
+        with self._lock:
+            self.handled.append(time.monotonic())
+
+    def run_recovery_checkpoint(self) -> None:
+        with self._lock:
+            self.recovery_calls.append(time.monotonic())
+
+
+def test_recovery_checkpoint_runs_even_under_continuous_queue_traffic():
+    """The liveness proof: a naive "only check when the queue goes idle"
+    design could starve recovery forever under continuous traffic - the
+    monotonic-deadline scheduling in _run_worker() must not."""
+
+    whatsapp_config = _make_whatsapp_config()
+    handler = _RecordingRecoveryHandler()
+    server = WhatsAppServer(whatsapp_config, handler, recovery_interval_seconds=0.1)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    stop_feeding = threading.Event()
+
+    def feed():
+        while not stop_feeding.is_set():
+            try:
+                server._queue.put_nowait(object())
+            except queue.Full:
+                pass
+            time.sleep(0.005)
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and len(handler.recovery_calls) == 0:
+            time.sleep(0.02)
+        assert len(handler.recovery_calls) >= 1, (
+            "recovery checkpoint never ran despite continuous queue traffic"
+        )
+        # Normal traffic kept progressing concurrently - recovery did not
+        # monopolize the worker thread either.
+        assert len(handler.handled) > 0
+    finally:
+        stop_feeding.set()
+        feeder.join(timeout=2)
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_recovery_checkpoint_never_blocks_normal_queue_for_long():
+    """Recovery is bounded per checkpoint - normal queue items keep being
+    processed at a healthy rate even while recovery checkpoints keep
+    firing on a short interval."""
+
+    whatsapp_config = _make_whatsapp_config()
+    handler = _RecordingRecoveryHandler()
+    server = WhatsAppServer(
+        whatsapp_config, handler, queue_capacity=64, recovery_interval_seconds=0.05
+    )
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    try:
+        for _ in range(50):
+            server._queue.put_nowait(object())
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and len(handler.handled) < 50:
+            time.sleep(0.02)
+        assert len(handler.handled) == 50, "normal queue items were not all processed promptly"
+    finally:
+        server.stop()
+        thread.join(timeout=5)
+
+
+def test_stop_remains_prompt_despite_a_long_recovery_interval():
+    """A long recovery_interval_seconds (never due during this test) must
+    never delay shutdown - _STOP is dequeued and honored with the same
+    priority as any other item, never gated behind the recovery deadline."""
+
+    whatsapp_config = _make_whatsapp_config()
+    handler = _RecordingRecoveryHandler()
+    server = WhatsAppServer(whatsapp_config, handler, recovery_interval_seconds=60.0)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    started = time.monotonic()
+    server.stop()
+    elapsed = time.monotonic() - started
+    thread.join(timeout=5)
+
+    assert elapsed < 2.0, f"stop() took {elapsed:.2f}s - should be prompt regardless of recovery_interval_seconds"
+    assert not thread.is_alive()
+
+
+# --- Milestone 47 P1: runtime-lock release ordering -------------------------
+
+
+class _SpyRuntimeLock:
+    """Records release() calls without touching any real OS resource -
+    used to prove WhatsAppServer.stop()'s exact release-ordering contract
+    without needing a genuine cross-process lock file for this specific
+    ordering proof (see tests/kernel/employee_tasks/test_runtime_lock.py
+    for the real OS-level guarantees themselves)."""
+
+    def __init__(self):
+        self.release_calls = 0
+
+    def release(self) -> None:
+        self.release_calls += 1
+
+
+def test_stop_releases_runtime_lock_after_clean_worker_join():
+    whatsapp_config = _make_whatsapp_config()
+    handler = _RecordingRecoveryHandler()
+    lock = _SpyRuntimeLock()
+    server = WhatsAppServer(whatsapp_config, handler, runtime_lock=lock)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    server.stop()
+    thread.join(timeout=5)
+
+    assert lock.release_calls == 1
+
+
+def test_stop_does_not_release_runtime_lock_while_worker_still_active(monkeypatch):
+    """The Milestone 47 P1 analogue of the existing H1 worker-connection
+    ownership regression test: a runtime-ownership lock must never be
+    released while the worker thread might still be touching the task
+    database - releasing early would let a second runtime start
+    reconciling the same database while this process's worker is still
+    live, exactly the hazard database-scoped ownership exists to
+    prevent."""
+
+    import interfaces.whatsapp.server as server_module
+
+    monkeypatch.setattr(server_module, "_WORKER_JOIN_TIMEOUT_SECONDS", 0.3)
+
+    class _BlockingHandler:
+        def __init__(self):
+            self.started = threading.Event()
+            self._release = threading.Event()
+
+        def handle_task(self, task):
+            self.started.set()
+            self._release.wait(timeout=5)
+
+        def run_recovery_checkpoint(self):
+            pass
+
+        def release(self):
+            self._release.set()
+
+    whatsapp_config = _make_whatsapp_config()
+    handler = _BlockingHandler()
+    lock = _SpyRuntimeLock()
+    server = server_module.WhatsAppServer(whatsapp_config, handler, runtime_lock=lock)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+
+    server._queue.put(object())
+
+    try:
+        assert handler.started.wait(timeout=2), "worker never reached the blocking handler call"
+
+        server.stop()
+        assert lock.release_calls == 0, "stop() released the runtime lock while the worker was still active"
+
+        # Unblock the worker so the underlying OS thread can finish
+        # cleanly - stop() itself was already called once and already gave
+        # up on releasing the lock. By design, it never retries release
+        # after a timed-out join (see stop()'s own docstring): that case
+        # deliberately relies on eventual OS-level process-exit cleanup,
+        # never a second, later Python-level release from inside this
+        # process. The lock must therefore remain unreleased for the rest
+        # of this test, even once the worker thread has genuinely finished
+        # on its own.
+        handler.release()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert lock.release_calls == 0, (
+            "the lock must never be released automatically just because the worker later finished - "
+            "only stop() itself releases it, and only on a join that succeeds"
+        )
+    finally:
+        handler.release()
+        thread.join(timeout=5)
+
+
+def test_stop_does_not_release_runtime_ownership_while_a_request_thread_is_still_active(monkeypatch):
+    """The request-thread analogue of
+    test_stop_does_not_release_runtime_lock_while_worker_still_active above:
+    _QuiescentThreadingHTTPServer's explicit daemon_threads=False/
+    block_on_close=True (Milestone 47 P1 adversarial-review correction
+    MEDIUM-3) must make server_close() itself block until a request thread
+    still inside accept_task_message()'s durable write has finished - so
+    stop() can never reach runtime-lock release while that request thread
+    might still be touching the task database. No real Meta/WhatsApp
+    network access; only a monkeypatched accept_task_message() blocked on a
+    threading.Event, never a fragile sleep-based race."""
+
+    import interfaces.whatsapp.server as server_module
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_accept_task_message(*args, **kwargs):
+        started.set()
+        release.wait(timeout=5)
+        from interfaces.whatsapp.task_control import DurableAcceptanceFailed
+
+        raise DurableAcceptanceFailed("blocked-for-test")
+
+    monkeypatch.setattr(server_module, "accept_task_message", _blocking_accept_task_message)
+
+    whatsapp_config = _make_whatsapp_config()
+    handler = _RecordingRecoveryHandler()
+    lock = _SpyRuntimeLock()
+    server = server_module.WhatsAppServer(
+        whatsapp_config, handler, runtime_lock=lock, task_db_path=object()
+    )
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    time.sleep(0.05)
+
+    request_result: list[int] = []
+
+    def _send_request():
+        request_result.append(
+            _post(server, _envelope("wamid.med3.1", _AUTHORIZED_SENDER, text="/task open notepad"))
+        )
+
+    request_thread = threading.Thread(target=_send_request, daemon=True)
+    request_thread.start()
+
+    try:
+        assert started.wait(timeout=2), "request thread never reached accept_task_message()"
+
+        stop_result: list[BaseException] = []
+
+        def _run_stop():
+            try:
+                server.stop()
+            except BaseException as exc:  # noqa: BLE001 - captured for the assert below
+                stop_result.append(exc)
+
+        stop_thread = threading.Thread(target=_run_stop, daemon=True)
+        stop_thread.start()
+
+        # stop()'s server_close() must itself be blocked waiting on the
+        # still-active request thread - so the lock must not be released
+        # yet, no matter how long we wait here.
+        time.sleep(0.2)
+        assert lock.release_calls == 0, (
+            "stop() released runtime ownership while a request thread was still "
+            "inside accept_task_message() - server_close() must block on it first"
+        )
+        assert stop_thread.is_alive(), "stop() returned before the request thread finished"
+
+        release.set()
+        request_thread.join(timeout=5)
+        assert not request_thread.is_alive()
+        assert request_result == [503]
+
+        stop_thread.join(timeout=5)
+        assert not stop_thread.is_alive()
+        assert not stop_result
+
+        server_thread.join(timeout=5)
+        assert not server_thread.is_alive()
+        assert lock.release_calls == 1
+    finally:
+        release.set()
+        request_thread.join(timeout=5)
+        server_thread.join(timeout=5)

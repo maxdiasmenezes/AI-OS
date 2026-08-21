@@ -270,29 +270,72 @@ acknowledgement on top of that.
 - For **`/task`**: durable acceptance happens *before* this interface
   ever returns HTTP success, so the request is never lost as an
   unidentified/unrecorded message - the `TaskRecord` itself always
-  survives a crash at that point. This does **not** mean M46 guarantees
-  automatic pickup afterward: if the process dies after that HTTP success
-  but before the worker actually processes the queued `TaskExecutionWork`,
-  the task can remain `CREATED` indefinitely - nothing in M46 scans for
-  and automatically re-dispatches an outstanding `CREATED` task on
-  restart. Recovery, if it happens at all today, requires an external
-  trigger: a retried/redelivered `/task` with the same provider message ID
-  resolves to the same durable row and (since it is still `CREATED`)
-  re-enqueues it. Genuine restart reconciliation - scanning for and
-  re-dispatching stuck `CREATED` (or uncertain `in_progress`) work without
-  requiring an external retry - is explicitly Milestone 47 scope, not
-  implemented here.
-- For **`CONFIRM`/`REJECT`**: HTTP `200` means the command was accepted
-  onto the bounded, **in-memory** worker queue - it is **not** a
-  durable-decision acknowledgement, and this interface makes **no claim**
-  that Meta will retry/redeliver the webhook after a `200` (nor does
-  correctness depend on that ever happening). If the process crashes
-  between that response and the worker actually consuming the queued
-  item, the decision itself is lost, but **nothing durable was ever
-  mutated** - the pending confirmation row is untouched, no action was
-  claimed, and none was executed. The user (or an operator) can always
-  manually resend the identical command while it remains pending, subject
-  to the same expiry rule described next.
+  survives a crash at that point. If the process dies after that HTTP
+  success but before the worker actually processes the queued
+  `TaskExecutionWork`, the queued item itself does not survive the crash
+  (it only ever existed in memory) and the task can sit `CREATED` (or
+  `planning`/`ready`/`running`) durably, with nothing left to process
+  it - but, as of Milestone 47 P3, this is no longer indefinite and no
+  longer requires an external re-dispatch trigger: a periodic, bounded
+  recovery checkpoint (`run_task_state_recovery_checkpoint()`) discovers
+  and resumes a stranded task automatically, through the exact same
+  `dispatch_task_work()` path a normal dispatch uses - never a separate
+  recovery-specific execution path or executor. This discovery is based
+  entirely on durable database state, not on inspecting the worker's own
+  in-memory queue - outside the pure post-crash case just described, an
+  ordinary, currently-queued `TaskExecutionWork` item for the SAME task
+  may legitimately coexist with a P3-eligible row (see "What this
+  interface does not guarantee" below for why that is safe, not a race).
+  A task stranded mid-`planning` is
+  explicitly re-armed (`planning -> created`) for a genuinely fresh
+  planning attempt, never assuming the interrupted model call's outcome.
+  A retried/redelivered `/task` with the same provider message ID still
+  resolves to the same durable row and re-enqueues it too, exactly as
+  before - the two mechanisms coexist safely (`dispatch_task_work()` is
+  safe to call more than once for the same task). A `running` task whose
+  step was left `in_progress` by a crash mid-action is discovered the
+  same way, but is deliberately **never retried**: the engine already
+  treats an in-progress step as permanently uncertain and fails the task
+  closed (`step_execution_uncertain`) rather than ever calling the action
+  handler again - see "What this interface does not guarantee" below.
+- For **`CONFIRM`/`REJECT`**: as of Milestone 47 P2, an **accepted, new**
+  command's decision is durably recorded *before* this interface may
+  ever return HTTP `200` for it - `record_confirmation_decision()`
+  atomically checks source/state/first-decision-wins and commits the
+  decision in one transaction. This does not mean every `200` this
+  endpoint ever returns for a `CONFIRM`/`REJECT` represents a fresh
+  recording happening on that exact request - see `DUPLICATE_INGRESS`
+  just below, which also returns `200`, precisely because the decision
+  was *already* durably recorded by an earlier request, not because this
+  one recorded anything new. The in-memory worker queue item carries
+  only the confirmation id, never the decision itself - the worker always
+  reloads the durable decision fresh, so the queue is never authority,
+  and a crash between a genuine recording's own HTTP `200` and worker
+  pickup no longer loses the decision: a periodic, bounded recovery
+  checkpoint (`run_confirmation_decision_recovery_checkpoint()`) picks it
+  up and processes it, with capped-exponential backoff if a recovery
+  attempt itself fails, so one repeatedly-failing decision can never
+  permanently block a later one. An exact redelivery of the SAME
+  provider message - even one that arrives after the original decision
+  has already been fully consumed and its own pending-confirmation row
+  deleted - is durably recognized and safely ignored (`DUPLICATE_INGRESS`:
+  HTTP `200`, no re-enqueue, no reply, no further mutation), via a
+  separate, restart-surviving ingress receipt keyed on a hashed provider
+  message id - never the raw id itself. This is distinct from a genuine
+  **manual resend**: the user (or an operator) re-sending the identical
+  `CONFIRM`/`REJECT` text arrives as a NEW provider message (its own,
+  different provider message id) and is therefore never itself classified
+  `DUPLICATE_INGRESS` - it is evaluated fresh against whatever the durable
+  confirmation state actually is right now, returning `RECORDED` (a
+  genuine, first-ever recording, with a real effect - e.g. if the original
+  attempt never actually reached this interface at all), `ALREADY_DECIDED`
+  (a true no-op - the original attempt already won, whether or not it was
+  ever visibly acknowledged), or `NOT_ELIGIBLE` (if the task has moved on)
+  - never a silent DUPLICATE_INGRESS-style ignore in any of these three
+  cases. A manual resend remains available while the confirmation is
+  still pending, subject to the same expiry rule described next, but is
+  now simply redundant with automatic recovery for the crash-window case
+  specifically, not the only way forward for it.
 - **`CONFIRM` vs `REJECT` expiry is not symmetric.** A `CONFIRM` resent
   after the confirmation's own TTL (120 seconds) has passed reaches the
   engine's existing expiry check and fails the task closed
@@ -301,22 +344,33 @@ acknowledgement on top of that.
   because denial never authorizes or executes anything, so honoring it
   late is safe.
 
-### What Milestone 46 does **not** guarantee
+### What this interface does not guarantee
+
+Milestone 47 (P1-P3) closed most of what Milestone 46 originally stated as
+an open scope boundary here - durable confirmation-decision recording,
+provider-message redelivery deduplication, and stranded-task restart
+recovery, all described above. What remains true, deliberately, even
+after that work:
 
 - No exactly-once guarantee for an external action's side effects across
-  a process crash.
-- No exactly-once guarantee for outbound lifecycle message delivery.
-- No exactly-once guarantee for confirmation-*command* processing across
-  a process crash (see the crash-window language above - a genuinely
-  lost decision requires a manual resend; nothing is corrupted, but
-  nothing auto-recovers it either).
-- No automatic restart reconciliation, and no recovery of a step left in
-  an uncertain `in_progress` state by a crash mid-execution.
-- No outbound-delivery retry ledger of any kind.
-
-These are Milestone 47's scope (persistence recovery/reconciliation),
-where applicable - Milestone 46 states these boundaries explicitly rather
-than silently assuming them away.
+  a process crash, ever. A crash after a step is claimed but before or
+  during the actual external call is genuinely uncertain, and is always
+  resolved by failing the task closed - never by inferring success or
+  failure, and never by retrying the action.
+- No exactly-once guarantee for outbound lifecycle message delivery -
+  the outbox retry mechanism (Milestone 47 P1) is at-least-once, so a
+  duplicate WhatsApp message around a crash boundary remains possible.
+- The Milestone 47 P3 recovery backoff governs its own discovery
+  ordering only - it is not a global execution lock. A legitimate,
+  already-queued `TaskExecutionWork` item may still process a
+  currently-backed-off task sooner than its own next scheduled recovery
+  attempt; this is intentional, not a gap.
+- Single-worker recovery may be delayed by one long-running task,
+  network call, or model call ahead of it in the same checkpoint.
+- This remains a personal-scale architecture - no generalized scheduler,
+  no multi-worker recovery, and no exactly-once delivery ledger of any
+  kind (the outbox retry mechanism above is a bounded at-least-once
+  redelivery schedule, not an exactly-once guarantee).
 
 ## Message handling
 

@@ -1,9 +1,13 @@
 """Tests for kernel/employee_tasks/repository.py's durable confirmation
 API (Milestone 42 P2): propose_confirmation(), get_pending_confirmation(),
 consume_confirmation_and_claim_step(), deny_confirmation(),
-fail_pending_confirmation(), fail_running_step()."""
+fail_pending_confirmation(), fail_running_step(). Milestone 47 P2 adds
+record_confirmation_decision()/find_recoverable_confirmation_decision()."""
 
+import itertools
+import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -11,9 +15,13 @@ from kernel.employee_tasks.db import open_writer_connection
 from kernel.employee_tasks.repository import TaskRepository
 from kernel.employee_tasks.types import (
     MAX_CONFIRMATION_ID_CHARS,
+    ConfirmationDecision,
+    ConfirmationDecisionOutcome,
     ConfirmationExpiredError,
     ConfirmationMismatchError,
     InvalidTransitionError,
+    LifecycleEventKind,
+    LifecycleEventPayloadError,
     NoPendingConfirmationError,
     StepAlreadyClaimedError,
     StepNotInProgressError,
@@ -22,6 +30,8 @@ from kernel.employee_tasks.types import (
     TaskInputTooLargeError,
     TaskState,
     TaskStorageCorruptError,
+    deserialize_confirmation_required_payload,
+    format_utc_timestamp,
 )
 
 _STATE_PATH = {
@@ -728,3 +738,918 @@ def test_consume_confirmation_accepts_confirmation_id_at_exactly_max_length(repo
         task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
     )
     assert result.state == TaskState.RUNNING
+
+
+# --- Milestone 47 P1: atomic lifecycle-outbox event creation ---------------
+
+
+def test_propose_confirmation_atomically_creates_confirmation_required_event(repo, task):
+    waiting = repo.propose_confirmation(
+        task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120
+    )
+    pending = repo.get_pending_confirmation(task.task_id)
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, waiting.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.CONFIRMATION_REQUIRED
+    assert event.channel == "whatsapp"
+    assert event.delivered_at is None
+    assert event.attempt_count == 0
+
+    payload = deserialize_confirmation_required_payload(event.payload_json)
+    assert payload.confirmation_id == pending.confirmation_id
+    assert payload.action_name == "repository_backup"
+    assert payload.resource_key == "ai_os"
+
+
+def test_consume_confirmation_and_claim_step_creates_no_outbox_event(repo, task):
+    """RUNNING is never a deliverable target - approval continuing
+    execution produces no standalone WhatsApp acknowledgement (see
+    interfaces/whatsapp/task_control.py's own docstring on why)."""
+
+    waiting = repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+    running = repo.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+
+    assert repo.get_outbox_event_for_task_version(task.task_id, running.version) is None
+    # The earlier CONFIRMATION_REQUIRED event is untouched by this call.
+    assert repo.get_outbox_event_for_task_version(task.task_id, waiting.version) is not None
+
+
+def test_deny_confirmation_atomically_creates_task_cancelled_event(repo, task):
+    repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+
+    cancelled = repo.deny_confirmation(task.task_id, pending.confirmation_id)
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, cancelled.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_CANCELLED
+    assert event.payload_json is None
+    assert event.channel == "whatsapp"
+
+
+def test_fail_pending_confirmation_atomically_creates_task_failed_event(repo, task):
+    repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+
+    failed = repo.fail_pending_confirmation(
+        task.task_id, pending.confirmation_id, "confirmation_expired", "The confirmation window expired."
+    )
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, failed.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_FAILED
+    assert event.payload_json is None
+
+
+def test_fail_running_step_atomically_creates_task_failed_event(repo, task):
+    repo.claim_step(task.task_id, 1)
+
+    failed = repo.fail_running_step(task.task_id, 1, "failed", "That action could not be completed.")
+
+    event = repo.get_outbox_event_for_task_version(task.task_id, failed.version)
+    assert event is not None
+    assert event.event_kind is LifecycleEventKind.TASK_FAILED
+    assert event.payload_json is None
+    assert event.channel == "whatsapp"
+
+
+def test_fail_running_step_task_already_terminal_creates_no_second_event(repo, task):
+    """When a concurrent writer already moved the task to a terminal state
+    before fail_running_step()'s own UPDATE runs, TaskAlreadyTerminalError
+    is raised BEFORE this method's own task_transitions/outbox insert -
+    the terminal state that actually won already has its own event from
+    whatever produced IT; this call must not create a second, spurious
+    one."""
+
+    repo.claim_step(task.task_id, 1)
+    cancelled = repo.mark_cancelled(task.task_id, TaskState.RUNNING)
+    winning_event = repo.get_outbox_event_for_task_version(task.task_id, cancelled.version)
+    assert winning_event is not None
+
+    with pytest.raises(TaskAlreadyTerminalError):
+        repo.fail_running_step(task.task_id, 1, "failed", "too late")
+
+    # Still exactly the one event the winning CANCELLED transition created -
+    # fail_running_step()'s own failed attempt never got far enough to
+    # insert a second, spurious one.
+    assert repo.get_outbox_event_for_task_version(task.task_id, cancelled.version) == winning_event
+
+
+def test_historical_confirmation_event_survives_being_replaced_by_a_later_round(repo, task):
+    """The central reconstruction-safety proof (Milestone 47 design): round
+    1's own confirmation_required event must remain fully intact and
+    correctly rendered even after its pending row is consumed and a
+    SECOND, DIFFERENT confirmation round is proposed for the same task -
+    never silently overwritten, never reinterpreted as round 2's data."""
+
+    round1 = repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending1 = repo.get_pending_confirmation(task.task_id)
+    round1_version = round1.version
+
+    repo.consume_confirmation_and_claim_step(
+        task.task_id, pending1.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    repo.mark_step_succeeded(task.task_id, 1, '{"ok": true}')
+
+    # A fresh RUNNING task with a second sensitive step proposes a second,
+    # DIFFERENT confirmation round.
+    round2 = repo.propose_confirmation(task.task_id, 2, "open_application", "notepad", ttl_seconds=120)
+    pending2 = repo.get_pending_confirmation(task.task_id)
+    assert pending2.confirmation_id != pending1.confirmation_id
+
+    # Round 1's historical event is untouched by round 2 ever happening.
+    event1 = repo.get_outbox_event_for_task_version(task.task_id, round1_version)
+    payload1 = deserialize_confirmation_required_payload(event1.payload_json)
+    assert payload1.confirmation_id == pending1.confirmation_id
+    assert payload1.action_name == "repository_backup"
+    assert payload1.resource_key == "ai_os"
+
+    event2 = repo.get_outbox_event_for_task_version(task.task_id, round2.version)
+    payload2 = deserialize_confirmation_required_payload(event2.payload_json)
+    assert payload2.confirmation_id == pending2.confirmation_id
+    assert payload2.action_name == "open_application"
+    assert payload2.resource_key == "notepad"
+
+    assert event1.event_id != event2.event_id
+    assert event1.transition_id != event2.transition_id
+
+
+def test_outbox_insert_failure_rolls_back_the_whole_confirmation_proposal(repo, task, monkeypatch):
+    """The atomicity invariant, adversarially proven: if the outbox insert
+    step itself fails (here, forcing serialize_confirmation_required_payload()
+    to raise), NOTHING commits - no state transition, no task_pending_confirmation
+    row, no task_transitions row, no outbox row. Either everything commits
+    together, or nothing does."""
+
+    import kernel.employee_tasks.repository as repository_module
+
+    def _raising_serializer(payload):
+        raise LifecycleEventPayloadError("forced failure for this test")
+
+    monkeypatch.setattr(repository_module, "serialize_confirmation_required_payload", _raising_serializer)
+
+    with pytest.raises(LifecycleEventPayloadError):
+        repo.propose_confirmation(task.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+
+    reloaded = repo.get_task(task.task_id)
+    assert reloaded.state == TaskState.RUNNING  # never moved to WAITING_FOR_CONFIRMATION
+    assert reloaded.version == task.version  # no version bump at all
+    assert repo.get_pending_confirmation(task.task_id) is None
+    assert repo.get_step_progress(task.task_id, 1) is None  # never claimed either
+
+
+# =============================================================================
+# Milestone 47 P2: record_confirmation_decision() / find_recoverable_confirmation_decision()
+# =============================================================================
+
+
+def _proposed(repo, request_text="back up the repository", source="whatsapp"):
+    """A task in WAITING_FOR_CONFIRMATION with one real pending
+    confirmation - the exact shape record_confirmation_decision() needs.
+    Returns (task_record, pending_confirmation)."""
+
+    record = repo.create_task(request_text, source)
+    _drive_to_state(repo, record.task_id, "running")
+    task = repo.propose_confirmation(record.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo.get_pending_confirmation(task.task_id)
+    return task, pending
+
+
+_dedup_key_counter = itertools.count()
+
+
+def _dk() -> str:
+    """A fresh, unique provider_dedup_key for each call - representing a
+    DIFFERENT provider message each time, exactly like two independently
+    posted CONFIRM/REJECT messages racing for the same confirmation_id
+    would each carry their own distinct provider message ID. Tests that
+    specifically need the SAME dedup key (proving DUPLICATE_INGRESS for
+    an exact provider-message redelivery) pass one explicitly instead."""
+
+    return f"test-provider-dedup-{next(_dedup_key_counter)}"
+
+
+# --- A/B/C/D: first-decision-wins, all four orderings -----------------------
+
+
+def test_confirm_then_confirm_first_recorded_second_already_decided(repo):
+    task, pending = _proposed(repo)
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    assert outcome2 is ConfirmationDecisionOutcome.ALREADY_DECIDED
+    final = repo.get_pending_confirmation(task.task_id)
+    assert final.decision is ConfirmationDecision.CONFIRM
+    assert final.decided_at is not None
+
+
+def test_reject_then_reject_first_recorded_second_already_decided(repo):
+    task, pending = _proposed(repo)
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    assert outcome2 is ConfirmationDecisionOutcome.ALREADY_DECIDED
+    final = repo.get_pending_confirmation(task.task_id)
+    assert final.decision is ConfirmationDecision.REJECT
+
+
+def test_confirm_then_reject_confirm_wins_reject_cannot_overwrite(repo):
+    task, pending = _proposed(repo)
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    assert outcome2 is ConfirmationDecisionOutcome.ALREADY_DECIDED
+    # The durable value is still CONFIRM - REJECT never overwrote it.
+    assert repo.get_pending_confirmation(task.task_id).decision is ConfirmationDecision.CONFIRM
+
+
+def test_reject_then_confirm_reject_wins_confirm_cannot_overwrite(repo):
+    task, pending = _proposed(repo)
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    assert outcome2 is ConfirmationDecisionOutcome.ALREADY_DECIDED
+    assert repo.get_pending_confirmation(task.task_id).decision is ConfirmationDecision.REJECT
+
+
+# --- E: concurrent two-repository race ---------------------------------------
+
+
+def test_concurrent_two_repository_confirm_reject_race_exactly_one_wins(db_path):
+    conn_a = open_writer_connection(db_path)
+    conn_b = open_writer_connection(db_path)
+    repo_a = TaskRepository(conn_a)
+    repo_b = TaskRepository(conn_b)
+
+    record = repo_a.create_task("back up the repository", "whatsapp")
+    _drive_to_state(repo_a, record.task_id, "running")
+    repo_a.propose_confirmation(record.task_id, 1, "repository_backup", "ai_os", ttl_seconds=120)
+    pending = repo_a.get_pending_confirmation(record.task_id)
+
+    outcomes = {}
+
+    def attempt(repo, decision, tag, dedup_key):
+        outcomes[tag] = repo.record_confirmation_decision(
+            pending.confirmation_id, decision, required_source="whatsapp",
+            provider_dedup_key=dedup_key,
+        )
+
+    t_a = threading.Thread(
+        target=attempt, args=(repo_a, ConfirmationDecision.CONFIRM, "a", _dk())
+    )
+    t_b = threading.Thread(
+        target=attempt, args=(repo_b, ConfirmationDecision.REJECT, "b", _dk())
+    )
+    t_a.start()
+    t_b.start()
+    t_a.join()
+    t_b.join()
+
+    # Exactly one of the two transactionally won.
+    assert sorted(o.value for o in outcomes.values()) == ["already_decided", "recorded"]
+    winner_decision = (
+        ConfirmationDecision.CONFIRM
+        if outcomes["a"] is ConfirmationDecisionOutcome.RECORDED
+        else ConfirmationDecision.REJECT
+    )
+    final = repo_a.get_pending_confirmation(record.task_id)
+    assert final.decision is winner_decision
+
+    conn_a.close()
+    conn_b.close()
+
+
+# --- I/J/K: eligibility gate - never a transient write either ---------------
+
+
+def test_wrong_source_decision_never_written(repo):
+    task, pending = _proposed(repo, source="whatsapp")
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="sms",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome is ConfirmationDecisionOutcome.NOT_ELIGIBLE
+    assert repo.get_pending_confirmation(task.task_id).decision is None
+
+
+def test_wrong_source_never_creates_a_winning_receipt(repo):
+    # Milestone 47 P2 adversarial-review correction (section 9/18): the
+    # wrong-source eligibility check happens BEFORE the receipt would ever
+    # be written - a wrong-source attempt must never leave behind a
+    # durable receipt any later, correctly-sourced attempt could collide
+    # with or be confused by.
+    task, pending = _proposed(repo, source="whatsapp")
+    dedup_key = _dk()
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="sms",
+        provider_dedup_key=dedup_key,
+    )
+
+    assert outcome is ConfirmationDecisionOutcome.NOT_ELIGIBLE
+    receipt = repo._conn.execute(
+        "SELECT 1 FROM task_confirmation_ingress_receipts WHERE dedup_key = ?", (dedup_key,)
+    ).fetchone()
+    assert receipt is None
+
+    # The SAME dedup_key, now correctly sourced, can still win - proving
+    # the earlier wrong-source attempt left nothing behind to block it.
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+    assert outcome2 is ConfirmationDecisionOutcome.RECORDED
+
+
+def test_wrong_state_decision_never_written(repo, task):
+    # `task` (module fixture) is RUNNING, never proposed - no pending
+    # confirmation exists for it at all, so any confirmation_id attempted
+    # against it is definitionally NOT_ELIGIBLE. Prove the wrong-STATE
+    # case specifically: a task whose pending confirmation was already
+    # consumed (state moved back to RUNNING) but whose OLD confirmation_id
+    # is replayed.
+    proposed, pending = _proposed(repo, request_text="a different task")
+    repo.consume_confirmation_and_claim_step(
+        proposed.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    assert repo.get_task(proposed.task_id).state == TaskState.RUNNING
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome is ConfirmationDecisionOutcome.NOT_ELIGIBLE
+    # The row is already gone (consumed) - nothing to check decision on,
+    # which is itself the proof nothing was written.
+    assert repo.get_pending_confirmation(proposed.task_id) is None
+
+
+def test_already_consumed_token_never_gets_a_decision(repo):
+    task, pending = _proposed(repo)
+    repo.deny_confirmation(task.task_id, pending.confirmation_id)
+    assert repo.get_pending_confirmation(task.task_id) is None
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome is ConfirmationDecisionOutcome.NOT_ELIGIBLE
+    assert repo.get_task(task.task_id).state == TaskState.CANCELLED  # unchanged
+
+
+# --- L/M: expiry semantics - unchanged by durable recording -----------------
+
+
+def test_expired_confirm_durable_record_allowed_but_consumption_fails_closed(repo):
+    task, pending = _proposed(repo)
+    repo._conn.execute(
+        "UPDATE task_pending_confirmation SET expires_at = ? WHERE confirmation_id = ?",
+        ("2020-01-01T00:00:00+00:00", pending.confirmation_id),
+    )
+    repo._conn.commit()
+
+    # The durable decision itself may still be recorded after expiry -
+    # record_confirmation_decision() never checks expires_at at all.
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+    assert repo.get_pending_confirmation(task.task_id).decision is ConfirmationDecision.CONFIRM
+
+    # Consumption remains the sole authority for expiry semantics -
+    # unchanged by P2: an expired CONFIRM still fails closed here.
+    with pytest.raises(ConfirmationExpiredError):
+        repo.consume_confirmation_and_claim_step(
+            task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+        )
+    # Never mutated by the failed attempt - state/pending row untouched.
+    assert repo.get_task(task.task_id).state == TaskState.WAITING_FOR_CONFIRMATION
+    assert repo.get_pending_confirmation(task.task_id) is not None
+
+
+def test_expired_reject_durable_record_allowed_and_cancellation_still_occurs(repo):
+    task, pending = _proposed(repo)
+    repo._conn.execute(
+        "UPDATE task_pending_confirmation SET expires_at = ? WHERE confirmation_id = ?",
+        ("2020-01-01T00:00:00+00:00", pending.confirmation_id),
+    )
+    repo._conn.commit()
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.RECORDED
+
+    # deny_confirmation() never checks expires_at - a rejection still
+    # succeeds even past the nominal TTL, unchanged by P2.
+    repo.deny_confirmation(task.task_id, pending.confirmation_id)
+    assert repo.get_task(task.task_id).state == TaskState.CANCELLED
+    assert repo.get_pending_confirmation(task.task_id) is None
+
+
+# --- decision/decided_at validation ------------------------------------------
+
+
+def test_record_confirmation_decision_rejects_non_enum_decision(repo):
+    task, pending = _proposed(repo)
+
+    with pytest.raises(TaskInputTooLargeError):
+        repo.record_confirmation_decision(
+            pending.confirmation_id, "confirm", required_source="whatsapp", provider_dedup_key=_dk(),
+        )
+
+    assert repo.get_pending_confirmation(task.task_id).decision is None
+
+
+def test_record_confirmation_decision_rejects_oversized_confirmation_id(repo):
+    with pytest.raises(TaskInputTooLargeError):
+        repo.record_confirmation_decision(
+            "x" * (MAX_CONFIRMATION_ID_CHARS + 1),
+            ConfirmationDecision.CONFIRM,
+            required_source="whatsapp",
+            provider_dedup_key=_dk(),
+        )
+
+
+def test_record_confirmation_decision_unknown_token_is_not_eligible(repo):
+    outcome = repo.record_confirmation_decision(
+        "does-not-exist-at-all", ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    assert outcome is ConfirmationDecisionOutcome.NOT_ELIGIBLE
+
+
+# --- DUPLICATE_INGRESS: the durable, restart-surviving provider receipt ----
+
+
+def test_same_dedup_key_after_recorded_is_duplicate_ingress(repo):
+    task, pending = _proposed(repo)
+    dedup_key = _dk()
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    assert outcome2 is ConfirmationDecisionOutcome.DUPLICATE_INGRESS
+
+
+def test_same_dedup_key_after_consumption_is_still_duplicate_ingress(repo):
+    # The whole reason the receipt survives consumption: a redelivery of
+    # the WINNING provider message, arriving after task_pending_confirmation's
+    # own row is already gone, must still be recognized - never NOT_ELIGIBLE.
+    task, pending = _proposed(repo)
+    dedup_key = _dk()
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+
+    repo.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    assert repo.get_pending_confirmation(task.task_id) is None
+
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+    assert outcome2 is ConfirmationDecisionOutcome.DUPLICATE_INGRESS
+
+
+def test_same_dedup_key_survives_repository_reopen(db_path):
+    conn1 = open_writer_connection(db_path)
+    repo1 = TaskRepository(conn1)
+    task, pending = _proposed(repo1)
+    dedup_key = _dk()
+
+    outcome1 = repo1.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    repo1.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    conn1.close()
+
+    conn2 = open_writer_connection(db_path)
+    repo2 = TaskRepository(conn2)
+    try:
+        outcome2 = repo2.record_confirmation_decision(
+            pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+            provider_dedup_key=dedup_key,
+        )
+        assert outcome2 is ConfirmationDecisionOutcome.DUPLICATE_INGRESS
+    finally:
+        conn2.close()
+
+
+def test_different_dedup_key_same_confirmation_after_win_is_already_decided_not_duplicate(repo):
+    # A DIFFERENT provider message for the SAME confirmation_id (the
+    # loser of an ALREADY_DECIDED race) is never confused with
+    # DUPLICATE_INGRESS - only an identical dedup_key ever produces that
+    # outcome.
+    task, pending = _proposed(repo)
+
+    outcome1 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    outcome2 = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert outcome1 is ConfirmationDecisionOutcome.RECORDED
+    assert outcome2 is ConfirmationDecisionOutcome.ALREADY_DECIDED
+
+
+def test_only_the_winning_decision_leaves_a_receipt(repo):
+    # Section 6's own minimal-write-volume requirement: the LOSING
+    # ALREADY_DECIDED attempt's own dedup_key never gets a receipt.
+    task, pending = _proposed(repo)
+    winner_key = _dk()
+    loser_key = _dk()
+
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=winner_key,
+    )
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.REJECT, required_source="whatsapp",
+        provider_dedup_key=loser_key,
+    )
+
+    rows = repo._conn.execute("SELECT dedup_key FROM task_confirmation_ingress_receipts").fetchall()
+    assert [r[0] for r in rows] == [winner_key]
+
+
+def test_receipt_committed_atomically_with_decision(repo):
+    """This does NOT exercise the decision-UPDATE-then-receipt-INSERT
+    ordering: pre-seeding the SAME dedup_key makes
+    record_confirmation_decision()'s very first check (the
+    existing_receipt SELECT, before any eligibility check or write) exit
+    via DUPLICATE_INGRESS immediately - the UPDATE and the real INSERT
+    are never reached. This only proves the early duplicate-receipt
+    short-circuit; see
+    test_post_update_receipt_insert_failure_rolls_back_the_decision_too
+    below for the actual post-UPDATE INSERT-failure atomicity proof
+    (Milestone 47 P2 final-review correction: the original version of
+    this test's docstring incorrectly claimed to prove that)."""
+
+    task, pending = _proposed(repo)
+    dedup_key = _dk()
+
+    # A real task_id is required by the receipt table's own FOREIGN KEY -
+    # reuses this SAME task's id (a distinct, unrelated confirmation_id is
+    # enough to prove the collision is on dedup_key alone, not on any
+    # other column).
+    repo._conn.execute(
+        "INSERT INTO task_confirmation_ingress_receipts "
+        "(dedup_key, task_id, confirmation_id, decision, source, accepted_at) "
+        "VALUES (?, ?, 'unrelated-confirmation', 'confirm', 'whatsapp', "
+        "'2020-01-01T00:00:00.000000+00:00')",
+        (dedup_key, task.task_id),
+    )
+    repo._conn.commit()
+
+    outcome = repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=dedup_key,
+    )
+
+    # The pre-seeded row already existed, so this is detected as an
+    # ordinary DUPLICATE_INGRESS by the SELECT-based check at the very
+    # start of the transaction - the decision is never written.
+    assert outcome is ConfirmationDecisionOutcome.DUPLICATE_INGRESS
+    assert repo.get_pending_confirmation(task.task_id).decision is None
+
+
+def test_post_update_receipt_insert_failure_rolls_back_the_decision_too(repo):
+    """Milestone 47 P2 final-review correction: forces a REAL failure of
+    the receipt INSERT itself, AFTER the decision UPDATE has already run
+    inside the same transaction, using a temporary trigger on
+    task_confirmation_ingress_receipts rather than a pre-seeded row (a
+    pre-seeded row is caught by the early existing_receipt SELECT before
+    the UPDATE ever runs - see the test above). provider_dedup_key here
+    is genuinely unique, so the eligibility checks and the UPDATE both
+    execute normally; only the subsequent INSERT fails.
+
+    Proves two things: (1) atomicity - either both the decision and its
+    receipt exist, or neither does, never one without the other; (2) the
+    resulting sqlite3.IntegrityError is never misclassified as
+    DUPLICATE_INGRESS - that outcome is reserved solely for the explicit
+    pre-check SELECT finding a genuine prior winner, since BEGIN
+    IMMEDIATE's exclusive write lock (held from before that SELECT runs)
+    already makes a real concurrent dedup_key race structurally
+    impossible."""
+
+    task, pending = _proposed(repo)
+    before_transitions = repo._conn.execute(
+        "SELECT COUNT(*) FROM task_transitions WHERE task_id = ?", (task.task_id,)
+    ).fetchone()[0]
+
+    repo._conn.execute(
+        "CREATE TEMP TRIGGER force_receipt_insert_failure "
+        "BEFORE INSERT ON task_confirmation_ingress_receipts "
+        "BEGIN SELECT RAISE(ABORT, 'forced test failure - not a real duplicate'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.record_confirmation_decision(
+            pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+            provider_dedup_key=_dk(),
+        )
+
+    reloaded = repo.get_pending_confirmation(task.task_id)
+    assert reloaded.decision is None
+    assert reloaded.decided_at is None
+    assert reloaded.decision_attempt_count == 0
+    assert reloaded.decision_next_attempt_at is None
+    assert reloaded.confirmation_id == pending.confirmation_id
+
+    receipts = repo._conn.execute("SELECT 1 FROM task_confirmation_ingress_receipts").fetchall()
+    assert receipts == []
+
+    assert repo.get_task(task.task_id).state is TaskState.WAITING_FOR_CONFIRMATION
+
+    after_transitions = repo._conn.execute(
+        "SELECT COUNT(*) FROM task_transitions WHERE task_id = ?", (task.task_id,)
+    ).fetchone()[0]
+    assert after_transitions == before_transitions
+
+
+# --- find_recoverable_confirmation_decision() --------------------------------
+
+
+def test_find_recoverable_confirmation_decision_returns_none_when_nothing_decided(repo):
+    _proposed(repo)  # pending, but never durably decided
+    assert repo.find_recoverable_confirmation_decision("whatsapp") is None
+
+
+def test_find_recoverable_confirmation_decision_finds_the_recorded_one(repo):
+    task, pending = _proposed(repo)
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    found = repo.find_recoverable_confirmation_decision("whatsapp")
+    assert found == pending.confirmation_id
+
+
+def test_find_recoverable_confirmation_decision_filters_by_source(repo):
+    task, pending = _proposed(repo, source="whatsapp")
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    # A durable decision recorded for "whatsapp" must never be recoverable
+    # from a different source's own recovery checkpoint.
+    assert repo.find_recoverable_confirmation_decision("sms") is None
+    assert repo.find_recoverable_confirmation_decision("whatsapp") == pending.confirmation_id
+
+
+def test_find_recoverable_confirmation_decision_excludes_already_consumed(repo):
+    task, pending = _proposed(repo)
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    repo.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+
+    # The pending row (and its decision) is gone - nothing left to recover.
+    assert repo.find_recoverable_confirmation_decision("whatsapp") is None
+
+
+def test_find_recoverable_confirmation_decision_orders_oldest_first(repo):
+    task_a, pending_a = _proposed(repo, request_text="task a")
+    task_b, pending_b = _proposed(repo, request_text="task b")
+
+    # Record B's decision first, then A's - the OLDER decided_at (B's)
+    # must still be returned first, proving this orders by
+    # decision_next_attempt_at (which starts equal to decided_at), not by
+    # insertion/creation order.
+    repo.record_confirmation_decision(
+        pending_b.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    repo.record_confirmation_decision(
+        pending_a.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    assert repo.find_recoverable_confirmation_decision("whatsapp") == pending_b.confirmation_id
+
+    # Once B is consumed, A becomes the only (and therefore next)
+    # recoverable decision.
+    repo.consume_confirmation_and_claim_step(
+        task_b.task_id, pending_b.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    assert repo.find_recoverable_confirmation_decision("whatsapp") == pending_a.confirmation_id
+
+
+def test_find_recoverable_confirmation_decision_bounded_to_one_never_a_list(repo):
+    # Signature-level proof this is bounded to a single confirmation_id,
+    # never a page/list - matches the "at most one per checkpoint"
+    # recovery-scheduling discipline this function exists to serve.
+    task_a, pending_a = _proposed(repo, request_text="task a")
+    task_b, pending_b = _proposed(repo, request_text="task b")
+    repo.record_confirmation_decision(
+        pending_a.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    repo.record_confirmation_decision(
+        pending_b.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    result = repo.find_recoverable_confirmation_decision("whatsapp")
+    assert isinstance(result, str)
+
+
+# --- defer_confirmation_decision_retry() / recovery fairness (MEDIUM-2) ----
+
+
+def test_defer_confirmation_decision_retry_advances_next_attempt_at(repo):
+    task, pending = _proposed(repo)
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+    repo.defer_confirmation_decision_retry(pending.confirmation_id, 1, future)
+
+    reloaded = repo.get_pending_confirmation(task.task_id)
+    assert reloaded.decision_attempt_count == 1
+    assert reloaded.decision_next_attempt_at == format_utc_timestamp(future)
+    # Not immediately recoverable again - correctly deferred.
+    assert repo.find_recoverable_confirmation_decision("whatsapp") is None
+
+
+def test_defer_confirmation_decision_retry_is_a_noop_after_consumption(repo):
+    # Section 13's own requirement: a deferral attempt for an already-
+    # consumed decision must never fabricate a retry row - a plain,
+    # silent no-op.
+    task, pending = _proposed(repo)
+    repo.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    repo.consume_confirmation_and_claim_step(
+        task.task_id, pending.confirmation_id, 1, "repository_backup", "ai_os"
+    )
+    assert repo.get_pending_confirmation(task.task_id) is None
+
+    # Must not raise, must not fabricate anything.
+    repo.defer_confirmation_decision_retry(
+        pending.confirmation_id, 1, datetime.now(timezone.utc) + timedelta(seconds=60)
+    )
+    assert repo.get_pending_confirmation(task.task_id) is None
+
+
+def test_fairness_deferred_oldest_decision_does_not_starve_newer_one(repo):
+    # Section 15/MEDIUM-2's own regression: decision A (oldest) is
+    # deferred (simulating a repeatedly-failing dispatch attempt before
+    # consumption); decision B (newer) must still be selectable, never
+    # starved behind A.
+    task_a, pending_a = _proposed(repo, request_text="task a")
+    task_b, pending_b = _proposed(repo, request_text="task b")
+
+    repo.record_confirmation_decision(
+        pending_a.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    repo.record_confirmation_decision(
+        pending_b.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+
+    # A is oldest, so it is the one initially due.
+    assert repo.find_recoverable_confirmation_decision("whatsapp") == pending_a.confirmation_id
+
+    # A's dispatch "fails" - defer it far into the future.
+    far_future = datetime.now(timezone.utc) + timedelta(hours=1)
+    repo.defer_confirmation_decision_retry(pending_a.confirmation_id, 1, far_future)
+
+    # B is now the only due decision - A never executes from here, and B
+    # is not starved behind it.
+    assert repo.find_recoverable_confirmation_decision("whatsapp") == pending_b.confirmation_id
+
+    # A remains durable (never lost), still undecided-by-consumption, and
+    # will become due again once its own backoff elapses.
+    reloaded_a = repo.get_pending_confirmation(task_a.task_id)
+    assert reloaded_a.decision is ConfirmationDecision.CONFIRM
+    assert reloaded_a.decision_attempt_count == 1
+
+
+def test_defer_confirmation_decision_retry_metadata_survives_repository_reopen(db_path):
+    conn1 = open_writer_connection(db_path)
+    repo1 = TaskRepository(conn1)
+    task, pending = _proposed(repo1)
+    repo1.record_confirmation_decision(
+        pending.confirmation_id, ConfirmationDecision.CONFIRM, required_source="whatsapp",
+        provider_dedup_key=_dk(),
+    )
+    future = datetime.now(timezone.utc) + timedelta(seconds=120)
+    repo1.defer_confirmation_decision_retry(pending.confirmation_id, 2, future)
+    conn1.close()
+
+    conn2 = open_writer_connection(db_path)
+    repo2 = TaskRepository(conn2)
+    try:
+        reloaded = repo2.get_pending_confirmation(task.task_id)
+        assert reloaded.decision_attempt_count == 2
+        assert reloaded.decision_next_attempt_at == format_utc_timestamp(future)
+        assert repo2.find_recoverable_confirmation_decision("whatsapp") is None  # still deferred
+    finally:
+        conn2.close()
+
+
+# --- LOW-1: corrupted decision row fails closed, never leaks -----------------
+
+
+def test_corrupted_decision_row_fails_closed_never_leaks_raw_value(repo):
+    """Milestone 47 P2 adversarial-review correction (LOW-1): a malformed
+    durable `decision` value (only reachable via direct, out-of-band
+    database corruption/tampering - never through this module's own
+    write path, which the schema's own CHECK constraint also closes)
+    must fail closed as TaskStorageCorruptError, never leaking the raw
+    corrupted value in its own exception text, exactly like
+    parse_task_timestamp() already does for the sibling expires_at
+    field. Simulated with PRAGMA ignore_check_constraints=ON, the
+    documented, controlled way to write a value the CHECK constraint
+    would otherwise reject - never real, uncontrolled repository
+    corruption."""
+
+    task, pending = _proposed(repo)
+
+    repo._conn.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        repo._conn.execute(
+            "UPDATE task_pending_confirmation SET decision = ?, decided_at = ? "
+            "WHERE confirmation_id = ?",
+            ("not-a-real-decision-value", "2026-01-01T00:00:00.000000+00:00", pending.confirmation_id),
+        )
+        repo._conn.commit()
+    finally:
+        repo._conn.execute("PRAGMA ignore_check_constraints = OFF")
+
+    with pytest.raises(TaskStorageCorruptError) as excinfo:
+        repo.get_pending_confirmation(task.task_id)
+
+    assert "not-a-real-decision-value" not in str(excinfo.value)

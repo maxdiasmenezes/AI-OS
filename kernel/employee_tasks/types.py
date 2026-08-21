@@ -9,12 +9,13 @@ generation is code-only and deterministic-or-random exactly as documented
 on each function below; the model never generates either.
 """
 
+import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 PROTOCOL_VERSION = 1
 
 # Fixed, code-level bounds on every externally supplied text field. Not
@@ -72,6 +73,31 @@ MAX_CONFIRMATION_RESOURCE_KEY_CHARS = 128
 # anything, never a specific string shape.
 MAX_CONFIRMATION_ID_CHARS = 128
 
+# Schema version 5 (Milestone 47 P1): bounds for task_lifecycle_outbox.
+# MAX_LIFECYCLE_CHANNEL_CHARS mirrors MAX_SOURCE_CHARS exactly - channel is
+# always derived verbatim from the owning task's own `source` column (see
+# TaskRepository's own module docstring on the outbox atomicity invariant),
+# never a second, independently-bounded value.
+MAX_LIFECYCLE_CHANNEL_CHARS = MAX_SOURCE_CHARS
+# Generous headroom over a serialized ConfirmationRequiredPayload (three
+# fields, each already independently bounded to at most
+# MAX_CONFIRMATION_ACTION_NAME_CHARS/MAX_CONFIRMATION_RESOURCE_KEY_CHARS/
+# MAX_CONFIRMATION_ID_CHARS - 128 characters apiece) plus JSON syntax
+# overhead - the only event_kind that ever has a non-NULL payload_json (see
+# LifecycleOutboxEvent's own docstring for why COMPLETED/FAILED/CANCELLED
+# never need one).
+MAX_LIFECYCLE_PAYLOAD_JSON_CHARS = 512
+
+# Milestone 47 P1: the lifecycle-outbox delivery-retry backoff window -
+# capped exponential, computed by compute_outbox_retry_delay_seconds()
+# below. Deliberately simple (no attempt-count-specific schedule beyond a
+# power-of-two cap) - this is a personal-scale, infrequently-restarted
+# system, not a high-volume messaging platform; a fixed cadence bounded
+# between these two values is sufficient to avoid both a tight retry loop
+# and an indefinitely-growing delay.
+OUTBOX_BASE_DELAY_SECONDS = 60.0
+OUTBOX_MAX_DELAY_SECONDS = 3600.0
+
 DISPLAY_ID_PREFIX = "TASK-"
 DISPLAY_ID_LENGTH = 8
 # Bounded retry count for the extremely unlikely case that a freshly
@@ -115,9 +141,20 @@ TERMINAL_STATES = frozenset({TaskState.COMPLETED, TaskState.FAILED, TaskState.CA
 # The exact, closed transition table. Cancellation is allowed from every
 # non-terminal state - nothing in the current roadmap needs an
 # uncancellable working state. No other states or edges exist.
+#
+# PLANNING -> CREATED (Milestone 47 P3) is the one exception to "forward
+# progress only": restart/crash reconciliation for a task stranded
+# PLANNING - planning is model-only (no external side effect), so
+# abandoning an interrupted model call and re-entering CREATED for a
+# fresh planning attempt is safe. Never used outside restart
+# reconciliation (see TaskRepository.transition_task()'s own
+# RESTART_PLANNING_INTERRUPTED_REASON_CODE, the sole caller-supplied
+# reason this edge is ever taken with).
 ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.CREATED: frozenset({TaskState.PLANNING, TaskState.CANCELLED, TaskState.FAILED}),
-    TaskState.PLANNING: frozenset({TaskState.READY, TaskState.CANCELLED, TaskState.FAILED}),
+    TaskState.PLANNING: frozenset(
+        {TaskState.READY, TaskState.CANCELLED, TaskState.FAILED, TaskState.CREATED}
+    ),
     TaskState.READY: frozenset({TaskState.RUNNING, TaskState.CANCELLED, TaskState.FAILED}),
     TaskState.RUNNING: frozenset(
         {
@@ -231,6 +268,21 @@ class TaskInputTooLargeError(TaskStorageError):
     validation rule."""
 
 
+class LifecycleEventPayloadError(TaskStorageError):
+    """A task_lifecycle_outbox event's payload_json (Milestone 47 P1)
+    either could not be serialized within MAX_LIFECYCLE_PAYLOAD_JSON_CHARS
+    at write time, or - a read-time defense-in-depth check, never expected
+    to fire against anything this layer itself ever wrote - could not be
+    deserialized back into the expected ConfirmationRequiredPayload shape.
+    Every field serialize_confirmation_required_payload() ever writes is
+    already independently bounded by its own caller-side validation
+    (MAX_CONFIRMATION_ACTION_NAME_CHARS/MAX_CONFIRMATION_RESOURCE_KEY_CHARS/
+    MAX_CONFIRMATION_ID_CHARS), so this should be structurally unreachable
+    in practice - but is never assumed away, matching this package's own
+    "the caller already validated it, but never trust that alone"
+    doctrine."""
+
+
 class StepAlreadyClaimedError(TaskStorageError):
     """TaskRepository.claim_step() targeted a (task_id, step_position)
     pair that already has a task_step_progress row - whatever its status.
@@ -307,6 +359,20 @@ class TaskRecord:
     protocol_version: int
     version: int
     plan_json: str | None = None
+    # Milestone 47 P3 (adversarial-review correction): durable backoff
+    # state for find_one_recoverable_task()'s own due-ordered pickup -
+    # mirrors task_pending_confirmation's decision_attempt_count/
+    # decision_next_attempt_at (Milestone 47 P2) exactly, for the
+    # identical reason: without it, one recoverable task whose recovery
+    # dispatch keeps raising (without ever transitioning the task out of
+    # its recoverable state) permanently starves every task created after
+    # it, since a plain oldest-first scan always re-selects the same row.
+    # recovery_attempt_count starts at 0 and recovery_next_attempt_at
+    # starts at NULL (== "never deferred, immediately eligible") for
+    # every task - see TaskRepository.defer_task_recovery_retry() for how
+    # they change after a failed recovery dispatch.
+    recovery_attempt_count: int = 0
+    recovery_next_attempt_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -356,6 +422,65 @@ class TaskStepProgress:
     task_version: int
 
 
+class ConfirmationDecision(str, Enum):
+    """The closed set of durable decisions a CONFIRM/REJECT command may
+    record against a pending confirmation (Milestone 47 P2) - mirrors
+    TaskState/StepStatus/LifecycleEventKind's own "inherits str" convention
+    so a member compares equal to, and can be stored/read as, its plain
+    string value. Exactly the two values
+    task_pending_confirmation.decision's own schema-level CHECK constraint
+    accepts (kernel/employee_tasks/db.py) - no other decision string is
+    ever valid, matching this module's own "close the set in SQL too, not
+    just in the enum" discipline (see _STEP_STATUS_LIST_SQL's own comment
+    in db.py). This is the single, kernel-owned representation - never
+    duplicated by interfaces/whatsapp/task_control.py, which imports this
+    exact enum rather than defining its own equivalent."""
+
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+class ConfirmationDecisionOutcome(str, Enum):
+    """The closed set of outcomes TaskRepository.record_confirmation_decision()
+    (Milestone 47 P2) may return - never a free-form string, never an
+    exception for any of these three ordinary, expected results (an
+    exception remains reserved for a genuine storage failure, matching
+    every other repository method's own convention).
+
+    RECORDED: this call's decision durably won - it, and only it, is now
+    task_pending_confirmation.decision for this confirmation_id, AND a
+    matching task_confirmation_ingress_receipts row now durably remembers
+    this exact provider message as the one that won (see
+    TaskRepository.record_confirmation_decision()'s own docstring for the
+    atomicity of that pairing).
+    ALREADY_DECIDED: a decision (whether this same one or the opposite one)
+    was already durably recorded before this call ever reached the
+    transaction - first-decision-wins, and this call never overwrote it.
+    DUPLICATE_INGRESS (Milestone 47 P2 adversarial-review correction): this
+    EXACT provider message was already the one that durably won a decision
+    - detected via task_confirmation_ingress_receipts, which survives even
+    after task_pending_confirmation's own row is later consumed/deleted.
+    Distinct from ALREADY_DECIDED: ALREADY_DECIDED means "some decision for
+    this confirmation_id already exists, but not necessarily from this
+    exact provider message"; DUPLICATE_INGRESS means "this exact provider
+    message itself already won, at any point in the past, even long after
+    the pending row is gone" - the crash-safe, restart-surviving transport-
+    redelivery answer NOT_ELIGIBLE could never give.
+    NOT_ELIGIBLE: no durable decision was written, for any reason -
+    confirmation_id does not resolve, the owning task's source does not
+    match, the owning task is no longer WAITING_FOR_CONFIRMATION, or the
+    pending row is otherwise gone. Deliberately as unspecific as
+    get_task_by_pending_confirmation_id()'s own None return: which of
+    these actually happened is never distinguishable from the outcome
+    alone, so a wrong-source or expired-token attempt discloses nothing
+    about which case occurred."""
+
+    RECORDED = "recorded"
+    ALREADY_DECIDED = "already_decided"
+    DUPLICATE_INGRESS = "duplicate_ingress"
+    NOT_ELIGIBLE = "not_eligible"
+
+
 @dataclass(frozen=True)
 class PendingTaskConfirmation:
     """One durable task_pending_confirmation row (Milestone 42 P2) - a
@@ -401,7 +526,35 @@ class PendingTaskConfirmation:
     specific threat would require an independent trust boundary (e.g. an
     authenticated/signed proposal record, or storage this process does not
     itself have unrestricted write access to) that no part of this
-    codebase's existing threat model calls for today."""
+    codebase's existing threat model calls for today.
+
+    `decision`/`decided_at` (Milestone 47 P2): durable confirmation-decision
+    authority - see TaskRepository.record_confirmation_decision()'s own
+    docstring for the exact atomic eligibility/first-decision-wins
+    contract. Both are None until a decision has been durably recorded;
+    `decision` is never any value other than a ConfirmationDecision member
+    once non-None, matching the schema's own CHECK constraint. This row
+    (and its decision, if any) is deleted, atomically, by whichever of
+    consume_confirmation_and_claim_step()/deny_confirmation()/
+    fail_pending_confirmation() actually consumes it - there is no separate
+    durable "decision history" once that happens; the task_transitions
+    journal remains the sole durable task-state history (a SEPARATE,
+    independent durable record - task_confirmation_ingress_receipts -
+    remembers only which provider message won, specifically so it can
+    outlive this row's own deletion; see that table's own rationale on
+    TaskRepository.record_confirmation_decision()).
+
+    `decision_attempt_count`/`decision_next_attempt_at` (Milestone 47 P2
+    adversarial-review correction): the SAME small, bounded, capped-
+    exponential retry-scheduling shape task_lifecycle_outbox's own
+    attempt_count/next_attempt_at already established for P1, applied here
+    so one durable decision that repeatedly fails to be dispatched (before
+    it is ever consumed) can never permanently starve every later durable
+    decision behind it in find_recoverable_confirmation_decision()'s own
+    due-ordered queue. Both are meaningless (0 / None) until a decision
+    exists; once RECORDED, decision_next_attempt_at starts equal to
+    decided_at (immediately due) and only ever moves forward, exactly like
+    the outbox's own next_attempt_at never moves backward."""
 
     task_id: str
     confirmation_id: str
@@ -410,6 +563,237 @@ class PendingTaskConfirmation:
     resource_key: str | None
     created_at: str
     expires_at: str
+    decision: ConfirmationDecision | None = None
+    decided_at: str | None = None
+    decision_attempt_count: int = 0
+    decision_next_attempt_at: str | None = None
+
+
+class LifecycleEventKind(str, Enum):
+    """The closed set of durable lifecycle-outbox event kinds (Milestone
+    47 P1) - mirrors TaskState/StepStatus's own "inherits str" convention.
+    Exactly the four target states TaskRepository's own transition-producing
+    methods ever treat as externally notification-worthy (see
+    TaskRepository's own module docstring for the exact atomicity
+    invariant and the four call sites that create one of these). No other
+    event_kind string is ever accepted - db.py's own CHECK constraint
+    closes this set at the schema level too, not merely in this enum."""
+
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    TASK_CANCELLED = "task_cancelled"
+
+
+@dataclass(frozen=True)
+class LifecycleOutboxEvent:
+    """One durable, at-least-once lifecycle-notification obligation
+    (Milestone 47 P1) - created atomically, in the SAME SQLite transaction,
+    by whichever TaskRepository method produces the corresponding
+    deliverable task_transitions row; see that module's own docstring for
+    the exact invariant ("if the lifecycle transition commits, the
+    corresponding required lifecycle event exists - always, never later,
+    never separately").
+
+    `channel` is always exactly the owning task's own `source` column
+    (task.source == "whatsapp" -> channel == "whatsapp") - never a second,
+    independently-set value, and never model-selected. A delivery/recovery
+    loop for one channel MUST filter on this column and must never consume
+    a different channel's event; this table never stores a recipient of
+    any kind - recipient authority always remains the CURRENT
+    configuration of whichever interface owns `channel`, resolved fresh at
+    send time, never persisted here.
+
+    `payload_json` is populated only for CONFIRMATION_REQUIRED (see
+    ConfirmationRequiredPayload's own docstring for why) and is always
+    None for TASK_COMPLETED/TASK_FAILED/TASK_CANCELLED: every field their
+    eventual message needs is already durably, permanently immutable on
+    the task/step-progress rows themselves the instant a terminal
+    transition commits (terminal states have no outgoing edges - see
+    ALLOWED_TRANSITIONS), so re-deriving from current state at delivery
+    time is provably safe for those three kinds, unlike
+    CONFIRMATION_REQUIRED's own pending-row source data, which can
+    legitimately be deleted and replaced by a later, different
+    confirmation round while the task is still non-terminal.
+
+    `transition_id` correlates this event to EXACTLY the one
+    task_transitions row that created the obligation (UNIQUE at the schema
+    level - see db.py) - this is what makes duplicate event creation for
+    one transition structurally impossible, not merely conventionally
+    avoided. `attempt_count`/`next_attempt_at` implement a small, bounded,
+    capped-exponential retry schedule (see
+    compute_outbox_retry_delay_seconds() below) - never unbounded, never
+    a tight loop, and never storing a raw provider error/exception text."""
+
+    event_id: str
+    task_id: str
+    transition_id: int
+    channel: str
+    event_kind: LifecycleEventKind
+    payload_json: str | None
+    created_at: str
+    delivered_at: str | None
+    attempt_count: int
+    next_attempt_at: str
+
+
+@dataclass(frozen=True)
+class ConfirmationRequiredPayload:
+    """The immutable, structured payload captured atomically inside
+    TaskRepository.propose_confirmation()'s own transaction (Milestone 47
+    P1) - never rendered WhatsApp (or any other interface's) wording
+    itself, only the same three already-bounded, non-secret identifiers
+    task_pending_confirmation itself already carries. Rendering the actual
+    outbound text from this payload is the receiving interface's own job
+    (see interfaces/whatsapp/task_control.py), exactly like it already is
+    for a live, not-yet-resolved PendingTaskConfirmation row - this
+    dataclass is deliberately duck-type-compatible with that one (same
+    three field names) so a caller's own formatter can accept either
+    without caring which one it was handed."""
+
+    confirmation_id: str
+    action_name: str
+    resource_key: str | None
+
+
+def serialize_confirmation_required_payload(payload: ConfirmationRequiredPayload) -> str:
+    """Deterministic, canonical JSON serialization (sorted keys, compact
+    separators - matching kernel.task_execution.observation's own
+    serialize_observation() discipline). Raises LifecycleEventPayloadError
+    if the result would exceed MAX_LIFECYCLE_PAYLOAD_JSON_CHARS; never
+    truncates. Should be unreachable in practice given every field's own
+    independent bound, but is real defense in depth, not assumed away."""
+
+    data = {
+        "confirmation_id": payload.confirmation_id,
+        "action_name": payload.action_name,
+        "resource_key": payload.resource_key,
+    }
+    serialized = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    if len(serialized) > MAX_LIFECYCLE_PAYLOAD_JSON_CHARS:
+        raise LifecycleEventPayloadError(
+            f"serialized confirmation_required payload exceeds "
+            f"MAX_LIFECYCLE_PAYLOAD_JSON_CHARS ({MAX_LIFECYCLE_PAYLOAD_JSON_CHARS})"
+        )
+    return serialized
+
+
+# Milestone 47 P1 adversarial-review correction: the exact, closed set of
+# top-level keys a durable confirmation_required payload may ever have -
+# not one more, not one fewer. Checked via set equality, not merely
+# presence, so an extra/unexpected key is rejected exactly like a missing
+# one - both are "this durable row does not match the shape this layer
+# itself ever wrote," and both fail the same way.
+_CONFIRMATION_REQUIRED_PAYLOAD_KEYS = frozenset({"confirmation_id", "action_name", "resource_key"})
+
+
+def _validate_deserialized_payload_str(value, field_name: str, min_len: int, max_len: int) -> str:
+    """A small, LOCAL validator for deserialize_confirmation_required_payload()
+    below - deliberately NOT kernel.employee_tasks.repository's own
+    _validate_bounded_text(): repository.py already imports FROM this
+    module, so importing back from repository.py here would be circular.
+    Reuses the SAME bound constants repository.py's own write-path
+    validators use (MAX_CONFIRMATION_ID_CHARS/
+    MAX_CONFIRMATION_ACTION_NAME_CHARS/MAX_CONFIRMATION_RESOURCE_KEY_CHARS),
+    so the two independently-implemented checks can never silently drift
+    apart on the NUMBERS, even though the checking LOGIC is necessarily
+    duplicated in shape given the layering. Raises LifecycleEventPayloadError
+    directly, never TaskInputTooLargeError - this function exists solely to
+    serve this one deserialization boundary's own single exception
+    contract. Never includes the offending value in its own message - only
+    the field name and a fixed, generic description, so a corrupted
+    durable payload's own content is never echoed back through an
+    exception."""
+
+    if not isinstance(value, str):
+        raise LifecycleEventPayloadError(f"{field_name} must be a string")
+    if "\x00" in value:
+        raise LifecycleEventPayloadError(f"{field_name} must not contain a NUL character")
+    if not (min_len <= len(value) <= max_len):
+        raise LifecycleEventPayloadError(
+            f"{field_name} must be between {min_len} and {max_len} characters"
+        )
+    return value
+
+
+def deserialize_confirmation_required_payload(raw: str) -> ConfirmationRequiredPayload:
+    """The inverse of serialize_confirmation_required_payload() - a
+    genuinely closed, bounded, type-checked schema, not merely a
+    structural/presence check. Every malformed-input path raises only
+    LifecycleEventPayloadError, never leaking the raw payload or any
+    offending value in its own message, so a caller reading a durably-
+    corrupted row back can always fail safely rather than crash or
+    silently accept unvalidated data:
+
+      - the raw string itself is bounded to MAX_LIFECYCLE_PAYLOAD_JSON_CHARS
+        BEFORE json.loads() is ever called, so an arbitrarily oversized
+        corrupted row is never even parsed;
+      - invalid JSON syntax;
+      - a non-object top level;
+      - a key set that is not EXACTLY {confirmation_id, action_name,
+        resource_key} - an extra key is rejected exactly like a missing
+        one (see _CONFIRMATION_REQUIRED_PAYLOAD_KEYS's own comment);
+      - confirmation_id/action_name: anything other than a non-empty,
+        NUL-free string within the SAME bound
+        (MAX_CONFIRMATION_ID_CHARS/MAX_CONFIRMATION_ACTION_NAME_CHARS) the
+        write path already enforces - never coerced via str(value), a
+        wrong-typed value (int/list/dict/bool/None) is rejected outright;
+      - resource_key: anything other than None, or a non-empty, NUL-free
+        string within MAX_CONFIRMATION_RESOURCE_KEY_CHARS - matching
+        PendingTaskConfirmation/propose_confirmation()'s own "None means
+        no resource, never an empty-string placeholder" semantics exactly."""
+
+    if not isinstance(raw, str) or len(raw) > MAX_LIFECYCLE_PAYLOAD_JSON_CHARS:
+        raise LifecycleEventPayloadError(
+            f"payload exceeds MAX_LIFECYCLE_PAYLOAD_JSON_CHARS ({MAX_LIFECYCLE_PAYLOAD_JSON_CHARS})"
+        )
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LifecycleEventPayloadError("payload is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise LifecycleEventPayloadError("payload is not a JSON object")
+
+    if set(data.keys()) != _CONFIRMATION_REQUIRED_PAYLOAD_KEYS:
+        raise LifecycleEventPayloadError(
+            "payload does not have exactly the expected confirmation_required keys"
+        )
+
+    confirmation_id = _validate_deserialized_payload_str(
+        data["confirmation_id"], "confirmation_id", 1, MAX_CONFIRMATION_ID_CHARS
+    )
+    action_name = _validate_deserialized_payload_str(
+        data["action_name"], "action_name", 1, MAX_CONFIRMATION_ACTION_NAME_CHARS
+    )
+    resource_key_raw = data["resource_key"]
+    if resource_key_raw is None:
+        resource_key = None
+    else:
+        resource_key = _validate_deserialized_payload_str(
+            resource_key_raw, "resource_key", 1, MAX_CONFIRMATION_RESOURCE_KEY_CHARS
+        )
+
+    return ConfirmationRequiredPayload(
+        confirmation_id=confirmation_id, action_name=action_name, resource_key=resource_key
+    )
+
+
+def compute_outbox_retry_delay_seconds(attempt_count: int) -> float:
+    """Capped exponential backoff for a lifecycle-outbox delivery retry
+    (Milestone 47 P1) - pure, deterministic, no I/O, no wall-clock read of
+    its own. `attempt_count` is the NEW count after the failed attempt
+    this delay is being computed for (call with 1 to get the delay before
+    the second attempt). The EXPONENT itself is capped before 2**n is ever
+    computed - never a literal unbounded exponentiation - so this stays
+    cheap and safe no matter how large attempt_count ever grows; the
+    result is then also capped at OUTBOX_MAX_DELAY_SECONDS regardless."""
+
+    if attempt_count < 1:
+        attempt_count = 1
+    capped_exponent = min(attempt_count - 1, 10)  # 2**10 already saturates past OUTBOX_MAX_DELAY_SECONDS
+    return min(OUTBOX_BASE_DELAY_SECONDS * (2 ** capped_exponent), OUTBOX_MAX_DELAY_SECONDS)
 
 
 def parse_task_timestamp(value: str, field_name: str = "timestamp") -> datetime:
@@ -443,6 +827,45 @@ def parse_task_timestamp(value: str, field_name: str = "timestamp") -> datetime:
     if parsed.tzinfo is None:
         raise TaskStorageCorruptError(f"{field_name} is not a timezone-aware timestamp")
     return parsed
+
+
+def format_utc_timestamp(value: datetime) -> str:
+    """Milestone 47 P1 adversarial-review correction: the ONE canonical,
+    fixed-width, always-microsecond-precision UTC serialization used for
+    task_lifecycle_outbox's own created_at/next_attempt_at columns - see
+    TaskRepository.list_due_lifecycle_outbox_events()'s own docstring for
+    the exact invariant this establishes (plain lexical SQL comparison
+    provably, not merely coincidentally, equivalent to chronological
+    comparison).
+
+    Unlike datetime.isoformat()'s own default behavior - which OMITS the
+    fractional-seconds component entirely when it is exactly zero,
+    producing a SHORTER string for that one case (see
+    parse_task_timestamp()'s own docstring for why that variable-width
+    behavior is unsafe to compare lexically) - this ALWAYS includes
+    exactly six fractional digits (`timespec="microseconds"`), so every
+    value this function ever produces has the identical fixed structure:
+    the well-known, provably-correct condition for "lexical order equals
+    chronological order" over zero-padded, fixed-width date/time
+    components. Always converts to UTC first (`.astimezone(timezone.utc)`)
+    - never trusts or preserves a non-UTC offset, so this function alone
+    is always safe to call on any genuinely timezone-aware datetime,
+    regardless of its original offset; callers that must additionally
+    REJECT a non-UTC input outright (rather than silently normalizing it)
+    perform that check themselves before calling this function - see
+    TaskRepository.mark_lifecycle_event_delivery_failed()'s own explicit
+    UTC-only gate for exactly that stricter contract.
+
+    Raises ValueError (matching datetime's own contract for this precise
+    situation - never a custom exception type) if `value` is not
+    timezone-aware; every caller in this codebase already has a real,
+    timezone-aware datetime object in hand, never caller-supplied raw
+    text, so this is a programming-contract check, not an external-input
+    validation boundary."""
+
+    if value.tzinfo is None:
+        raise ValueError("value must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def generate_task_id() -> str:

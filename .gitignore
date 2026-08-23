@@ -79,3 +79,9 @@ storage/tasks/*.sqlite3
 storage/tasks/*.sqlite3-wal
 storage/tasks/*.sqlite3-shm
 storage/tasks/*.sqlite3-journal
+
+# Milestone 47 P1: the database-scoped runtime-ownership lock file
+# (kernel/employee_tasks/runtime_lock.py) - its own content is never
+# authoritative (only a live OS-level lock on it matters), and it is
+# machine-local derived data, never committed.
+storage/tasks/*.lock

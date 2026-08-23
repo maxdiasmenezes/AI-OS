@@ -18,6 +18,229 @@ Meta's WhatsApp Business Cloud API. Two message families are handled here:
 **Single-user only**: exactly one WhatsApp sender is authorized - there is
 no allow-list and no multi-user support.
 
+## Launch runbook (Milestone 48)
+
+This section is the practical, sequential operator guide for running this
+interface for real personal use. It references, rather than repeats, the
+exact technical detail in "Running it" / "Configuration" / "Endpoints" /
+"Task control" below - those remain the authoritative reference for each
+individual fact.
+
+### Launch envelope
+
+The validated M48 launch envelope is:
+
+- one Windows machine
+- one local AI-OS runtime (this process)
+- one SQLite task database
+- one background worker
+- one authorized WhatsApp sender
+- Meta WhatsApp Business Cloud API
+- ngrok as the current inbound development tunnel
+- a permanent Meta System User token for outbound Graph API authentication
+- explicit confirmation for every sensitive action
+- controlled personal use
+
+This is explicitly **not**: multi-user, multi-worker, a generalized
+production SaaS, a high-availability service, or an arbitrary automation
+platform. Nothing in this milestone changes that envelope - see
+`docs/architecture.md`'s own Milestone 48 entry for the full acceptance
+record behind this claim.
+
+### Required configuration (names only)
+
+See "Configuration" below for the complete, authoritative list and
+validation rules. The concepts that matter operationally:
+
+- `WHATSAPP_ACCESS_TOKEN` - for the validated launch setup, this must be a
+  **permanent Meta System User token**, not a short-lived/temporary token
+  that expires. The validated System User permission set for this launch
+  is exactly `whatsapp_business_management` and
+  `whatsapp_business_messaging` - grant no more than that.
+- `WHATSAPP_APP_SECRET` - validates inbound webhook authenticity
+  (`X-Hub-Signature-256`). Unrelated to ngrok.
+- `WHATSAPP_VERIFY_TOKEN` - used only for Meta's own GET webhook
+  verification handshake. Also unrelated to ngrok.
+- `WHATSAPP_PHONE_NUMBER_ID` / `WHATSAPP_AUTHORIZED_SENDER_ID` - identify
+  which business number this server answers for, and the single phone
+  number allowed to use it.
+
+**ngrok provides inbound tunneling only** - it makes this loopback-only
+server reachable by Meta's webhook delivery. It has no role in outbound
+Graph API authentication at all; that is entirely the access token's job,
+independent of whatever ngrok URL happens to be active. Never write a
+real secret value into this file, into chat, or into a screenshot - see
+"Security and operator hygiene" below.
+
+### Starting the service
+
+From the repository root:
+
+```
+uv run python -m interfaces.whatsapp.server
+```
+
+(equivalent to `python -m interfaces.whatsapp.server` inside the project's
+own `.venv` - see "Running it" below for the exact loopback/port/TLS
+behavior this starts.)
+
+In a second terminal, start an ngrok tunnel pointed at the same local
+port the server is bound to (default `8000`, matching `WHATSAPP_PORT`'s
+own default - see "Configuration" below):
+
+```
+ngrok http 8000
+```
+
+The public HTTPS URL ngrok prints changes on every fresh ngrok session -
+never hard-code it anywhere in this repository. Configure Meta's webhook
+callback URL as:
+
+```
+https://<current-ngrok-host>/webhook
+```
+
+(the callback path is always exactly `/webhook` - see "Endpoints" below),
+with the messages subscription enabled and the verify token matching
+`WHATSAPP_VERIFY_TOKEN`. Both the server terminal and the ngrok terminal
+stay open for the entire session - closing either one ends that half of
+the pipeline.
+
+### Normal use
+
+Ordinary conversation works with no special syntax. Task control uses the
+grammar documented in full under "Task control" below; in short:
+
+- `/task list the files in downloads` - a read-only task; proceeds
+  straight to a terminal result, no confirmation needed.
+- `/task open notepad` - a sensitive task; stops at a confirmation
+  request and waits.
+- `CONFIRM <confirmation-id>` / `REJECT <confirmation-id>` - respond to a
+  pending confirmation, using the exact id from that request message
+  (never a real id from this documentation - ids are single-use and
+  opaque by design).
+
+First-decision-wins: once a confirmation id is resolved (approved,
+rejected, or expired), replaying the identical `CONFIRM`/`REJECT` text
+again never authorizes a second action - see "Execution and the
+confirmation gate" and "Durability and crash-window language" below for
+the complete, precise semantics (including the distinction between a
+user-level text replay and exact provider-message redelivery - only the
+latter is `DUPLICATE_INGRESS`, and that specific guarantee is proven by
+the automated test suite, not by manual live testing).
+
+### Graceful shutdown
+
+1. In the server terminal, press `Ctrl+C`.
+2. In the ngrok terminal, press `Ctrl+C`.
+
+This is the normal operator shutdown sequence. A graceful stop blocks
+until every in-flight request finishes, then signals and waits (up to a
+bounded timeout) for the worker to quiesce, only releasing the runtime
+lock once both are done (see "WhatsApp Server Lifecycle" in
+`docs/architecture.md` for the exact, code-enforced ordering). Prefer
+this over abruptly killing the process during normal operation - not
+because an abrupt loss is unsafe, but because it is unnecessary: durable
+task *state* is always reconciled after a restart regardless of how the
+previous process ended, as described in the next section, though an
+external action whose outcome became uncertain during that process death
+is deliberately never resumed or retried - it fails closed instead. See
+"Restart and crash recovery" below for the precise distinction.
+
+### Restart and crash recovery
+
+Durable task state lives in SQLite, independent of the running process.
+On startup, this interface's bounded recovery checkpoints discover and
+resume durable work left behind by a crash or restart - see "Durability
+and crash-window language" above for the exact mechanism and "What this
+interface does not guarantee" for its precise limits. In summary:
+
+- A task stranded `created` (accepted but never dispatched) is
+  rediscovered and resumed automatically.
+- A task stranded mid-`planning` is explicitly re-armed back to `created`
+  and replanned fresh - the interrupted model call's outcome is never
+  assumed.
+- `ready`/`running` recovery resumes through the same bounded execution
+  path a normal dispatch uses, revalidating current configuration first.
+- A `running` task whose step was left `in_progress` by a crash mid-action
+  is **never blindly retried** - its external outcome is uncertain by
+  construction, and the task fails closed rather than risking a
+  duplicate side effect.
+
+This is not only a design claim: Milestone 48's own controlled live
+acceptance abruptly terminated the running server process while a real
+WhatsApp task existed, then confirmed - via a read-only inspection of the
+durable database while the process was still dead - that the task was
+genuinely captured mid-`planning`. After restarting, that exact task
+recovered and reached a terminal result **without being resent**. See
+`docs/architecture.md`'s Milestone 48 entry for the full record. No
+exactly-once guarantee for external side effects is made anywhere in
+this - see "What this interface does not guarantee" above.
+
+### Known operational limitations
+
+- Response latency varies noticeably and was not treated as a defect
+  during M48 acceptance. Observed, approximate, single-session ranges:
+  ordinary conversation roughly 10-22 seconds; a read-only task roughly
+  22-60 seconds; sensitive-task planning through to the confirmation
+  request roughly 22-90 seconds; a `CONFIRM`/`REJECT` decision itself
+  roughly 3 seconds. These are observations from one controlled
+  personal-use session, not performance guarantees. Local model
+  cold/warm-load variability plausibly contributes, but this is an
+  inference, not a proven diagnosis.
+- The ngrok URL is ephemeral and changes between sessions - the Meta
+  webhook callback must be re-verified whenever it changes.
+- This remains an operator-managed local service, not a managed/hosted
+  deployment - there is no supervision process that restarts it for you.
+- The launch envelope assumes exactly one runtime and one worker; see
+  "What this interface does not guarantee" above for the exact
+  persistence/recovery limits that follow from that.
+
+### Security and operator hygiene
+
+- Never paste, screenshot, or otherwise display `.env` contents,
+  access tokens, the app secret, or the verify token - not in chat, not
+  in a terminal capture, not in an issue or commit.
+- Rotate immediately any credential that becomes visible or is otherwise
+  exposed, however briefly. Prefer revoking the old credential at its
+  source (Meta Business Settings, for a System User token) over merely
+  replacing it locally, so a leaked value stops working everywhere, not
+  just in this repository's own configuration.
+- Keep every secret in `.env` only - never commit it, never inline it
+  into a script or a doc.
+- Use the minimum Meta System User permission set that this integration
+  actually needs (`whatsapp_business_management`,
+  `whatsapp_business_messaging`) - do not grant broader access "to be
+  safe."
+- **Operational lesson from Milestone 48's own live acceptance:** this
+  interface's `open_application` action only ever launches the one
+  registered application executable - it never selects, opens, or has
+  any awareness of a target document. Some applications, independently
+  of how they were launched, restore their *own* previous session or
+  content on startup. During M48 acceptance, Windows Notepad's own
+  "Continue previous session" setting restored a previously,
+  separately, manually opened tab that happened to contain secret-bearing
+  content - an application/operator-state issue, not this interface (or
+  the underlying action) intentionally opening that file. Before using
+  any application as a live confirmation-testing target, put it into a
+  safe startup state first. For Windows Notepad, the validated
+  remediation is to set its startup behavior to "Start new session and
+  discard unsaved changes" - this is an operator/OS-level setting, not a
+  guarantee this codebase makes or enforces.
+
+### Troubleshooting
+
+| Symptom | Likely cause / what to check |
+|---|---|
+| Server not listening | Confirm the process actually started without a config-validation error (see "Configuration" below - a missing/invalid variable fails startup immediately); confirm `WHATSAPP_HOST`/`WHATSAPP_PORT` match what ngrok is pointed at. |
+| ngrok callback unavailable | Confirm the ngrok process is still running and the terminal wasn't closed; ngrok URLs are ephemeral per session. |
+| Meta verification failure | Confirm the callback URL ends in exactly `/webhook`, and that the verify token entered in Meta matches `WHATSAPP_VERIFY_TOKEN` exactly. |
+| No inbound messages arrive | Confirm the Meta app's messages subscription is enabled, the ngrok tunnel is still the one Meta has configured, and the sender is the exact authorized number. |
+| Outbound Graph API authentication failure | Confirm `WHATSAPP_ACCESS_TOKEN` is still a valid, non-revoked permanent System User token - a rotated or expired token must be updated in `.env` and the server restarted. |
+| Stale/expired confirmation | Expected behavior after the confirmation's own TTL - see "Execution and the confirmation gate" above; send a fresh `/task` rather than retrying the old id. |
+| Slow first response | Consistent with local model cold-start - see "Known operational limitations" above; not itself a failure. |
+| Restarting after a crash | See "Restart and crash recovery" above - start the service normally; do not delete the SQLite database or manually edit task rows as a troubleshooting step. |
+
 ## Running it
 
 ```

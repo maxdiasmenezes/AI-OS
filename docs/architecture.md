@@ -3435,20 +3435,96 @@ this flow — a single call to `handle()` is one full request/response cycle.
   use it, exactly like every other edge in that same table, though only
   P3's own recovery checkpoint currently does.
 
+- Milestone 48 — Employee Acceptance and Launch: **COMPLETE.** Determines
+  whether the integrated M39-47 system is safe, understandable, operable,
+  recoverable, and ready for controlled personal use - not another
+  subsystem, and deliberately not broad employee launch acceptance,
+  production deployment procedures, generalized monitoring, new tools/
+  actions, expanded autonomy, or any real-world launch process beyond
+  this envelope; those remain out of scope entirely, not absorbed by
+  closing this milestone.
+
+  P1 (Automated Employee Acceptance) found the existing M39-47 test suite
+  already proves the full employee composition - a real HTTP webhook
+  request through durable task creation, planning, execution, the
+  confirmation gate, and lifecycle delivery, using genuine production
+  wiring with only the LLM provider and outbound WhatsApp client faked -
+  so no new acceptance test file was needed. Final non-live acceptance
+  total: **2213 passed, 11 skipped, 0 failed**, across
+  `tests/kernel/employee_tasks`, `tests/interfaces/whatsapp`,
+  `tests/kernel/task_execution`/`task_orchestration`/`task_planner`, and
+  `tests/kernel/tools` - deliberately excluding the two disruptive live
+  Windows UIA files (`test_milestone_45_p1_e2e.py`,
+  `test_desktop_windows_integration.py`), which validate M45's own
+  desktop-automation surface in isolation and add no incremental M48
+  assurance.
+
+  P2 (Controlled Live Employee Acceptance) ran a real session against the
+  live Meta WhatsApp Business Cloud API (via an ngrok tunnel), the real
+  local AI-OS runtime, the real SQLite task database, real local Ollama
+  models, and a real Windows Notepad sensitive-action target. Verified
+  live: ordinary conversation; a real read-only `/task`; the sensitive
+  pre-confirmation boundary (the action never ran before `CONFIRM`, on
+  every attempt); a real `CONFIRM` producing exactly one Notepad launch;
+  user-level replay of the identical `CONFIRM` text correctly producing
+  the generic invalid-confirmation reply with no second launch; a real
+  `REJECT` producing no launch; and, the most significant new evidence
+  this milestone adds, a genuine abrupt termination of the live server
+  process while a real WhatsApp task existed. A read-only inspection of
+  the durable database (`open_reader_connection()`, public
+  `TaskRepository` APIs only, performed while the process was confirmed
+  dead) captured that task genuinely stranded mid-`planning`. After
+  restarting the server, the same task recovered and reached a terminal
+  result **without being resent** - the first live proof of the
+  `planning -> created` restart-reconciliation path Milestone 47 P3
+  built and had, until this session, only ever proven non-live. (The
+  live replay test proves user-level replay safety only - it used a new
+  provider message and does not constitute live proof of exact
+  provider-message redelivery/`DUPLICATE_INGRESS`; that guarantee
+  remains proven exclusively by the automated Milestone 47 P2 suite.)
+
+  One operational security incident occurred during P2 and was fully
+  remediated before closure: Windows Notepad's own "Continue previous
+  session" setting restored a previously, separately, manually opened
+  tab containing secret-bearing `.env` content when `open_application`
+  launched it - `open_application` itself only ever launches the
+  registered executable and has no awareness of or control over a
+  target application's own session-restore behavior; no source evidence
+  supports this being AI-OS opening that file, and it is not classified
+  as a production-code defect. The exposed `WHATSAPP_APP_SECRET` and
+  `WHATSAPP_VERIFY_TOKEN` were rotated (the verify token twice, after a
+  second exposure), and the permanent System User `WHATSAPP_ACCESS_TOKEN`
+  was revoked at Meta and replaced with a new token scoped to only
+  `whatsapp_business_management`/`whatsapp_business_messaging`. All
+  replacement credentials were functionally validated end-to-end before
+  closure. No secret was committed to this repository at any point.
+  Separately, variable response latency (roughly 3-90 seconds depending
+  on operation, observed across this one session) was judged an accepted
+  personal-use UX characteristic, not a correctness or safety defect -
+  every operation eventually completed correctly with no timeout.
+
+  Final launch classification: **controlled personal use** - one
+  operator, one Windows machine, one local runtime, one SQLite task
+  database, one worker, one authorized WhatsApp sender. No HIGH or
+  MEDIUM production defect was found or remains open at closure.
+
+  Marking this milestone **COMPLETE** does not retract any boundary
+  stated in Milestone 47's own closure paragraph or restated there - all
+  of it remains true and is not superseded here: no exactly-once
+  guarantee for external side effects; a crash after a step is claimed
+  but before or during the actual external call remains genuinely
+  uncertain and is always resolved by failing closed, never by
+  inferring an outcome; outbound lifecycle delivery is at-least-once,
+  so a duplicate WhatsApp message around a crash boundary remains
+  possible; the Milestone 47 P3 recovery backoff governs its own
+  discovery ordering only, never a global execution lock or a
+  distributed task lock; single-worker recovery may be delayed by one
+  long-running task/network/model call ahead of it in the same
+  checkpoint; and this remains a personal-scale architecture with no
+  generalized scheduler and no multi-worker recovery.
+
 **Planned / not yet implemented:**
 
-- Milestone 48 (employee acceptance/launch). Does not exist yet; do not
-  treat the name as implemented. Milestones 46 and 47 are both complete —
-  see their own entries above — and neither absorbs Milestone 48's scope
-  merely by closing: broad employee launch acceptance, production
-  deployment procedures, generalized monitoring/alerting, new tools or
-  actions, expanded autonomy, and any real-world launch process are all
-  Milestone 48's concern entirely, not a hidden part of M47's persistence/
-  recovery correctness work. Neither Milestone 44 nor Milestone 45
-  absorbs any of this scope either — a future JavaScript-enabled or
-  interactive browser capability, and any future native desktop mutation
-  capability, are each new, separately-designed features, not a hidden
-  part of any of these, and not owned by M46 or M47.
 - Real interfaces for Claude, web, and voice wired to the orchestrator —
   currently placeholder directories only (WhatsApp is implemented; see
   above).

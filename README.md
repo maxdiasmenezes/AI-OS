@@ -1,5 +1,7 @@
 # AI Operating System (AI-OS)
 
+Developed by Max Dias Menezes for Murilo Dias Menezes's personal use.
+
 A personal AI Operating System: a kernel platform that runs a set of specialized AI employees, each dedicated to a specific domain of work and life.
 
 ## Mission
